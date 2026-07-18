@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from sqlalchemy.orm import Session
+
+from vtnote.config import Settings
+from vtnote.configuration import ConfigurationService, InvalidConfiguration
+from vtnote.database import initialize_database
+from vtnote.models import ItemRecord
+from vtnote.paths import StoragePaths
+from vtnote.secrets import MemorySecretStore
+from vtnote.tasks import TaskService
+from vtnote.url_security import SourceUrlPolicy
+
+
+class PublicResolver:
+    def resolve(self, host: str) -> list[str]:
+        return ["142.250.72.14"]
+
+
+def make_services(tmp_path: Path):
+    paths = StoragePaths.from_settings(
+        Settings(data_root=tmp_path / "data", runtime_cache_root=tmp_path / "cache")
+    )
+    engine = initialize_database(paths.database)
+    session = Session(engine)
+    configuration = ConfigurationService(session, MemorySecretStore(), paths=paths)
+    tasks = TaskService(session, configuration, paths, SourceUrlPolicy(PublicResolver()))
+    return configuration, tasks, session, paths
+
+
+def test_fixed_local_whisper_defaults_use_d_drive_roots(tmp_path: Path) -> None:
+    configuration, _, session, paths = make_services(tmp_path)
+    try:
+        local = configuration.get_defaults().local_whisper_options
+        assert local == {
+            "model": "large-v3-turbo",
+            "device": "auto",
+            "compute_type": "int8_float16",
+            "vad_filter": True,
+            "model_root": str(paths.durable("models", "faster-whisper")),
+            "cache_root": str(paths.runtime("models", "faster-whisper")),
+        }
+        assert Path(local["model_root"]).drive.casefold() == "d:"
+        assert Path(local["cache_root"]).drive.casefold() == "d:"
+        with pytest.raises(InvalidConfiguration, match="configured D-drive"):
+            configuration.update_defaults(
+                local_whisper_options={"model_root": r"C:\models"}
+            )
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp_path: Path) -> None:
+    configuration, _, session, _ = make_services(tmp_path)
+    try:
+        cloud = configuration.create_connection(
+            name="Cloud", protocol="volc_bigasr_flash",
+            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+        )
+        chat = configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example.com/v1", parameters={}, secret="key"
+        )
+        with pytest.raises(InvalidConfiguration, match="context_length"):
+            configuration.create_profile(
+                name="Bad context", purpose="notes", connection_id=chat.id,
+                model="gpt", context_length=0
+            )
+        with pytest.raises(InvalidConfiguration, match="profile option"):
+            configuration.create_profile(
+                name="Bad cloud", purpose="cloud_asr", connection_id=cloud.id,
+                model="bigmodel", context_length=8192, options={"temperature": 0.2}
+            )
+        with pytest.raises(InvalidConfiguration, match="profile option"):
+            configuration.create_profile(
+                name="Bad notes", purpose="notes", connection_id=chat.id,
+                model="gpt", context_length=8192, options={"language": "zh-CN"}
+            )
+        valid = configuration.create_profile(
+            name="Notes", purpose="notes", connection_id=chat.id,
+            model="gpt", context_length=32768, options={"temperature": 0.2}
+        )
+        assert valid.context_length == 32768
+        assert "context" not in valid.model_dump()
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_volc_resource_is_fixed_and_not_caller_configurable(tmp_path: Path) -> None:
+    configuration, tasks, session, _ = make_services(tmp_path)
+    try:
+        with pytest.raises(InvalidConfiguration, match="parameter"):
+            configuration.create_connection(
+                name="Bad Cloud", protocol="volc_bigasr_flash",
+                base_url="https://openspeech.bytedance.com",
+                parameters={"resource_id": "attacker.resource"}, secret="key"
+            )
+        connection = configuration.create_connection(
+            name="Cloud", protocol="volc_bigasr_flash",
+            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+        )
+        profile = configuration.create_profile(
+            name="Flash", purpose="cloud_asr", connection_id=connection.id,
+            model="bigmodel", context_length=8192, options={"language": "zh-CN"}
+        )
+        configuration.record_profile_test(profile.id, ok=True, message="ok")
+        configuration.authorize_cloud_upload(profile.id)
+        configuration.update_defaults(asr_mode="cloud", cloud_asr_profile_id=profile.id)
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        assert created.pipeline_snapshot["asr"]["profile"]["resource"] == (
+            "volc.bigasr.auc_turbo"
+        )
+        local_only = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/local"}],
+            options={"asr_mode": "local"},
+        )
+        assert local_only.pipeline_snapshot["asr"]["profile"] is None
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_task_overrides_snapshot_all_pipeline_choices_and_fixed_item_path(tmp_path: Path) -> None:
+    configuration, tasks, session, _, = make_services(tmp_path)
+    try:
+        chat = configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example.com/v1", parameters={}, secret="key"
+        )
+        translation = configuration.create_profile(
+            name="Translation", purpose="translation", connection_id=chat.id,
+            model="translate", context_length=16384, options={"temperature": 0.1}
+        )
+        notes = configuration.create_profile(
+            name="Notes", purpose="notes", connection_id=chat.id,
+            model="notes", context_length=32768, options={"max_tokens": 2048}
+        )
+        configuration.record_profile_test(translation.id, ok=True, message="ok")
+        configuration.record_profile_test(notes.id, ok=True, message="ok")
+
+        task = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
+            options={
+                "asr_mode": "local",
+                "translation_enabled": True,
+                "translation_profile_id": translation.id,
+                "translation_target_language": "ja",
+                "notes_enabled": True,
+                "notes_profile_id": notes.id,
+                "notes_template": "custom",
+                "notes_output_language": "zh-Hans",
+                "notes_custom_prompt": "Use headings",
+            },
+        )
+        snapshot = task.pipeline_snapshot
+        assert snapshot["schema_version"] == 1
+        assert snapshot["asr"]["mode"] == "local"
+        assert snapshot["translation"]["target_language"] == "ja"
+        assert snapshot["notes"] == {
+            "enabled": True,
+            "profile": snapshot["notes"]["profile"],
+            "template": "custom",
+            "output_language": "zh-Hans",
+            "custom_prompt": "Use headings",
+        }
+        stored_item = session.get(ItemRecord, task.items[0].id)
+        assert stored_item is not None
+        assert stored_item.artifact_relpath == f"items/{stored_item.id}"
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_stale_cloud_falls_back_in_auto_but_forced_cloud_fails(tmp_path: Path) -> None:
+    configuration, tasks, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Cloud", protocol="volc_bigasr_flash",
+            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+        )
+        profile = configuration.create_profile(
+            name="Flash", purpose="cloud_asr", connection_id=connection.id,
+            model="bigmodel", context_length=8192
+        )
+        configuration.record_profile_test(profile.id, ok=True, message="ok")
+        configuration.authorize_cloud_upload(profile.id)
+        configuration.update_defaults(asr_mode="auto", cloud_asr_profile_id=profile.id)
+        configuration.update_connection(connection.id, name="Cloud revised")
+
+        automatic = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        assert automatic.pipeline_snapshot["asr"]["profile"] is None
+
+        with pytest.raises(InvalidConfiguration, match="cloud ASR"):
+            tasks.create_task(
+                sources=[{"kind": "url", "locator": "https://youtu.be/def"}],
+                options={"asr_mode": "cloud", "cloud_asr_profile_id": profile.id},
+            )
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_names_are_unique_case_insensitively(tmp_path: Path) -> None:
+    configuration, _, session, _ = make_services(tmp_path)
+    try:
+        configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example.com/v1", parameters={}
+        )
+        with pytest.raises(InvalidConfiguration, match="name"):
+            configuration.create_connection(
+                name="chat", protocol="openai_compatible",
+                base_url="https://other.example.com/v1", parameters={}
+            )
+    finally:
+        session.close()
+        session.bind.dispose()

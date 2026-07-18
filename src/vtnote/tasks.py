@@ -1,0 +1,341 @@
+"""Durable task creation and control; this module never executes pipeline work."""
+
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
+
+from vtnote.configuration import ConfigurationService, InvalidConfiguration
+from vtnote.exports import ExportFormat, render_export_from_json
+from vtnote.models import ItemRecord, StageRunRecord, TaskRecord
+from vtnote.paths import StoragePaths
+from vtnote.url_security import SourceUrlPolicy
+
+
+class InvalidTaskOperation(ValueError):
+    pass
+
+
+class StageView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    stage: str
+    attempt: int
+    status: str
+    error_code: str | None
+    error_message: str | None
+    warning: str | None
+
+
+class ItemView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    position: int
+    source_kind: str
+    source_locator: str
+    status: str
+    title: str | None
+    stage_runs: tuple[StageView, ...]
+
+
+class TaskView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    status: str
+    options: dict[str, Any]
+    pipeline_snapshot: dict[str, Any]
+    items: tuple[ItemView, ...]
+
+
+_TERMINAL = {"canceled", "completed", "completed_with_warnings", "failed"}
+_RETRYABLE = {"failed", "canceled"}
+_TASK_OPTION_KEYS = frozenset(
+    {
+        "asr_mode",
+        "cloud_asr_profile_id",
+        "translation_enabled",
+        "translation_profile_id",
+        "translation_target_language",
+        "notes_enabled",
+        "notes_profile_id",
+        "notes_template",
+        "notes_output_language",
+        "notes_custom_prompt",
+    }
+)
+
+
+class TaskService:
+    def __init__(
+        self,
+        session: Session,
+        configuration: ConfigurationService,
+        paths: StoragePaths,
+        source_urls: SourceUrlPolicy,
+    ) -> None:
+        self.session = session
+        self.configuration = configuration
+        self.paths = paths
+        self.source_urls = source_urls
+
+    def _load_task(self, task_id: str) -> TaskRecord:
+        row = self.session.scalar(
+            select(TaskRecord)
+            .where(TaskRecord.id == task_id)
+            .options(selectinload(TaskRecord.items).selectinload(ItemRecord.stage_runs))
+        )
+        if row is None:
+            raise KeyError(task_id)
+        return row
+
+    def _view_item(self, row: ItemRecord) -> ItemView:
+        stage_order = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
+        return ItemView(
+            id=row.id,
+            position=row.position,
+            source_kind=row.source_kind,
+            source_locator=row.source_locator,
+            status=row.status,
+            title=row.title,
+            stage_runs=tuple(
+                StageView(
+                    id=run.id,
+                    stage=run.stage,
+                    attempt=run.attempt,
+                    status=run.status,
+                    error_code=run.error_code,
+                    error_message=run.error_message,
+                    warning=run.warning,
+                )
+                for run in sorted(
+                    row.stage_runs,
+                    key=lambda run: (stage_order.get(run.stage, 99), run.attempt),
+                )
+            ),
+        )
+
+    def _view(self, row: TaskRecord) -> TaskView:
+        return TaskView(
+            id=row.id,
+            status=row.status,
+            options=copy.deepcopy(row.options),
+            pipeline_snapshot=copy.deepcopy(row.pipeline_snapshot_json),
+            items=tuple(self._view_item(item) for item in row.items),
+        )
+
+    def _profile_snapshot(self, profile_id: str | None, purpose: str) -> dict[str, Any] | None:
+        if profile_id is None:
+            return None
+        profile = self.configuration.get_profile(profile_id)
+        if profile.purpose != purpose or not profile.tested or profile.test_ok is not True:
+            raise InvalidConfiguration(f"{purpose} profile must have a current successful test")
+        return self.configuration.snapshot_profile(profile_id)
+
+    def _pipeline_snapshot(self, options: dict[str, Any]) -> dict[str, Any]:
+        defaults = self.configuration.get_defaults()
+        asr_mode = options.get("asr_mode", defaults.asr_mode)
+        if asr_mode not in {"auto", "cloud", "local"}:
+            raise InvalidTaskOperation("invalid ASR mode")
+        cloud_profile_id = options.get(
+            "cloud_asr_profile_id", defaults.cloud_asr_profile_id
+        )
+        cloud = None
+        cloud_view = None
+        if cloud_profile_id is not None:
+            try:
+                cloud_view = self.configuration.get_profile(cloud_profile_id)
+            except KeyError:
+                cloud_view = None
+            if (
+                cloud_view is not None
+                and cloud_view.purpose == "cloud_asr"
+                and cloud_view.tested
+                and cloud_view.test_ok is True
+                and cloud_view.upload_authorized
+            ):
+                cloud = self.configuration.snapshot_profile(cloud_profile_id)
+        cloud_authorized = (
+            cloud is not None and cloud_view is not None and cloud_view.upload_authorized
+        )
+        if asr_mode == "cloud":
+            if not cloud_authorized:
+                raise InvalidConfiguration("cloud ASR requires current test and upload authorization")
+        elif asr_mode == "local":
+            cloud = None
+        elif not cloud_authorized:
+            cloud = None
+        translation_enabled = options.get(
+            "translation_enabled", defaults.translation_enabled
+        )
+        translation_profile_id = options.get(
+            "translation_profile_id", defaults.translation_profile_id
+        )
+        translation = (
+            self._profile_snapshot(translation_profile_id, "translation")
+            if translation_enabled
+            else None
+        )
+        notes_enabled = options.get("notes_enabled", defaults.notes_enabled)
+        notes_profile_id = options.get("notes_profile_id", defaults.notes_profile_id)
+        notes = (
+            self._profile_snapshot(notes_profile_id, "notes")
+            if notes_enabled
+            else None
+        )
+        target_language = options.get(
+            "translation_target_language", defaults.translation_target_language
+        )
+        output_language = options.get(
+            "notes_output_language", defaults.notes_output_language
+        )
+        notes_template = options.get("notes_template", defaults.notes_template)
+        custom_prompt = options.get("notes_custom_prompt", defaults.notes_custom_prompt)
+        if not isinstance(target_language, str) or not target_language.strip():
+            raise InvalidTaskOperation("translation target language cannot be empty")
+        if not isinstance(output_language, str) or not output_language.strip():
+            raise InvalidTaskOperation("notes output language cannot be empty")
+        if notes_template not in {"summary", "key_points", "custom"}:
+            raise InvalidTaskOperation("invalid notes template")
+        if notes_template == "custom" and (
+            not isinstance(custom_prompt, str) or not custom_prompt.strip()
+        ):
+            raise InvalidTaskOperation("custom notes template requires a prompt")
+        return {
+            "schema_version": 1,
+            "asr": {"mode": asr_mode, "profile": cloud},
+            "translation": {
+                "enabled": translation_enabled,
+                "profile": translation,
+                "target_language": target_language,
+            },
+            "notes": {
+                "enabled": notes_enabled,
+                "profile": notes,
+                "template": notes_template,
+                "output_language": output_language,
+                "custom_prompt": custom_prompt if notes_template == "custom" else None,
+            },
+            "local_whisper": dict(defaults.local_whisper_options),
+        }
+
+    def _validate_source(self, source: dict[str, str]) -> tuple[str, str]:
+        if set(source) != {"kind", "locator"}:
+            raise InvalidTaskOperation("source requires only kind and locator")
+        kind = source["kind"]
+        locator = source["locator"]
+        if kind == "url":
+            return kind, self.source_urls.validate(locator)
+        if kind not in {"local_media", "local_subtitle"}:
+            raise InvalidTaskOperation("unsupported source kind")
+        path = Path(locator)
+        if not path.is_absolute() or not path.is_file():
+            raise InvalidTaskOperation("local source must be an existing absolute file")
+        return kind, str(path)
+
+    def create_task(
+        self, *, sources: list[dict[str, str]], options: dict[str, Any] | None = None
+    ) -> TaskView:
+        if not sources:
+            raise InvalidTaskOperation("at least one source is required")
+        selected_options = dict(options or {})
+        if set(selected_options) - _TASK_OPTION_KEYS:
+            raise InvalidTaskOperation("unsupported task option")
+        validated = [self._validate_source(source) for source in sources]
+        snapshot = self._pipeline_snapshot(selected_options)
+        task = TaskRecord(options=selected_options, pipeline_snapshot_json=snapshot)
+        translation_enabled = snapshot["translation"]["enabled"]
+        notes_enabled = snapshot["notes"]["enabled"]
+        for position, (kind, locator) in enumerate(validated):
+            item = ItemRecord(position=position, source_kind=kind, source_locator=locator)
+            stages = ["source", "transcribe"]
+            if translation_enabled:
+                stages.append("translate")
+            if notes_enabled:
+                stages.append("notes")
+            item.stage_runs = [StageRunRecord(stage=stage, attempt=1) for stage in stages]
+            task.items.append(item)
+        self.session.add(task)
+        self.session.flush()
+        for item in task.items:
+            item.artifact_relpath = f"items/{item.id}"
+        self.session.commit()
+        return self._view(self._load_task(task.id))
+
+    def list_tasks(self) -> list[TaskView]:
+        ids = self.session.scalars(select(TaskRecord.id).order_by(TaskRecord.created_at.desc())).all()
+        return [self._view(self._load_task(task_id)) for task_id in ids]
+
+    def get_task(self, task_id: str) -> TaskView:
+        return self._view(self._load_task(task_id))
+
+    def cancel_task(self, task_id: str) -> TaskView:
+        task = self._load_task(task_id)
+        if task.status in _TERMINAL:
+            raise InvalidTaskOperation("terminal task cannot be canceled")
+        running = task.status == "running" or any(
+            item.status == "running" or any(run.status == "running" for run in item.stage_runs)
+            for item in task.items
+        )
+        target = "cancel_requested" if running else "canceled"
+        task.status = target
+        for item in task.items:
+            if item.status not in _TERMINAL:
+                item.status = target
+            for run in item.stage_runs:
+                if run.status == "running":
+                    run.status = "cancel_requested"
+                elif run.status == "queued":
+                    run.status = "canceled" if not running else "canceled"
+        self.session.commit()
+        return self._view(self._load_task(task_id))
+
+    def retry_stage(self, item_id: str, stage: str) -> ItemView:
+        item = self.session.scalar(
+            select(ItemRecord)
+            .where(ItemRecord.id == item_id)
+            .options(selectinload(ItemRecord.stage_runs), selectinload(ItemRecord.task))
+        )
+        if item is None:
+            raise KeyError(item_id)
+        attempts = [run for run in item.stage_runs if run.stage == stage]
+        if not attempts or attempts[-1].status not in _RETRYABLE:
+            raise InvalidTaskOperation("only a failed or canceled stage can be retried")
+        next_attempt = max(run.attempt for run in attempts) + 1
+        item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
+        item.status = "queued"
+        item.task.status = "queued"
+        self.session.commit()
+        self.session.refresh(item)
+        return self._view_item(item)
+
+    def export_item(
+        self,
+        item_id: str,
+        *,
+        variant: str,
+        export_format: ExportFormat | str,
+        language: str | None = None,
+    ) -> str:
+        if self.session.get(ItemRecord, item_id) is None:
+            raise KeyError(item_id)
+        transcript_path = self.paths.transcript(item_id)
+        if not transcript_path.is_file():
+            raise InvalidTaskOperation("transcript artifact is not available")
+        translation_json: bytes | None = None
+        if variant == "translation":
+            if language is None:
+                raise InvalidTaskOperation("translation export requires language")
+            translation_path = self.paths.translation(item_id, language)
+            if not translation_path.is_file():
+                raise InvalidTaskOperation("translation artifact is not available")
+            translation_json = translation_path.read_bytes()
+        elif variant != "original" or language is not None:
+            raise InvalidTaskOperation("invalid export variant")
+        return render_export_from_json(
+            transcript_path.read_bytes(), export_format, translation_json
+        )

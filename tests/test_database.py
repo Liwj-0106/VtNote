@@ -24,7 +24,10 @@ def test_sqlite_initialization_creates_tables_and_enables_wal(tmp_path: Path) ->
         assert journal_mode.lower() == "wal"
         assert foreign_keys == 1
         assert busy_timeout == 5_000
-        assert {"tasks", "items", "stage_runs"} <= set(inspect(engine).get_table_names())
+        assert {
+            "tasks", "items", "stage_runs", "provider_connections",
+            "processor_profiles", "default_settings",
+        } <= set(inspect(engine).get_table_names())
     finally:
         engine.dispose()
 

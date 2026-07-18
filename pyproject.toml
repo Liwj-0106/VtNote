@@ -8,9 +8,13 @@ version = "0.1.0"
 description = "Local-first video transcript and notes pipeline"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "fastapi>=0.115,<0.116",
+  "httpx>=0.28,<0.29",
+  "keyring>=25,<26",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "SQLAlchemy>=2.0,<3",
+  "uvicorn>=0.34,<0.35",
 ]
 
 [project.optional-dependencies]

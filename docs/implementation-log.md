@@ -26,3 +26,13 @@
 - Modified translation writes to validate source hash and exact ordered cue IDs before replacement. Modified SRT/VTT/ASS export handling for representability and stable ASS literal escaping.
 - Modified SQLite bootstrap/models/tests for serialized bounded WAL initialization, connection-local busy timeout/foreign-key pragmas, UTC-aware timestamp round trips, mutable JSON options, and deterministic relationship ordering.
 - Modified `tests/test_database.py`, `tests/test_schemas.py`, `tests/test_storage.py`, and `tests/test_subtitles.py` with focused regression coverage. No dependencies were added, and no project files were deleted.
+
+### Task 2: FastAPI, configuration/task services, and local security
+
+- Added FastAPI, httpx, keyring, and uvicorn runtime dependency ranges and installed them into the existing `vtnote` Conda environment with pip cache/temp under `D:\Workspace\Codex\cache\VtNote-runtime`.
+- Refactored the pre-release schema directly after confirming `D:\Workspace\Project\VtNote-data\vtnote.db` did not exist. Added separate provider-connection, processor-profile, and default-setting tables; durable non-secret task pipeline snapshots; fixed item artifact paths; profile/context revision state; cloud-upload authorization revisions; and case-insensitive unique names.
+- Added injected memory/keyring secret stores, direct configuration services, secret replacement/clear/rollback behavior, purpose/protocol compatibility, purpose-specific option whitelists, sanitized connectivity state, safe defaults, and fixed Volcengine flash resource metadata.
+- Added durable task enqueue/list/get/cancel and stage-only retry services. Enqueue snapshots schema-v1 non-secret pipeline choices and creates only queued task/item/stage rows; it has no worker or external-media execution path.
+- Added FastAPI routes for CSRF issuance, source probing, connections, profiles, defaults, tasks, cancel/retry, upload authorization, connectivity tests, and original/translation on-demand exports. Missing real probe/connectivity adapters return 501.
+- Added exact Host/Origin and double-submit CSRF enforcement without CORS; public HTTPS YouTube/Bilibili source validation with IP/private-DNS/fake-suffix/non-443 rejection and redirect revalidation; separate HTTPS-or-loopback-HTTP provider URL validation; and one sanitized API error envelope.
+- Added Task 2 tests for configuration revisions and compatibility, secret redaction/rollback, defaults and task overrides, immutable snapshots, queue/cancel/retry semantics, export routes, adapter injection, API statuses, local security, URL/DNS/redirect defenses, fixed pipeline defaults, and Task 1 regressions. No project files were deleted.
