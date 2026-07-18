@@ -36,3 +36,13 @@
 - Added FastAPI routes for CSRF issuance, source probing, connections, profiles, defaults, tasks, cancel/retry, upload authorization, connectivity tests, and original/translation on-demand exports. Missing real probe/connectivity adapters return 501.
 - Added exact Host/Origin and double-submit CSRF enforcement without CORS; public HTTPS YouTube/Bilibili source validation with IP/private-DNS/fake-suffix/non-443 rejection and redirect revalidation; separate HTTPS-or-loopback-HTTP provider URL validation; and one sanitized API error envelope.
 - Added Task 2 tests for configuration revisions and compatibility, secret redaction/rollback, defaults and task overrides, immutable snapshots, queue/cancel/retry semantics, export routes, adapter injection, API statuses, local security, URL/DNS/redirect defenses, fixed pipeline defaults, and Task 1 regressions. No project files were deleted.
+
+### Task 2 review-fix pass
+
+- Disabled FastAPI OpenAPI/Swagger/ReDoc endpoints by default; they are available only through the explicit development setting. Added an outer sanitized error boundary and centralized bounded diagnostic redaction for structured credentials, bearer values, known secrets, and credential references.
+- Replaced in-place secret replacement with a prepared credential-reference rotation, and replaced destructive connection/profile deletion with soft archive semantics. Archived configuration remains internally resolvable for already queued task snapshots while public CRUD hides it; active profiles must be archived before their connection.
+- Added `connection_id` to non-secret profile snapshots, repaired defaults when profiles are archived, validated dormant profile references, enabled the first successfully tested notes profile once, and persisted an explicit opt-out marker so later user choices are preserved.
+- Made PATCH null/no-op/display-name behavior explicit, restricted loopback HTTP to OpenAI-compatible connections, made cancellation idempotent, guarded stage retry prerequisites and duplicate-attempt races, and redacted absolute local source paths from public task views.
+- Extended source-probe results with duration, subtitle descriptors, and the reported redirect chain. The Task 3 adapter remains a trusted network boundary: it must disable automatic redirects and validate each peer before I/O; Task 2 validates the complete reported chain but does not claim DNS pinning.
+- Browser multipart media/subtitle staging is deliberately deferred to Task 3. Task 2 continues to accept an existing local path only at its internal service boundary and does not claim that contract is usable by browser file inputs.
+- Modified the Task 2 source/tests and this log. No project files were deleted.

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from vtnote.artifacts import write_transcript_json, write_translation_json
@@ -11,7 +13,7 @@ from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService
 from vtnote.database import initialize_database
 from vtnote.paths import StoragePaths
-from vtnote.models import ItemRecord, StageRunRecord, TaskRecord
+from vtnote.models import ItemRecord, ProviderConnectionRecord, StageRunRecord, TaskRecord
 from vtnote.schemas import (
     Provenance,
     ProvenanceMethod,
@@ -202,6 +204,10 @@ def test_cancel_running_task_requests_cooperative_cancel(tmp_path: Path) -> None
         assert canceled.status == "cancel_requested"
         assert canceled.items[0].status == "cancel_requested"
         assert canceled.items[0].stage_runs[0].status == "cancel_requested"
+        repeated = tasks.cancel_task(created.id)
+        assert repeated.status == "cancel_requested"
+        assert repeated.items[0].status == "cancel_requested"
+        assert repeated.items[0].stage_runs[0].status == "cancel_requested"
     finally:
         session.bind.dispose()
         session.close()
@@ -216,6 +222,7 @@ def test_retry_is_stage_only_and_increments_attempt(tmp_path: Path) -> None:
         item = created.items[0]
         item_row = session.get(ItemRecord, item.id)
         assert item_row is not None
+        next(run for run in item_row.stage_runs if run.stage == "source").status = "completed"
         next(run for run in item_row.stage_runs if run.stage == "transcribe").status = "failed"
         session.commit()
         retried = tasks.retry_stage(item.id, "transcribe")
@@ -225,6 +232,91 @@ def test_retry_is_stage_only_and_increments_attempt(tmp_path: Path) -> None:
 
         with pytest.raises(InvalidTaskOperation):
             tasks.retry_stage(item.id, "source")
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_rejects_active_work_and_incomplete_prerequisites(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        source = next(run for run in item.stage_runs if run.stage == "source")
+        transcribe = next(run for run in item.stage_runs if run.stage == "transcribe")
+        source.status = "canceled"
+        transcribe.status = "failed"
+        session.commit()
+        with pytest.raises(InvalidTaskOperation, match="prerequisite"):
+            tasks.retry_stage(item.id, "transcribe")
+
+        source.status = "running"
+        session.commit()
+        with pytest.raises(InvalidTaskOperation, match="active"):
+            tasks.retry_stage(item.id, "transcribe")
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_maps_duplicate_attempt_race_to_invalid_operation(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        next(run for run in item.stage_runs if run.stage == "source").status = "completed"
+        next(run for run in item.stage_runs if run.stage == "transcribe").status = "failed"
+        session.commit()
+
+        def conflict(_: Session) -> None:
+            raise IntegrityError("insert retry", {}, RuntimeError("duplicate"))
+
+        event.listen(session, "before_commit", conflict, once=True)
+        with pytest.raises(InvalidTaskOperation, match="conflicted"):
+            tasks.retry_stage(item.id, "transcribe")
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_public_task_view_redacts_local_path_and_stage_diagnostics(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        source = tmp_path / "private-folder" / "video.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"media")
+        connection = configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example/v1", parameters={}, secret="known-secret"
+        )
+        stored_connection = session.get(ProviderConnectionRecord, connection.id)
+        assert stored_connection is not None
+        created = tasks.create_task(
+            sources=[{"kind": "local_media", "locator": str(source)}]
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        item.stage_runs[0].error_message = '{"access_token":"issued-token"}'
+        item.stage_runs[0].warning = (
+            f"secret={stored_connection.credential_ref} known-secret"
+        )
+        session.commit()
+
+        public = tasks.get_task(created.id)
+        assert public.items[0].source_locator == "video.mp4"
+        assert "issued-token" not in (public.items[0].stage_runs[0].error_message or "")
+        assert "known-secret" not in (public.items[0].stage_runs[0].warning or "")
+        assert stored_connection.credential_ref not in (
+            public.items[0].stage_runs[0].warning or ""
+        )
+        session.refresh(item)
+        assert item.source_locator == str(source)
     finally:
         session.bind.dispose()
         session.close()

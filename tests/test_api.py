@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -42,12 +43,28 @@ class FakeSourceProbe:
             canonical_url="https://www.youtube.com/watch?v=abc",
             title="Example",
             platform="youtube",
+            duration_ms=12_345,
+            subtitles=(
+                {"language": "zh-Hans", "format": "vtt", "is_manual": True},
+                {"language": "en", "format": "vtt", "is_manual": False},
+            ),
+            redirect_chain=("https://www.youtube.com/watch?v=abc",),
         )
 
 
 class ExplodingSourceProbe:
     def probe(self, url: str, validate_redirect):
         raise RuntimeError("Authorization: super-secret")
+
+
+class UnsafeReportedRedirectProbe:
+    def probe(self, url: str, validate_redirect):
+        return ProbeResult(
+            canonical_url="https://www.youtube.com/watch?v=abc",
+            title="Unsafe",
+            platform="youtube",
+            redirect_chain=("https://127.0.0.1/internal",),
+        )
 
 
 def make_client(
@@ -100,6 +117,38 @@ def test_exact_host_origin_and_double_submit_csrf_are_enforced(tmp_path: Path) -
         engine.dispose()
 
 
+def test_interactive_api_docs_are_disabled_unless_dev_mode_is_explicit(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+        assert client.get("/openapi.json").status_code == 404
+    finally:
+        engine.dispose()
+
+    settings = Settings(
+        data_root=tmp_path / "dev-data",
+        runtime_cache_root=tmp_path / "dev-cache",
+        enable_dev_docs=True,
+    )
+    paths = StoragePaths.from_settings(settings)
+    engine = initialize_database(paths.database)
+    client = TestClient(
+        create_app(
+            settings=settings,
+            engine=engine,
+            secret_store=MemorySecretStore(),
+            resolver=PublicResolver(),
+        ),
+        base_url=BASE_URL,
+    )
+    try:
+        assert client.get("/docs").status_code == 200
+        assert client.get("/openapi.json").status_code == 200
+    finally:
+        engine.dispose()
+
+
 def test_errors_use_one_sanitized_shape(tmp_path: Path) -> None:
     client, engine, _ = make_client(tmp_path)
     try:
@@ -142,7 +191,7 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
         assert tested.status_code == 200
         assert tester.called is True
         assert "super-secret" not in tested.text
-        assert "[redacted]" in tested.json()["test_message"]
+        assert tested.json()["test_message"] == "Connection test succeeded"
 
         assert client.get("/api/connections").status_code == 200
         assert client.get(f"/api/connections/{connection['id']}").status_code == 200
@@ -152,7 +201,7 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
             json={"name": "Chat updated"},
         )
         assert patched.status_code == 200
-        assert patched.json()["revision"] == 2
+        assert patched.json()["revision"] == 1
 
         profile = client.post(
             "/api/profiles",
@@ -196,6 +245,54 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
         ).status_code == 204
         assert client.delete(f"/api/profiles/{profile_id}", headers=headers).status_code == 204
         assert client.delete(f"/api/connections/{connection['id']}", headers=headers).status_code == 204
+        assert client.get(f"/api/profiles/{profile_id}").status_code == 404
+        assert client.get(f"/api/connections/{connection['id']}").status_code == 404
+        assert all(
+            item["id"] != profile_id for item in client.get("/api/profiles").json()
+        )
+        assert all(
+            item["id"] != connection["id"]
+            for item in client.get("/api/connections").json()
+        )
+    finally:
+        engine.dispose()
+
+
+def test_patch_rejects_explicit_null_and_empty_patch_is_a_noop(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections", headers=headers,
+            json={
+                "name": "Chat", "protocol": "openai_compatible",
+                "base_url": "https://api.example/v1", "parameters": {},
+            },
+        ).json()
+        empty = client.patch(
+            f"/api/connections/{connection['id']}", headers=headers, json={}
+        )
+        assert empty.status_code == 200
+        assert empty.json()["revision"] == connection["revision"]
+        assert client.patch(
+            f"/api/connections/{connection['id']}", headers=headers,
+            json={"base_url": None},
+        ).status_code == 422
+
+        profile = client.post(
+            "/api/profiles", headers=headers,
+            json={
+                "name": "Notes", "purpose": "notes",
+                "connection_id": connection["id"], "model": "notes",
+            },
+        ).json()
+        assert client.patch(
+            f"/api/profiles/{profile['id']}", headers=headers,
+            json={"model": None},
+        ).status_code == 422
+        assert client.patch(
+            f"/api/profiles/{profile['id']}", headers=headers, json={}
+        ).json()["revision"] == profile["revision"]
     finally:
         engine.dispose()
 
@@ -220,7 +317,32 @@ def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_pa
             json={"url": "https://youtu.be/abc"},
         )
         assert response.status_code == 200
-        assert response.json()["platform"] == "youtube"
+        assert response.json() == {
+            "canonical_url": "https://www.youtube.com/watch?v=abc",
+            "title": "Example",
+            "platform": "youtube",
+            "duration_ms": 12_345,
+            "subtitles": [
+                {"language": "zh-Hans", "format": "vtt", "is_manual": True},
+                {"language": "en", "format": "vtt", "is_manual": False},
+            ],
+            "redirect_chain": ["https://www.youtube.com/watch?v=abc"],
+        }
+    finally:
+        engine.dispose()
+
+
+def test_probe_centrally_rejects_an_unsafe_reported_redirect_chain(tmp_path: Path) -> None:
+    client, engine, _ = make_client(
+        tmp_path, source_probe=UnsafeReportedRedirectProbe()
+    )
+    try:
+        response = client.post(
+            "/api/sources/probe", headers=csrf(client),
+            json={"url": "https://youtu.be/abc"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "unsafe_source_url"
     finally:
         engine.dispose()
 
@@ -261,10 +383,17 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
         with Session(engine) as session:
             item = session.get(ItemRecord, item_id)
             assert item is not None
+            next(run for run in item.stage_runs if run.stage == "source").status = "completed"
             next(run for run in item.stage_runs if run.stage == "transcribe").status = "failed"
             session.commit()
-        retried = client.post(f"/api/items/{item_id}/stages/transcribe/retry", headers=headers)
+        retried = client.post(
+            f"/api/tasks/{task['id']}/retry", headers=headers,
+            json={"item_id": item_id, "stage": "transcribe"},
+        )
         assert retried.status_code == 201
+        assert client.post(
+            f"/api/items/{item_id}/stages/transcribe/retry", headers=headers
+        ).status_code == 404
 
         with Session(engine) as session:
             item = session.get(ItemRecord, item_id)
@@ -313,7 +442,9 @@ def test_task_options_cannot_smuggle_credentials_into_durable_responses(tmp_path
         engine.dispose()
 
 
-def test_unexpected_adapter_errors_are_sanitized(tmp_path: Path) -> None:
+def test_unexpected_adapter_errors_are_sanitized(
+    tmp_path: Path, caplog,
+) -> None:
     settings = Settings(
         data_root=tmp_path / "data", runtime_cache_root=tmp_path / "cache"
     )
@@ -326,17 +457,19 @@ def test_unexpected_adapter_errors_are_sanitized(tmp_path: Path) -> None:
         resolver=PublicResolver(),
         source_probe=ExplodingSourceProbe(),
     )
-    client = TestClient(app, base_url=BASE_URL, raise_server_exceptions=False)
+    client = TestClient(app, base_url=BASE_URL, raise_server_exceptions=True)
     try:
-        response = client.post(
-            "/api/sources/probe",
-            headers=csrf(client),
-            json={"url": "https://youtu.be/abc"},
-        )
+        with caplog.at_level(logging.ERROR):
+            response = client.post(
+                "/api/sources/probe",
+                headers=csrf(client),
+                json={"url": "https://youtu.be/abc"},
+            )
         assert response.status_code == 500
         assert response.json() == {
             "error": {"code": "internal_error", "message": "internal server error", "details": None}
         }
         assert "super-secret" not in response.text
+        assert "super-secret" not in caplog.text
     finally:
         engine.dispose()

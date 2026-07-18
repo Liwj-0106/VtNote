@@ -8,9 +8,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
+from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.exports import ExportFormat, render_export_from_json
 from vtnote.models import ItemRecord, StageRunRecord, TaskRecord
 from vtnote.paths import StoragePaths
@@ -54,6 +56,9 @@ class TaskView(BaseModel):
 
 _TERMINAL = {"canceled", "completed", "completed_with_warnings", "failed"}
 _RETRYABLE = {"failed", "canceled"}
+_ACTIVE = {"running", "cancel_requested"}
+_SUCCESSFUL_PREREQUISITE = {"completed", "skipped"}
+_STAGE_ORDER = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
 _TASK_OPTION_KEYS = frozenset(
     {
         "asr_mode",
@@ -93,13 +98,24 @@ class TaskService:
             raise KeyError(task_id)
         return row
 
-    def _view_item(self, row: ItemRecord) -> ItemView:
-        stage_order = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
+    def _view_item(
+        self, row: ItemRecord, sensitive_values: tuple[str, ...] | None = None
+    ) -> ItemView:
+        redaction_values = (
+            sensitive_values
+            if sensitive_values is not None
+            else self.configuration.diagnostic_sensitive_values()
+        )
+        source_locator = (
+            Path(row.source_locator).name
+            if row.source_kind in {"local_media", "local_subtitle"}
+            else row.source_locator
+        )
         return ItemView(
             id=row.id,
             position=row.position,
             source_kind=row.source_kind,
-            source_locator=row.source_locator,
+            source_locator=source_locator,
             status=row.status,
             title=row.title,
             stage_runs=tuple(
@@ -109,23 +125,28 @@ class TaskService:
                     attempt=run.attempt,
                     status=run.status,
                     error_code=run.error_code,
-                    error_message=run.error_message,
-                    warning=run.warning,
+                    error_message=sanitize_diagnostic(
+                        run.error_message, redaction_values
+                    ),
+                    warning=sanitize_diagnostic(run.warning, redaction_values),
                 )
                 for run in sorted(
                     row.stage_runs,
-                    key=lambda run: (stage_order.get(run.stage, 99), run.attempt),
+                    key=lambda run: (_STAGE_ORDER.get(run.stage, 99), run.attempt),
                 )
             ),
         )
 
     def _view(self, row: TaskRecord) -> TaskView:
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
         return TaskView(
             id=row.id,
             status=row.status,
             options=copy.deepcopy(row.options),
             pipeline_snapshot=copy.deepcopy(row.pipeline_snapshot_json),
-            items=tuple(self._view_item(item) for item in row.items),
+            items=tuple(
+                self._view_item(item, sensitive_values) for item in row.items
+            ),
         )
 
     def _profile_snapshot(self, profile_id: str | None, purpose: str) -> dict[str, Any] | None:
@@ -277,6 +298,8 @@ class TaskService:
         task = self._load_task(task_id)
         if task.status in _TERMINAL:
             raise InvalidTaskOperation("terminal task cannot be canceled")
+        if task.status == "cancel_requested":
+            return self._view(task)
         running = task.status == "running" or any(
             item.status == "running" or any(run.status == "running" for run in item.stage_runs)
             for item in task.items
@@ -302,14 +325,34 @@ class TaskService:
         )
         if item is None:
             raise KeyError(item_id)
+        if item.status == "cancel_requested" or item.task.status == "cancel_requested":
+            raise InvalidTaskOperation("cannot retry while cancellation is active")
+        if any(run.status in _ACTIVE for run in item.stage_runs):
+            raise InvalidTaskOperation("cannot retry while another stage is active")
         attempts = [run for run in item.stage_runs if run.stage == stage]
         if not attempts or attempts[-1].status not in _RETRYABLE:
             raise InvalidTaskOperation("only a failed or canceled stage can be retried")
+        if stage not in _STAGE_ORDER:
+            raise InvalidTaskOperation("unknown pipeline stage")
+        latest_by_stage: dict[str, StageRunRecord] = {}
+        for run in item.stage_runs:
+            previous = latest_by_stage.get(run.stage)
+            if previous is None or run.attempt > previous.attempt:
+                latest_by_stage[run.stage] = run
+        for prerequisite, order in _STAGE_ORDER.items():
+            if order >= _STAGE_ORDER[stage] or prerequisite not in latest_by_stage:
+                continue
+            if latest_by_stage[prerequisite].status not in _SUCCESSFUL_PREREQUISITE:
+                raise InvalidTaskOperation("stage prerequisite has not succeeded")
         next_attempt = max(run.attempt for run in attempts) + 1
         item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
         item.status = "queued"
         item.task.status = "queued"
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            raise InvalidTaskOperation("stage retry conflicted; refresh and retry") from None
         self.session.refresh(item)
         return self._view_item(item)
 

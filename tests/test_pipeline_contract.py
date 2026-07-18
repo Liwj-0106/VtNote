@@ -192,7 +192,9 @@ def test_stale_cloud_falls_back_in_auto_but_forced_cloud_fails(tmp_path: Path) -
         configuration.record_profile_test(profile.id, ok=True, message="ok")
         configuration.authorize_cloud_upload(profile.id)
         configuration.update_defaults(asr_mode="auto", cloud_asr_profile_id=profile.id)
-        configuration.update_connection(connection.id, name="Cloud revised")
+        configuration.update_connection(
+            connection.id, base_url="https://openspeech-revised.bytedance.com"
+        )
 
         automatic = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]

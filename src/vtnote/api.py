@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets as token_secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
@@ -9,7 +10,7 @@ from typing import Any, Callable, Literal, Protocol
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -31,10 +32,20 @@ class ConnectivityResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SubtitleDescriptor:
+    language: str
+    format: str
+    is_manual: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeResult:
     canonical_url: str
     title: str | None
     platform: str
+    duration_ms: int | None = None
+    subtitles: tuple[SubtitleDescriptor | dict[str, Any], ...] = ()
+    redirect_chain: tuple[str, ...] = ()
 
 
 class ConnectionTester(Protocol):
@@ -50,6 +61,8 @@ class ProfileTester(Protocol):
 
 
 class SourceProbe(Protocol):
+    """Trusted Task 3 boundary: disable auto-redirects and validate peers before I/O."""
+
     def probe(
         self, url: str, validate_redirect: Callable[[str], str]
     ) -> ProbeResult: ...
@@ -74,6 +87,15 @@ class ConnectionPatch(InputModel):
     secret: str | None = Field(default=None, min_length=1)
     clear_secret: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for field in ("name", "base_url", "parameters", "secret", "clear_secret"):
+                if field in value and value[field] is None:
+                    raise ValueError(f"{field} cannot be null")
+        return value
+
 
 class ProfileCreate(InputModel):
     name: str = Field(min_length=1, max_length=128)
@@ -90,6 +112,15 @@ class ProfilePatch(InputModel):
     model: str | None = Field(default=None, min_length=1)
     context_length: int | None = Field(default=None, gt=0)
     options: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for field in ("name", "connection_id", "model", "context_length", "options"):
+                if field in value and value[field] is None:
+                    raise ValueError(f"{field} cannot be null")
+        return value
 
 
 class DefaultsPatch(InputModel):
@@ -145,6 +176,15 @@ def _dump(value: Any) -> Any:
     return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
 
 
+def _dump_subtitle(value: SubtitleDescriptor | dict[str, Any]) -> dict[str, Any]:
+    track = value if isinstance(value, SubtitleDescriptor) else SubtitleDescriptor(**value)
+    return {
+        "language": track.language,
+        "format": track.format,
+        "is_manual": track.is_manual,
+    }
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -164,7 +204,15 @@ def create_app(
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
 
-    app = FastAPI(title="VtNote", version="0.1.0")
+    docs_enabled = selected_settings.enable_dev_docs
+    app = FastAPI(
+        title="VtNote",
+        version="0.1.0",
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+    logger = logging.getLogger("vtnote.api")
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
@@ -177,7 +225,11 @@ def create_app(
             header = request.headers.get("x-csrf-token")
             if not cookie or not header or not token_secrets.compare_digest(cookie, header):
                 return _error(403, "csrf_failed", "CSRF validation failed")
-        return await call_next(request)
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.error("Unhandled request failure")
+            return _error(500, "internal_error", "internal server error")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, error: RequestValidationError):
@@ -206,10 +258,6 @@ def create_app(
 
     for operation_exception in (InvalidTaskOperation, UnsafeSourceUrl, UnsafePathError):
         app.add_exception_handler(operation_exception, operation_error)
-
-    @app.exception_handler(Exception)
-    async def unexpected_error(_: Request, __: Exception):
-        return _error(500, "internal_error", "internal server error")
 
     def services() -> tuple[Session, ConfigurationService, TaskService]:
         session = sessions()
@@ -280,9 +328,12 @@ def create_app(
                 result = connection_tester.test_connection(view, secret, follow_redirects=False)
             except Exception:
                 result = ConnectivityResult(False, "Connectivity test failed")
+            safe_message = (
+                "Connection test succeeded" if result.ok else "Connection test failed"
+            )
             return _dump(
                 configuration.record_connection_test(
-                    connection_id, ok=result.ok, message=result.message
+                    connection_id, ok=result.ok, message=safe_message
                 )
             )
         finally:
@@ -343,9 +394,10 @@ def create_app(
                 result = profile_tester.test_profile(profile, secret, follow_redirects=False)
             except Exception:
                 result = ConnectivityResult(False, "Connectivity test failed")
-            return _dump(
-                configuration.record_profile_test(profile_id, ok=result.ok, message=result.message)
-            )
+            safe_message = "Profile test succeeded" if result.ok else "Profile test failed"
+            return _dump(configuration.record_profile_test(
+                profile_id, ok=result.ok, message=safe_message
+            ))
         finally:
             session.close()
 
@@ -387,11 +439,20 @@ def create_app(
         if source_probe is None:
             return _error(501, "adapter_unavailable", "source probe adapter is not configured")
         result = source_probe.probe(payload.url, source_policy.validate)
-        source_policy.validate(result.canonical_url)
+        redirect_targets = list(result.redirect_chain)
+        if not redirect_targets or redirect_targets[-1] != result.canonical_url:
+            redirect_targets.append(result.canonical_url)
+        source_policy.validate_redirect_chain(payload.url, redirect_targets)
+        if result.duration_ms is not None and result.duration_ms < 0:
+            raise ValueError("probe returned a negative duration")
+        subtitles = [_dump_subtitle(track) for track in result.subtitles]
         return {
             "canonical_url": result.canonical_url,
             "title": result.title,
             "platform": result.platform,
+            "duration_ms": result.duration_ms,
+            "subtitles": subtitles,
+            "redirect_chain": list(result.redirect_chain),
         }
 
     @app.get("/api/tasks")
@@ -438,14 +499,6 @@ def create_app(
             if payload.item_id not in {item.id for item in task.items}:
                 raise KeyError(payload.item_id)
             return _dump(tasks.retry_stage(payload.item_id, payload.stage))
-        finally:
-            session.close()
-
-    @app.post("/api/items/{item_id}/stages/{stage}/retry", status_code=201)
-    def retry_stage(item_id: str, stage: str):
-        session, _, tasks = services()
-        try:
-            return _dump(tasks.retry_stage(item_id, stage))
         finally:
             session.close()
 

@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     runtime_cache_root: Path = Path(r"D:\Workspace\Codex\cache\VtNote-runtime")
     bind_host: Literal["127.0.0.1"] = "127.0.0.1"
     bind_port: int = Field(default=8765, ge=1, le=65_535)
+    enable_dev_docs: bool = False
 
     @field_validator("data_root", "runtime_cache_root")
     @classmethod

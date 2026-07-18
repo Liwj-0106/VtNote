@@ -147,6 +147,7 @@ class ProviderConnectionRecord(Base):
     tested_revision: Mapped[int | None] = mapped_column(Integer)
     test_message: Mapped[str | None] = mapped_column(Text)
     tested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
@@ -182,6 +183,7 @@ class ProcessorProfileRecord(Base):
     tested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     upload_authorized_revision: Mapped[int | None] = mapped_column(Integer)
     upload_authorized_connection_revision: Mapped[int | None] = mapped_column(Integer)
+    archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
@@ -214,6 +216,9 @@ class DefaultSettingsRecord(Base):
         String(64), nullable=False, default="zh-Hans"
     )
     notes_custom_prompt: Mapped[str | None] = mapped_column(Text)
+    notes_auto_enable_allowed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     local_whisper_options: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON),
         nullable=False,

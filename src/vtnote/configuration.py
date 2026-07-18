@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import uuid
 import ipaddress
 from datetime import datetime, timezone
@@ -20,6 +19,7 @@ from vtnote.models import (
     ProcessorProfileRecord,
     ProviderConnectionRecord,
 )
+from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
 from vtnote.paths import StoragePaths
 
@@ -141,7 +141,7 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _clean_base_url(value: str) -> str:
+def _clean_base_url(value: str, protocol: str) -> str:
     try:
         parts = urlsplit(value)
         host = parts.hostname
@@ -152,6 +152,8 @@ def _clean_base_url(value: str) -> str:
         raise InvalidConfiguration("invalid provider base URL")
     if not host:
         raise InvalidConfiguration("invalid provider base URL")
+    if parts.scheme == "http" and protocol != "openai_compatible":
+        raise InvalidConfiguration("cloud provider base URL must use HTTPS")
     if parts.scheme == "http" and not _is_loopback_host(host):
         raise InvalidConfiguration("provider base URL must use HTTPS or loopback HTTP")
     if parts.scheme not in {"http", "https"}:
@@ -166,13 +168,7 @@ def _clean_base_url(value: str) -> str:
 def _clean_message(
     message: str | None, sensitive_values: tuple[str | None, ...] = ()
 ) -> str | None:
-    if message is None:
-        return None
-    cleaned = re.sub(r"(?i)(api[-_ ]?key|authorization|token|secret)\s*[:=]\s*\S+", r"\1=[redacted]", message)
-    for value in sensitive_values:
-        if value:
-            cleaned = cleaned.replace(value, "[redacted]")
-    return cleaned[:500]
+    return sanitize_diagnostic(message, sensitive_values)
 
 
 class ConfigurationService:
@@ -220,15 +216,19 @@ class ConfigurationService:
                     "local Whisper paths must remain under the configured D-drive roots"
                 )
 
-    def _connection(self, connection_id: str) -> ProviderConnectionRecord:
+    def _connection(
+        self, connection_id: str, *, include_archived: bool = False
+    ) -> ProviderConnectionRecord:
         row = self.session.get(ProviderConnectionRecord, connection_id)
-        if row is None:
+        if row is None or (row.archived_at is not None and not include_archived):
             raise KeyError(connection_id)
         return row
 
-    def _profile(self, profile_id: str) -> ProcessorProfileRecord:
+    def _profile(
+        self, profile_id: str, *, include_archived: bool = False
+    ) -> ProcessorProfileRecord:
         row = self.session.get(ProcessorProfileRecord, profile_id)
-        if row is None:
+        if row is None or (row.archived_at is not None and not include_archived):
             raise KeyError(profile_id)
         return row
 
@@ -293,7 +293,7 @@ class ConfigurationService:
         row = ProviderConnectionRecord(
             name=cleaned_name,
             protocol=protocol,
-            base_url=_clean_base_url(base_url),
+            base_url=_clean_base_url(base_url, protocol),
             parameters=dict(parameters),
             credential_ref=f"connection:{uuid.uuid4()}",
         )
@@ -325,41 +325,72 @@ class ConfigurationService:
         if secret is not None and clear_secret:
             raise InvalidConfiguration("cannot replace and clear a secret together")
         row = self._connection(connection_id)
+        old_reference = row.credential_ref
+        old_secret = self.secrets.get(old_reference)
+        cleaned_name = row.name
+        if name is not None:
+            if not isinstance(name, str) or not name.strip():
+                raise InvalidConfiguration("connection name cannot be empty")
+            cleaned_name = name.strip()
+        cleaned_base_url = (
+            _clean_base_url(base_url, row.protocol) if base_url is not None else row.base_url
+        )
+        selected_parameters = dict(row.parameters)
         if parameters is not None:
             _validate_connection_parameters(row.protocol, parameters)
-        old_secret = self.secrets.get(row.credential_ref)
-        if name is not None:
-            cleaned_name = name.strip()
-            if not cleaned_name:
-                raise InvalidConfiguration("connection name cannot be empty")
-            row.name = cleaned_name
-        if base_url is not None:
-            row.base_url = _clean_base_url(base_url)
-        if parameters is not None:
-            row.parameters = dict(parameters)
-        row.revision += 1
-        row.test_ok = None
-        row.tested_revision = None
-        row.test_message = None
+            selected_parameters = dict(parameters)
+        secret_changed = secret is not None and secret != old_secret
+        secret_cleared = clear_secret and old_secret is not None
+        execution_changed = (
+            cleaned_base_url != row.base_url
+            or selected_parameters != dict(row.parameters)
+            or secret_changed
+            or secret_cleared
+        )
+        display_changed = cleaned_name != row.name
+        if not display_changed and not execution_changed:
+            return self._connection_view(row)
+
+        new_reference: str | None = None
         try:
-            if secret is not None:
-                self.secrets.set(row.credential_ref, secret)
-            elif clear_secret:
-                self.secrets.delete(row.credential_ref)
+            if secret_changed or secret_cleared:
+                new_reference = f"connection:{uuid.uuid4()}"
+                if secret_changed:
+                    assert secret is not None
+                    self.secrets.set(new_reference, secret)
+                row.credential_ref = new_reference
+            row.name = cleaned_name
+            row.base_url = cleaned_base_url
+            row.parameters = selected_parameters
+            if execution_changed:
+                row.revision += 1
+                row.test_ok = None
+                row.tested_revision = None
+                row.test_message = None
             self.session.commit()
         except Exception as error:
             self.session.rollback()
-            if old_secret is None:
-                self.secrets.delete(row.credential_ref)
-            else:
-                self.secrets.set(row.credential_ref, old_secret)
+            if new_reference is not None:
+                try:
+                    self.secrets.delete(new_reference)
+                except Exception:
+                    pass
             if isinstance(error, IntegrityError):
                 raise InvalidConfiguration("connection name already exists") from None
             raise
+        if new_reference is not None:
+            try:
+                self.secrets.delete(old_reference)
+            except Exception:
+                pass
         return self._connection_view(row)
 
     def list_connections(self) -> list[ConnectionView]:
-        rows = self.session.scalars(select(ProviderConnectionRecord).order_by(ProviderConnectionRecord.created_at)).all()
+        rows = self.session.scalars(
+            select(ProviderConnectionRecord)
+            .where(ProviderConnectionRecord.archived_at.is_(None))
+            .order_by(ProviderConnectionRecord.created_at)
+        ).all()
         return [self._connection_view(row) for row in rows]
 
     def get_connection(self, connection_id: str) -> ConnectionView:
@@ -367,17 +398,14 @@ class ConfigurationService:
 
     def delete_connection(self, connection_id: str) -> None:
         row = self._connection(connection_id)
-        reference = row.credential_ref
-        old_secret = self.secrets.get(reference)
-        self.secrets.delete(reference)
-        self.session.delete(row)
+        if any(profile.archived_at is None for profile in row.profiles):
+            raise InvalidConfiguration("connection has active profiles")
+        row.archived_at = datetime.now(timezone.utc)
         try:
             self.session.commit()
-        except Exception:
+        except IntegrityError:
             self.session.rollback()
-            if old_secret is not None:
-                self.secrets.set(reference, old_secret)
-            raise
+            raise InvalidConfiguration("connection could not be archived") from None
 
     def record_connection_test(self, connection_id: str, *, ok: bool, message: str | None) -> ConnectionView:
         row = self._connection(connection_id)
@@ -432,32 +460,56 @@ class ConfigurationService:
         allowed = {"name", "connection_id", "model", "context_length", "options"}
         if set(changes) - allowed:
             raise InvalidConfiguration("unsupported profile change")
+        if "options" in changes and changes["options"] is None:
+            raise InvalidConfiguration("profile options cannot be null")
         if "options" in changes:
             _validate_profile_options(row.purpose, changes["options"])
-        if "context_length" in changes and (
-            isinstance(changes["context_length"], bool) or changes["context_length"] <= 0
-        ):
-            raise InvalidConfiguration("context_length must be a positive integer")
+        if "context_length" in changes:
+            context_length = changes["context_length"]
+            if (
+                context_length is None
+                or isinstance(context_length, bool)
+                or not isinstance(context_length, int)
+                or context_length <= 0
+            ):
+                raise InvalidConfiguration("context_length must be a positive integer")
         for string_field in ("name", "model"):
             if string_field in changes:
-                cleaned = changes[string_field].strip()
+                value = changes[string_field]
+                if not isinstance(value, str):
+                    raise InvalidConfiguration(f"profile {string_field} cannot be null")
+                cleaned = value.strip()
                 if not cleaned:
                     raise InvalidConfiguration(f"profile {string_field} cannot be empty")
                 changes[string_field] = cleaned
         if "connection_id" in changes:
+            if changes["connection_id"] is None:
+                raise InvalidConfiguration("profile connection_id cannot be null")
             connection = self._connection(changes["connection_id"])
             if _PURPOSE_PROTOCOL[row.purpose] != connection.protocol:
                 raise InvalidConfiguration(
                     "profile purpose is incompatible with connection protocol"
                 )
-        for name, value in changes.items():
-            setattr(row, name, dict(value) if name == "options" else value)
-        row.revision += 1
-        row.test_ok = None
-        row.tested_revision = None
-        row.tested_connection_revision = None
-        row.upload_authorized_revision = None
-        row.upload_authorized_connection_revision = None
+        selected = {
+            name: dict(value) if name == "options" else value
+            for name, value in changes.items()
+        }
+        changed = {
+            name: value for name, value in selected.items()
+            if value != getattr(row, name)
+        }
+        if not changed:
+            return self._profile_view(row)
+        execution_changed = any(name != "name" for name in changed)
+        for name, value in changed.items():
+            setattr(row, name, value)
+        if execution_changed:
+            row.revision += 1
+            row.test_ok = None
+            row.tested_revision = None
+            row.tested_connection_revision = None
+            row.upload_authorized_revision = None
+            row.upload_authorized_connection_revision = None
         try:
             self.session.commit()
         except IntegrityError:
@@ -466,15 +518,36 @@ class ConfigurationService:
         return self._profile_view(row)
 
     def list_profiles(self) -> list[ProfileView]:
-        rows = self.session.scalars(select(ProcessorProfileRecord).order_by(ProcessorProfileRecord.created_at)).all()
+        rows = self.session.scalars(
+            select(ProcessorProfileRecord)
+            .where(ProcessorProfileRecord.archived_at.is_(None))
+            .order_by(ProcessorProfileRecord.created_at)
+        ).all()
         return [self._profile_view(row) for row in rows]
 
     def get_profile(self, profile_id: str) -> ProfileView:
         return self._profile_view(self._profile(profile_id))
 
     def delete_profile(self, profile_id: str) -> None:
-        self.session.delete(self._profile(profile_id))
-        self.session.commit()
+        row = self._profile(profile_id)
+        defaults = self.session.get(DefaultSettingsRecord, 1)
+        if defaults is not None:
+            if defaults.cloud_asr_profile_id == row.id:
+                defaults.cloud_asr_profile_id = None
+                if defaults.asr_mode == "cloud":
+                    defaults.asr_mode = "auto"
+            if defaults.translation_profile_id == row.id:
+                defaults.translation_profile_id = None
+                defaults.translation_enabled = False
+            if defaults.notes_profile_id == row.id:
+                defaults.notes_profile_id = None
+                defaults.notes_enabled = False
+        row.archived_at = datetime.now(timezone.utc)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            raise InvalidConfiguration("profile could not be archived") from None
 
     def record_profile_test(self, profile_id: str, *, ok: bool, message: str | None) -> ProfileView:
         row = self._profile(profile_id)
@@ -489,6 +562,23 @@ class ConfigurationService:
             ),
         )
         row.tested_at = datetime.now(timezone.utc)
+        if row.purpose == "notes" and ok:
+            defaults = self.session.get(DefaultSettingsRecord, 1)
+            if defaults is None:
+                defaults = DefaultSettingsRecord(
+                    id=1,
+                    local_whisper_options=dict(self.local_whisper_defaults),
+                    notes_auto_enable_allowed=True,
+                )
+                self.session.add(defaults)
+            if (
+                defaults.notes_auto_enable_allowed
+                and defaults.notes_profile_id is None
+                and not defaults.notes_enabled
+            ):
+                defaults.notes_profile_id = row.id
+                defaults.notes_enabled = True
+                defaults.notes_auto_enable_allowed = False
         self.session.commit()
         return self._profile_view(row)
 
@@ -515,8 +605,11 @@ class ConfigurationService:
     def _valid_profile(self, profile_id: str | None, purpose: str) -> bool:
         if profile_id is None:
             return False
-        row = self.session.get(ProcessorProfileRecord, profile_id)
-        if row is None or row.purpose != purpose:
+        try:
+            row = self._profile(profile_id)
+        except KeyError:
+            return False
+        if row.purpose != purpose:
             return False
         view = self._profile_view(row)
         return view.tested and view.test_ok is True
@@ -553,6 +646,13 @@ class ConfigurationService:
             raise InvalidConfiguration("invalid ASR mode")
         asr_mode = changes.get("asr_mode", row.asr_mode)
         cloud_id = changes.get("cloud_asr_profile_id", row.cloud_asr_profile_id)
+        if cloud_id is not None:
+            try:
+                cloud_reference = self._profile(cloud_id)
+            except KeyError:
+                raise InvalidConfiguration("cloud ASR profile does not exist") from None
+            if cloud_reference.purpose != "cloud_asr":
+                raise InvalidConfiguration("cloud ASR profile has the wrong purpose")
         if asr_mode == "cloud":
             if not self._valid_profile(cloud_id, "cloud_asr"):
                 raise InvalidConfiguration("cloud ASR profile must have a current successful test")
@@ -560,9 +660,23 @@ class ConfigurationService:
             if not self._profile_view(cloud_profile).upload_authorized:
                 raise InvalidConfiguration("cloud ASR profile requires current upload authorization")
         notes_id = changes.get("notes_profile_id", row.notes_profile_id)
+        if notes_id is not None:
+            try:
+                notes_reference = self._profile(notes_id)
+            except KeyError:
+                raise InvalidConfiguration("notes profile does not exist") from None
+            if notes_reference.purpose != "notes":
+                raise InvalidConfiguration("notes profile has the wrong purpose")
         if changes.get("notes_enabled", row.notes_enabled) and not self._valid_profile(notes_id, "notes"):
             raise InvalidConfiguration("notes require a current tested notes profile")
         translation_id = changes.get("translation_profile_id", row.translation_profile_id)
+        if translation_id is not None:
+            try:
+                translation_reference = self._profile(translation_id)
+            except KeyError:
+                raise InvalidConfiguration("translation profile does not exist") from None
+            if translation_reference.purpose != "translation":
+                raise InvalidConfiguration("translation profile has the wrong purpose")
         if changes.get("translation_enabled", row.translation_enabled) and not self._valid_profile(translation_id, "translation"):
             raise InvalidConfiguration("translation requires a current tested translation profile")
         target_language = changes.get(
@@ -591,19 +705,45 @@ class ConfigurationService:
             changes["local_whisper_options"] = merged_local_options
         for name, value in changes.items():
             setattr(row, name, dict(value) if name == "local_whisper_options" else value)
-        self.session.commit()
+        if "notes_enabled" in changes or "notes_profile_id" in changes:
+            row.notes_auto_enable_allowed = False
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            raise InvalidConfiguration("default profile reference is invalid") from None
         return self.get_defaults()
 
     def secret_for_connection(self, connection_id: str) -> str | None:
         """Return a secret only to an injected execution adapter, never to an API schema."""
 
-        return self.secrets.get(self._connection(connection_id).credential_ref)
+        return self.secrets.get(
+            self._connection(connection_id, include_archived=True).credential_ref
+        )
 
-    def snapshot_profile(self, profile_id: str) -> dict[str, Any]:
-        row = self._profile(profile_id)
+    def diagnostic_sensitive_values(self) -> tuple[str, ...]:
+        """Return internal redaction literals without exposing them through public views."""
+
+        values: list[str] = []
+        rows = self.session.scalars(select(ProviderConnectionRecord)).all()
+        for row in rows:
+            values.append(row.credential_ref)
+            try:
+                secret = self.secrets.get(row.credential_ref)
+            except Exception:
+                secret = None
+            if secret:
+                values.append(secret)
+        return tuple(values)
+
+    def snapshot_profile(
+        self, profile_id: str, *, include_archived: bool = False
+    ) -> dict[str, Any]:
+        row = self._profile(profile_id, include_archived=include_archived)
         connection = row.connection
         snapshot = {
             "id": row.id,
+            "connection_id": connection.id,
             "name": row.name,
             "purpose": row.purpose,
             "protocol": connection.protocol,
@@ -619,3 +759,8 @@ class ConfigurationService:
         if connection.protocol == "volc_bigasr_flash":
             snapshot["resource"] = "volc.bigasr.auc_turbo"
         return snapshot
+
+    def resolve_profile_for_execution(self, profile_id: str) -> dict[str, Any]:
+        """Resolve an immutable task reference even after its profile is archived."""
+
+        return self.snapshot_profile(profile_id, include_archived=True)

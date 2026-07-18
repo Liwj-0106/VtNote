@@ -31,7 +31,13 @@ def test_source_policy_rejects_non_public_or_fake_platform_urls(url: str) -> Non
         policy.validate(url)
 
 
-@pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.2", "169.254.1.1", "::1"])
+@pytest.mark.parametrize(
+    "address",
+    [
+        "127.0.0.1", "10.0.0.2", "169.254.1.1", "::1",
+        "224.0.0.1", "239.255.255.250", "ff02::1", "2001:db8::1",
+    ],
+)
 def test_source_policy_rejects_private_dns_answers(address: str) -> None:
     policy = SourceUrlPolicy(FakeResolver({"www.youtube.com": [address]}))
     with pytest.raises(UnsafeSourceUrl, match="public"):

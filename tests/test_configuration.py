@@ -74,6 +74,9 @@ def test_secret_change_rolls_back_when_database_commit_fails(tmp_path: Path) -> 
         service.update_connection(connection.id, secret="new-secret")
 
     assert secrets.get(credential_ref) == "old-secret"
+    session.refresh(stored)
+    assert stored.credential_ref == credential_ref
+    assert secrets.values_count == 1
     session.close()
     session.bind.dispose()
 
@@ -310,6 +313,34 @@ def test_connectivity_message_scrubs_known_secret_even_without_a_label(tmp_path:
             connection.id, ok=True, message="accepted unique-secret-value"
         )
         assert tested.test_message == "accepted [redacted]"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_connectivity_message_scrubs_structured_and_bearer_credentials(tmp_path: Path) -> None:
+    service, _, session = make_service(tmp_path)
+    try:
+        connection = service.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example.com/v1", parameters={}, secret="known-key"
+        )
+        tested = service.record_connection_test(
+            connection.id,
+            ok=False,
+            message=(
+                '{"access_token":"issued-token-value","api_key":"other-key"} '
+                "Authorization: Bearer bearer-value known-key"
+            ),
+        )
+        assert tested.test_message is not None
+        assert "issued-token-value" not in tested.test_message
+        assert "other-key" not in tested.test_message
+        assert "bearer-value" not in tested.test_message
+        assert "known-key" not in tested.test_message
+        stored = session.get(ProviderConnectionRecord, connection.id)
+        assert stored is not None
+        assert "issued-token-value" not in (stored.test_message or "")
     finally:
         session.bind.dispose()
         session.close()

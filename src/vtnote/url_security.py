@@ -59,8 +59,19 @@ class SourceUrlPolicy:
         if not answers:
             raise UnsafeSourceUrl("source host could not be resolved")
         for answer in answers:
-            address = ipaddress.ip_address(answer)
-            if not address.is_global:
+            try:
+                address = ipaddress.ip_address(answer)
+            except ValueError as error:
+                raise UnsafeSourceUrl("source host returned an invalid address") from error
+            if (
+                not address.is_global
+                or address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_multicast
+                or address.is_reserved
+                or address.is_unspecified
+            ):
                 raise UnsafeSourceUrl("source host must resolve only to public addresses")
         return url
 
