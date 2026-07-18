@@ -21,6 +21,15 @@ from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.exports import ExportFormat, render_export_from_json
 from vtnote.models import ItemRecord, StageRunRecord, TaskRecord
 from vtnote.paths import StoragePaths
+from vtnote.pipeline import (
+    ACTIVE_STAGE_STATUSES as _ACTIVE,
+    RETRY_ACTIVE_CONFLICTS as _RETRY_ACTIVE_CONFLICTS,
+    RETRYABLE_STAGE_STATUSES as _RETRYABLE,
+    STAGE_DEPENDENCIES as _STAGE_DEPENDENCIES,
+    STAGE_ORDER as _STAGE_ORDER,
+    SUCCESSFUL_STAGE_STATUSES as _SUCCESSFUL_PREREQUISITE,
+    TERMINAL_STATUSES as _TERMINAL,
+)
 from vtnote.url_security import SourceUrlPolicy
 
 
@@ -59,23 +68,6 @@ class TaskView(BaseModel):
     items: tuple[ItemView, ...]
 
 
-_TERMINAL = {"canceled", "completed", "completed_with_warnings", "failed"}
-_RETRYABLE = {"failed", "canceled"}
-_ACTIVE = {"running", "cancel_requested"}
-_SUCCESSFUL_PREREQUISITE = {"completed", "skipped"}
-_STAGE_ORDER = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
-_STAGE_DEPENDENCIES = {
-    "source": frozenset(),
-    "transcribe": frozenset({"source"}),
-    "translate": frozenset({"transcribe"}),
-    "notes": frozenset({"transcribe"}),
-}
-_RETRY_ACTIVE_CONFLICTS = {
-    "source": frozenset({"source", "transcribe", "translate", "notes"}),
-    "transcribe": frozenset({"source", "transcribe", "translate", "notes"}),
-    "translate": frozenset({"source", "transcribe", "translate"}),
-    "notes": frozenset({"source", "transcribe", "notes"}),
-}
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _TASK_OPTION_KEYS = frozenset(
     {

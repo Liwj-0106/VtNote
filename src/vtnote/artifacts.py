@@ -8,6 +8,8 @@ privileged same-machine process racing the check and write.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -19,6 +21,7 @@ from vtnote.schemas import (
     canonical_transcript_bytes,
     canonical_translation_bytes,
 )
+from vtnote.subtitles import parse_ass, parse_srt, parse_vtt
 
 
 class ArtifactExistsError(FileExistsError):
@@ -77,6 +80,76 @@ def _atomic_write(
             staged.unlink()
 
 
+def _ensure_immutable(paths: StoragePaths, destination: Path, data: bytes) -> Path:
+    try:
+        return _atomic_write(paths, destination, data, immutable=True)
+    except ArtifactExistsError:
+        paths.assert_durable_destination(destination)
+        if destination.is_file() and destination.read_bytes() == data:
+            return destination
+        raise
+
+
+def _validate_source_subtitle(extension: str, data: bytes) -> None:
+    normalized = extension.casefold()
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValueError("source subtitle must be UTF-8 text") from error
+    if normalized == "srt":
+        cues = parse_srt(text)
+    elif normalized == "vtt":
+        cues = parse_vtt(text)
+    elif normalized == "ass":
+        cues = parse_ass(text)
+    elif normalized == "json":
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise ValueError("source subtitle JSON is invalid") from error
+        cues = _validated_json_cues(payload)
+    else:
+        raise ValueError("unsupported source subtitle format")
+    if not cues:
+        raise ValueError("source subtitle contains no cues")
+
+
+def _finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _valid_json_cue(cue: object, *, bili: bool) -> bool:
+    if not isinstance(cue, dict):
+        return False
+    if bili:
+        start, end, text = cue.get("from"), cue.get("to"), cue.get("content")
+    else:
+        start, end, text = cue.get("start_ms"), cue.get("end_ms"), cue.get("text")
+    return (
+        _finite_number(start)
+        and _finite_number(end)
+        and 0 <= start < end
+        and isinstance(text, str)
+        and bool(text.strip())
+    )
+
+
+def _validated_json_cues(payload: object) -> list[object]:
+    if not isinstance(payload, dict):
+        return []
+    for key, bili in (("body", True), ("segments", False)):
+        cues = payload.get(key)
+        if isinstance(cues, list) and cues and all(
+            _valid_json_cue(cue, bili=bili) for cue in cues
+        ):
+            return cues
+    return []
+
+
 def write_note_markdown(
     paths: StoragePaths, item_id: str, note_id: str, markdown: str
 ) -> Path:
@@ -95,12 +168,34 @@ def write_transcript_json(
 ) -> Path:
     """Write the source transcript once; an existing target is never replaced."""
 
-    return _atomic_write(
-        paths,
-        paths.transcript(item_id),
-        canonical_transcript_bytes(transcript),
-        immutable=True,
+    return ensure_transcript_json(paths, item_id, transcript)
+
+
+def ensure_transcript_json(
+    paths: StoragePaths, item_id: str, transcript: Transcript
+) -> Path:
+    """Create the immutable transcript or accept identical recovery content."""
+
+    return _ensure_immutable(
+        paths, paths.transcript(item_id), canonical_transcript_bytes(transcript)
     )
+
+
+def write_source_original(
+    paths: StoragePaths, item_id: str, extension: str, source_bytes: bytes
+) -> Path:
+    """Persist a validated real source subtitle without ever replacing it."""
+
+    destination = paths.source_original(item_id, extension)
+    _validate_source_subtitle(extension, source_bytes)
+    source_directory = destination.parent
+    paths.assert_durable_destination(source_directory)
+    if source_directory.is_dir() and any(
+        candidate.name.startswith("original.") and candidate != destination
+        for candidate in source_directory.iterdir()
+    ):
+        raise ArtifactExistsError(str(source_directory))
+    return _ensure_immutable(paths, destination, source_bytes)
 
 
 def write_translation_json(

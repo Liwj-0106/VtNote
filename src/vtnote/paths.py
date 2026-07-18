@@ -6,7 +6,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import UUID
 
 from vtnote.config import Settings
@@ -22,6 +22,10 @@ _LANGUAGE_RE = re.compile(
 )
 _SOURCE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "json"})
 _AUDIO_EXTENSIONS = frozenset({"wav", "mp3", "m4a", "flac", "ogg", "opus", "webm"})
+_MEDIA_EXTENSIONS = frozenset(
+    {"mp4", "mkv", "mov", "webm", "avi", "m4v", "mp3", "m4a", "wav", "flac", "ogg", "opus"}
+)
+_UPLOAD_EXTENSIONS = _SOURCE_EXTENSIONS | _MEDIA_EXTENSIONS
 
 
 def _uuid_component(value: str | UUID) -> str:
@@ -152,6 +156,55 @@ class StoragePaths:
             "audio",
             f"source.{_extension(extension, _AUDIO_EXTENSIONS)}",
         )
+
+    def incoming_upload(self, upload_id: str | UUID, extension: str) -> Path:
+        return self.runtime(
+            "incoming",
+            _uuid_component(upload_id),
+            f"upload.{_extension(extension, _UPLOAD_EXTENSIONS)}",
+        )
+
+    def uploaded_source(self, item_id: str | UUID, extension: str) -> Path:
+        return self.runtime(
+            "items",
+            _uuid_component(item_id),
+            "source",
+            f"upload.{_extension(extension, _UPLOAD_EXTENSIONS)}",
+        )
+
+    def downloaded_audio(self, item_id: str | UUID, extension: str) -> Path:
+        return self.runtime(
+            "items",
+            _uuid_component(item_id),
+            "audio",
+            f"downloaded.{_extension(extension, _AUDIO_EXTENSIONS)}",
+        )
+
+    def cloud_ogg(self, item_id: str | UUID) -> Path:
+        return self.runtime("items", _uuid_component(item_id), "audio", "cloud.ogg")
+
+    def local_prepared_audio(self, item_id: str | UUID) -> Path:
+        return self.runtime("items", _uuid_component(item_id), "audio", "local.wav")
+
+    def trash_asset(self, asset_id: str | UUID, extension: str) -> Path:
+        return self.runtime(
+            "trash",
+            _uuid_component(asset_id),
+            f"asset.{_extension(extension, _UPLOAD_EXTENSIONS)}",
+        )
+
+    def runtime_relative(self, candidate: Path) -> str:
+        owned = self.assert_runtime_destination(Path(candidate))
+        return owned.relative_to(self.runtime_cache_root.absolute()).as_posix()
+
+    def runtime_from_relative(self, relative_path: str) -> Path:
+        if not isinstance(relative_path, str) or not relative_path or "\\" in relative_path:
+            raise UnsafePathError("runtime asset path must be a non-empty POSIX relative path")
+        relative = PurePosixPath(relative_path)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise UnsafePathError("runtime asset path must stay below the runtime root")
+        candidate = self.runtime(*relative.parts)
+        return self.assert_runtime_destination(candidate)
 
     def assert_durable_destination(self, candidate: Path) -> Path:
         return _assert_owned_path(self.data_root, candidate)

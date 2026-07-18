@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Connection, Engine, create_engine, event
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 
@@ -17,6 +17,17 @@ from vtnote.models import Base
 
 _BOOTSTRAP_LOCK = threading.Lock()
 _WAL_ATTEMPTS = 5
+_ADDITIVE_COLUMNS = {
+    "items": {
+        "source_display_name": "TEXT",
+    },
+    "stage_runs": {
+        "external_request_id": "VARCHAR(128)",
+        "external_log_id": "VARCHAR(256)",
+        "external_submission_state": "VARCHAR(32)",
+        "recovered_count": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
 
 
 def _configure_sqlite(connection: sqlite3.Connection, _: Any) -> None:
@@ -43,6 +54,36 @@ def _initialize_wal(engine: Engine) -> None:
             time.sleep(0.025 * (attempt + 1))
 
 
+def _apply_additive_schema_upgrades(connection: Connection) -> None:
+    """Add Task 3 columns to an existing Task 2 database without rebuilding rows."""
+
+    for table_name, additions in _ADDITIVE_COLUMNS.items():
+        columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql(
+                f'PRAGMA table_info("{table_name}")'
+            )
+        }
+        for column_name, declaration in additions.items():
+            if column_name not in columns:
+                connection.exec_driver_sql(
+                    f'ALTER TABLE "{table_name}" '
+                    f'ADD COLUMN "{column_name}" {declaration}'
+                )
+
+
+def _initialize_schema(engine: Engine) -> None:
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            Base.metadata.create_all(connection)
+            _apply_additive_schema_upgrades(connection)
+        except Exception:
+            connection.rollback()
+            raise
+        connection.commit()
+
+
 def initialize_database(database_path: Path) -> Engine:
     """Create a file-backed SQLite engine, enable durability pragmas, and create tables."""
 
@@ -58,7 +99,7 @@ def initialize_database(database_path: Path) -> Engine:
     try:
         with _BOOTSTRAP_LOCK:
             _initialize_wal(engine)
-            Base.metadata.create_all(engine)
+            _initialize_schema(engine)
     except Exception:
         engine.dispose()
         raise

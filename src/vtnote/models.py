@@ -83,6 +83,7 @@ class ItemRecord(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     source_locator: Mapped[str] = mapped_column(Text, nullable=False)
+    source_display_name: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     title: Mapped[str | None] = mapped_column(Text)
     artifact_relpath: Mapped[str | None] = mapped_column(Text)
@@ -97,6 +98,11 @@ class ItemRecord(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by=lambda: (StageRunRecord.stage, StageRunRecord.attempt),
+    )
+    runtime_assets: Mapped[list[RuntimeAssetRecord]] = relationship(
+        back_populates="item",
+        passive_deletes=True,
+        order_by=lambda: RuntimeAssetRecord.created_at,
     )
 
 
@@ -121,12 +127,90 @@ class StageRunRecord(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     warning: Mapped[str | None] = mapped_column(Text)
+    external_request_id: Mapped[str | None] = mapped_column(String(128))
+    external_log_id: Mapped[str | None] = mapped_column(String(256))
+    external_submission_state: Mapped[str | None] = mapped_column(String(32))
+    recovered_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
     item: Mapped[ItemRecord] = relationship(back_populates="stage_runs")
+
+
+class RuntimeAssetRecord(Base):
+    """An app-owned disposable file below the configured runtime cache."""
+
+    __tablename__ = "runtime_assets"
+    __table_args__ = (
+        UniqueConstraint("relative_path", name="uq_runtime_assets_relative_path"),
+        UniqueConstraint(
+            "original_relative_path", name="uq_runtime_assets_original_relative_path"
+        ),
+        CheckConstraint("size_bytes >= 0", name="ck_runtime_asset_size"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("items.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    original_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="active", index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    purge_after: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    item: Mapped[ItemRecord] = relationship(back_populates="runtime_assets")
+
+
+class RuntimeCleanupEventRecord(Base):
+    """Persistent audit result for an app-owned runtime cleanup attempt."""
+
+    __tablename__ = "runtime_cleanup_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
+
+
+class ResourceLeaseRecord(Base):
+    """Exclusive named resource lease used by durable workers."""
+
+    __tablename__ = "resource_leases"
+
+    resource_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    lease_owner: Mapped[str] = mapped_column(String(128), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class WorkerHeartbeatRecord(Base):
+    """Last-seen state for one independently supervised worker process."""
+
+    __tablename__ = "worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    process_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
 
 class ProviderConnectionRecord(Base):

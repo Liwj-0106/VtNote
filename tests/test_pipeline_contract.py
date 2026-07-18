@@ -10,6 +10,12 @@ from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.models import ItemRecord
 from vtnote.paths import StoragePaths
+from vtnote.pipeline import (
+    RETRY_ACTIVE_CONFLICTS,
+    STAGE_DEPENDENCIES,
+    aggregate_item_status,
+    aggregate_task_status,
+)
 from vtnote.secrets import MemorySecretStore
 from vtnote.tasks import TaskService
 from vtnote.url_security import SourceUrlPolicy
@@ -18,6 +24,64 @@ from vtnote.url_security import SourceUrlPolicy
 class PublicResolver:
     def resolve(self, host: str) -> list[str]:
         return ["142.250.72.14"]
+
+
+def test_shared_pipeline_keeps_translation_and_notes_as_parallel_branches() -> None:
+    assert STAGE_DEPENDENCIES == {
+        "source": frozenset(),
+        "transcribe": frozenset({"source"}),
+        "translate": frozenset({"transcribe"}),
+        "notes": frozenset({"transcribe"}),
+    }
+    assert "notes" not in RETRY_ACTIVE_CONFLICTS["translate"]
+    assert "translate" not in RETRY_ACTIVE_CONFLICTS["notes"]
+
+
+def test_shared_pipeline_aggregates_core_and_optional_stage_outcomes() -> None:
+    core_success = {"source": "completed", "transcribe": "completed"}
+
+    assert aggregate_item_status(core_success) == "completed"
+    assert aggregate_item_status(
+        {**core_success, "translate": "failed", "notes": "completed"}
+    ) == "completed_with_warnings"
+    assert aggregate_item_status(
+        {**core_success, "translate": "completed", "notes": "running"}
+    ) == "running"
+    assert aggregate_item_status(
+        {"source": "completed", "transcribe": "failed"}
+    ) == "failed"
+    assert aggregate_task_status(["completed", "completed_with_warnings"]) == (
+        "completed_with_warnings"
+    )
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (
+            {
+                "source": "failed",
+                "transcribe": "queued",
+                "translate": "queued",
+                "notes": "queued",
+            },
+            "failed",
+        ),
+        (
+            {
+                "source": "completed",
+                "transcribe": "canceled",
+                "translate": "queued",
+                "notes": "queued",
+            },
+            "canceled",
+        ),
+    ],
+)
+def test_core_terminal_outcome_dominates_queued_dependents(
+    statuses: dict[str, str], expected: str
+) -> None:
+    assert aggregate_item_status(statuses) == expected
 
 
 def make_services(tmp_path: Path):
