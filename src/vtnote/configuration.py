@@ -15,9 +15,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from vtnote.models import (
+    CredentialCleanupRecord,
     DefaultSettingsRecord,
     ProcessorProfileRecord,
     ProviderConnectionRecord,
+    TaskRecord,
 )
 from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
@@ -43,6 +45,12 @@ class ConnectionView(PublicModel):
     tested: bool
     test_ok: bool | None
     test_message: str | None
+    cleanup_pending: bool
+
+
+class CredentialCleanupStatusView(PublicModel):
+    cleanup_pending: bool
+    pending_count: int
 
 
 class ProfileView(PublicModel):
@@ -90,6 +98,9 @@ _PURPOSE_OPTIONS = {
     "translation": frozenset({"temperature", "max_tokens"}),
     "notes": frozenset({"temperature", "max_tokens"}),
 }
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"canceled", "completed", "completed_with_warnings", "failed"}
+)
 
 
 def _validate_connection_parameters(protocol: str, parameters: dict[str, Any]) -> None:
@@ -232,8 +243,81 @@ class ConfigurationService:
             raise KeyError(profile_id)
         return row
 
+    def _nonterminal_snapshot_references(self) -> tuple[set[str], set[str]]:
+        profile_ids: set[str] = set()
+        connection_ids: set[str] = set()
+        snapshots = self.session.scalars(
+            select(TaskRecord.pipeline_snapshot_json).where(
+                TaskRecord.status.not_in(_TERMINAL_TASK_STATUSES)
+            )
+        ).all()
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            for section_name in ("asr", "translation", "notes"):
+                section = snapshot.get(section_name)
+                profile = section.get("profile") if isinstance(section, dict) else None
+                if not isinstance(profile, dict):
+                    continue
+                profile_id = profile.get("id")
+                connection_id = profile.get("connection_id")
+                if isinstance(profile_id, str):
+                    profile_ids.add(profile_id)
+                if isinstance(connection_id, str):
+                    connection_ids.add(connection_id)
+        return profile_ids, connection_ids
+
+    def _queue_credential_cleanup(
+        self, credential_ref: str, connection_id: str | None
+    ) -> CredentialCleanupRecord:
+        row = self.session.get(CredentialCleanupRecord, credential_ref)
+        if row is None:
+            row = CredentialCleanupRecord(
+                credential_ref=credential_ref, connection_id=connection_id
+            )
+            self.session.add(row)
+        elif row.connection_id is None and connection_id is not None:
+            row.connection_id = connection_id
+        return row
+
+    def _attempt_credential_cleanup(self, credential_ref: str) -> bool:
+        row = self.session.get(CredentialCleanupRecord, credential_ref)
+        if row is None:
+            return True
+        row.attempts += 1
+        row.last_attempt_at = datetime.now(timezone.utc)
+        try:
+            self.secrets.delete(credential_ref)
+        except Exception:
+            try:
+                self.session.commit()
+            except Exception:
+                self.session.rollback()
+            return False
+        self.session.delete(row)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            return False
+        return True
+
+    def _delete_or_queue_orphaned_credential(
+        self, credential_ref: str, connection_id: str | None = None
+    ) -> None:
+        try:
+            self.secrets.delete(credential_ref)
+        except Exception:
+            self._queue_credential_cleanup(credential_ref, connection_id)
+            self.session.commit()
+
     def _connection_view(self, row: ProviderConnectionRecord) -> ConnectionView:
         current = row.tested_revision == row.revision
+        cleanup_pending = self.session.scalar(
+            select(CredentialCleanupRecord.credential_ref)
+            .where(CredentialCleanupRecord.connection_id == row.id)
+            .limit(1)
+        ) is not None
         return ConnectionView(
             id=row.id,
             name=row.name,
@@ -245,6 +329,7 @@ class ConfigurationService:
             tested=current,
             test_ok=row.test_ok if current else None,
             test_message=row.test_message if current else None,
+            cleanup_pending=cleanup_pending,
         )
 
     def _profile_view(self, row: ProcessorProfileRecord) -> ProfileView:
@@ -306,7 +391,7 @@ class ConfigurationService:
         except Exception as error:
             self.session.rollback()
             if secret is not None:
-                self.secrets.delete(row.credential_ref)
+                self._delete_or_queue_orphaned_credential(row.credential_ref)
             if isinstance(error, IntegrityError):
                 raise InvalidConfiguration("connection name already exists") from None
             raise
@@ -359,6 +444,7 @@ class ConfigurationService:
                     assert secret is not None
                     self.secrets.set(new_reference, secret)
                 row.credential_ref = new_reference
+                self._queue_credential_cleanup(old_reference, row.id)
             row.name = cleaned_name
             row.base_url = cleaned_base_url
             row.parameters = selected_parameters
@@ -371,18 +457,12 @@ class ConfigurationService:
         except Exception as error:
             self.session.rollback()
             if new_reference is not None:
-                try:
-                    self.secrets.delete(new_reference)
-                except Exception:
-                    pass
+                self._delete_or_queue_orphaned_credential(new_reference)
             if isinstance(error, IntegrityError):
                 raise InvalidConfiguration("connection name already exists") from None
             raise
         if new_reference is not None:
-            try:
-                self.secrets.delete(old_reference)
-            except Exception:
-                pass
+            self._attempt_credential_cleanup(old_reference)
         return self._connection_view(row)
 
     def list_connections(self) -> list[ConnectionView]:
@@ -400,12 +480,26 @@ class ConfigurationService:
         row = self._connection(connection_id)
         if any(profile.archived_at is None for profile in row.profiles):
             raise InvalidConfiguration("connection has active profiles")
-        row.archived_at = datetime.now(timezone.utc)
+        profile_references, connection_references = (
+            self._nonterminal_snapshot_references()
+        )
+        referenced = row.id in connection_references or any(
+            profile.id in profile_references for profile in row.profiles
+        )
+        cleanup_reference: str | None = None
+        if referenced:
+            row.archived_at = datetime.now(timezone.utc)
+        else:
+            cleanup_reference = row.credential_ref
+            self._queue_credential_cleanup(cleanup_reference, row.id)
+            self.session.delete(row)
         try:
             self.session.commit()
         except IntegrityError:
             self.session.rollback()
-            raise InvalidConfiguration("connection could not be archived") from None
+            raise InvalidConfiguration("connection could not be deleted") from None
+        if cleanup_reference is not None:
+            self._attempt_credential_cleanup(cleanup_reference)
 
     def record_connection_test(self, connection_id: str, *, ok: bool, message: str | None) -> ConnectionView:
         row = self._connection(connection_id)
@@ -542,12 +636,74 @@ class ConfigurationService:
             if defaults.notes_profile_id == row.id:
                 defaults.notes_profile_id = None
                 defaults.notes_enabled = False
-        row.archived_at = datetime.now(timezone.utc)
+        profile_references, _ = self._nonterminal_snapshot_references()
+        if row.id in profile_references:
+            row.archived_at = datetime.now(timezone.utc)
+        else:
+            self.session.delete(row)
         try:
             self.session.commit()
         except IntegrityError:
             self.session.rollback()
-            raise InvalidConfiguration("profile could not be archived") from None
+            raise InvalidConfiguration("profile could not be deleted") from None
+
+    def purge_unreferenced_archived(self) -> dict[str, int]:
+        """Purge archives after their last nonterminal task snapshot releases them."""
+
+        profile_references, connection_references = (
+            self._nonterminal_snapshot_references()
+        )
+        profiles = self.session.scalars(
+            select(ProcessorProfileRecord).where(
+                ProcessorProfileRecord.archived_at.is_not(None)
+            )
+        ).all()
+        purged_profiles = 0
+        for profile in profiles:
+            if profile.id not in profile_references:
+                self.session.delete(profile)
+                purged_profiles += 1
+        self.session.flush()
+
+        connections = self.session.scalars(
+            select(ProviderConnectionRecord).where(
+                ProviderConnectionRecord.archived_at.is_not(None)
+            )
+        ).all()
+        cleanup_references: list[str] = []
+        purged_connections = 0
+        for connection in connections:
+            if connection.id in connection_references:
+                continue
+            referenced_profile = self.session.scalar(
+                select(ProcessorProfileRecord.id)
+                .where(
+                    ProcessorProfileRecord.connection_id == connection.id,
+                    ProcessorProfileRecord.id.in_(profile_references),
+                )
+                .limit(1)
+            )
+            active_profile = self.session.scalar(
+                select(ProcessorProfileRecord.id)
+                .where(
+                    ProcessorProfileRecord.connection_id == connection.id,
+                    ProcessorProfileRecord.archived_at.is_(None),
+                )
+                .limit(1)
+            )
+            if referenced_profile is not None or active_profile is not None:
+                continue
+            cleanup_references.append(connection.credential_ref)
+            self._queue_credential_cleanup(connection.credential_ref, connection.id)
+            self.session.delete(connection)
+            purged_connections += 1
+        self.session.commit()
+        for credential_ref in cleanup_references:
+            self._attempt_credential_cleanup(credential_ref)
+        return {
+            "profiles": purged_profiles,
+            "connections": purged_connections,
+        }
 
     def record_profile_test(self, profile_id: str, *, ok: bool, message: str | None) -> ProfileView:
         row = self._profile(profile_id)
@@ -721,20 +877,46 @@ class ConfigurationService:
             self._connection(connection_id, include_archived=True).credential_ref
         )
 
+    def credential_cleanup_status(self) -> CredentialCleanupStatusView:
+        pending_count = len(
+            self.session.scalars(
+                select(CredentialCleanupRecord.credential_ref)
+            ).all()
+        )
+        return CredentialCleanupStatusView(
+            cleanup_pending=pending_count > 0,
+            pending_count=pending_count,
+        )
+
+    def retry_credential_cleanup(self) -> CredentialCleanupStatusView:
+        references = self.session.scalars(
+            select(CredentialCleanupRecord.credential_ref).order_by(
+                CredentialCleanupRecord.created_at
+            )
+        ).all()
+        for credential_ref in references:
+            self._attempt_credential_cleanup(credential_ref)
+        return self.credential_cleanup_status()
+
     def diagnostic_sensitive_values(self) -> tuple[str, ...]:
         """Return internal redaction literals without exposing them through public views."""
 
-        values: list[str] = []
+        values: set[str] = set()
         rows = self.session.scalars(select(ProviderConnectionRecord)).all()
-        for row in rows:
-            values.append(row.credential_ref)
+        cleanup_references = self.session.scalars(
+            select(CredentialCleanupRecord.credential_ref)
+        ).all()
+        for credential_ref in [row.credential_ref for row in rows] + list(
+            cleanup_references
+        ):
+            values.add(credential_ref)
             try:
-                secret = self.secrets.get(row.credential_ref)
+                secret = self.secrets.get(credential_ref)
             except Exception:
                 secret = None
             if secret:
-                values.append(secret)
-        return tuple(values)
+                values.add(secret)
+        return tuple(sorted(values, key=lambda value: (-len(value), value)))
 
     def snapshot_profile(
         self, profile_id: str, *, include_archived: bool = False

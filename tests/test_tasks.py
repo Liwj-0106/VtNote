@@ -322,6 +322,96 @@ def test_public_task_view_redacts_local_path_and_stage_diagnostics(tmp_path: Pat
         session.close()
 
 
+def test_stage_diagnostic_write_boundary_sanitizes_before_database_commit(
+    tmp_path: Path,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example/v1", parameters={}, secret="database-secret"
+        )
+        stored_connection = session.get(ProviderConnectionRecord, connection.id)
+        assert stored_connection is not None
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        stage_id = created.items[0].stage_runs[0].id
+        tasks.record_stage_failure(
+            stage_id,
+            error_code="source_failed",
+            message=(
+                '{"access_token":"issued-token"} database-secret '
+                f"{stored_connection.credential_ref}"
+            ),
+        )
+        tasks.record_stage_warning(
+            stage_id, "Authorization: Bearer warning-token database-secret"
+        )
+
+        session.expire_all()
+        stored = session.get(StageRunRecord, stage_id)
+        assert stored is not None
+        persisted = f"{stored.error_message} {stored.warning}"
+        assert "issued-token" not in persisted
+        assert "warning-token" not in persisted
+        assert "database-secret" not in persisted
+        assert stored_connection.credential_ref not in persisted
+        assert stored.status == "failed"
+        assert stored.error_code == "source_failed"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+@pytest.mark.parametrize("translation_status", ["failed", "canceled"])
+def test_notes_retry_depends_on_transcription_not_translation(
+    tmp_path: Path, translation_status: str,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Chat", protocol="openai_compatible",
+            base_url="https://api.example/v1", parameters={}
+        )
+        translation = configuration.create_profile(
+            name="Translation", purpose="translation",
+            connection_id=connection.id, model="translate"
+        )
+        notes = configuration.create_profile(
+            name="Notes", purpose="notes", connection_id=connection.id, model="notes"
+        )
+        configuration.record_profile_test(translation.id, ok=True, message="ok")
+        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
+            options={
+                "translation_enabled": True,
+                "translation_profile_id": translation.id,
+                "notes_enabled": True,
+                "notes_profile_id": notes.id,
+            },
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        statuses = {
+            "source": "completed", "transcribe": "completed",
+            "translate": translation_status, "notes": "failed",
+        }
+        for run in item.stage_runs:
+            run.status = statuses[run.stage]
+        session.commit()
+
+        retried = tasks.retry_stage(item.id, "notes")
+        attempts = [run for run in retried.stage_runs if run.stage == "notes"]
+        assert [(run.attempt, run.status) for run in attempts] == [
+            (1, "failed"), (2, "queued")
+        ]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
 def make_artifacts(paths: StoragePaths, item_id: str) -> None:
     transcript = Transcript(
         language="en",

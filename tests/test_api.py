@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -67,11 +69,23 @@ class UnsafeReportedRedirectProbe:
         )
 
 
+class RecoveringDeleteSecretStore(MemorySecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_delete = True
+
+    def delete(self, reference: str) -> None:
+        if self.fail_delete:
+            raise RuntimeError("credential backend delete unavailable")
+        super().delete(reference)
+
+
 def make_client(
     tmp_path: Path,
     *,
     connection_tester=None,
     source_probe=None,
+    secret_store=None,
 ) -> tuple[TestClient, object, StoragePaths]:
     settings = Settings(data_root=tmp_path / "data", runtime_cache_root=tmp_path / "cache")
     paths = StoragePaths.from_settings(settings)
@@ -79,7 +93,7 @@ def make_client(
     app = create_app(
         settings=settings,
         engine=engine,
-        secret_store=MemorySecretStore(),
+        secret_store=secret_store or MemorySecretStore(),
         resolver=PublicResolver(),
         connection_tester=connection_tester,
         source_probe=source_probe,
@@ -113,6 +127,29 @@ def test_exact_host_origin_and_double_submit_csrf_are_enforced(tmp_path: Path) -
         )
         assert wrong_csrf.status_code == 403
         assert "access-control-allow-origin" not in client.get("/api/tasks").headers
+    finally:
+        engine.dispose()
+
+
+def test_non_ascii_csrf_header_returns_sanitized_error(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        csrf(client)
+        headers = httpx.Headers(
+            [
+                (b"Origin", BASE_URL.encode("ascii")),
+                (b"X-CSRF-Token", b"\xff"),
+            ]
+        )
+        response = client.post("/api/tasks", headers=headers, json={"sources": []})
+        assert response.status_code == 403
+        assert response.json() == {
+            "error": {
+                "code": "csrf_failed",
+                "message": "CSRF validation failed",
+                "details": None,
+            }
+        }
     finally:
         engine.dispose()
 
@@ -183,6 +220,7 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
         assert created.status_code == 201
         connection = created.json()
         assert connection["has_secret"] is True
+        assert connection["cleanup_pending"] is False
         assert "secret" not in connection
         assert "super-secret" not in created.text
         assert "credential_ref" not in created.text
@@ -258,6 +296,40 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
         engine.dispose()
 
 
+def test_credential_cleanup_status_and_retry_never_expose_reference_or_secret(
+    tmp_path: Path,
+) -> None:
+    secrets = RecoveringDeleteSecretStore()
+    client, engine, _ = make_client(tmp_path, secret_store=secrets)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Disposable",
+                "protocol": "openai_compatible",
+                "base_url": "https://api.example/v1",
+                "parameters": {},
+                "secret": "cleanup-secret",
+            },
+        ).json()
+        assert client.delete(
+            f"/api/connections/{connection['id']}", headers=headers
+        ).status_code == 204
+
+        pending = client.get("/api/credential-cleanup")
+        assert pending.json() == {"cleanup_pending": True, "pending_count": 1}
+        assert "cleanup-secret" not in pending.text
+        assert "connection:" not in pending.text
+
+        secrets.fail_delete = False
+        retried = client.post("/api/credential-cleanup/retry", headers=headers)
+        assert retried.json() == {"cleanup_pending": False, "pending_count": 0}
+    finally:
+        engine.dispose()
+
+
 def test_patch_rejects_explicit_null_and_empty_patch_is_a_noop(tmp_path: Path) -> None:
     client, engine, _ = make_client(tmp_path)
     headers = csrf(client)
@@ -293,6 +365,51 @@ def test_patch_rejects_explicit_null_and_empty_patch_is_a_noop(tmp_path: Path) -
         assert client.patch(
             f"/api/profiles/{profile['id']}", headers=headers, json={}
         ).json()["revision"] == profile["revision"]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "asr_mode", "translation_enabled", "translation_target_language",
+        "notes_enabled", "notes_template", "notes_output_language",
+        "local_whisper_options",
+    ],
+)
+def test_defaults_patch_rejects_null_for_non_nullable_fields(
+    tmp_path: Path, field: str,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.patch(
+            "/api/defaults", headers=csrf(client), json={field: None}
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_error"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cloud_asr_profile_id",
+        "translation_profile_id",
+        "notes_profile_id",
+        "notes_custom_prompt",
+    ],
+)
+def test_defaults_patch_allows_null_only_for_nullable_fields(
+    tmp_path: Path, field: str,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.patch(
+            "/api/defaults", headers=csrf(client), json={field: None}
+        )
+        assert response.status_code == 200
+        assert response.json()[field] is None
     finally:
         engine.dispose()
 

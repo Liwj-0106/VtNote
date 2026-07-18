@@ -46,3 +46,12 @@
 - Extended source-probe results with duration, subtitle descriptors, and the reported redirect chain. The Task 3 adapter remains a trusted network boundary: it must disable automatic redirects and validate each peer before I/O; Task 2 validates the complete reported chain but does not claim DNS pinning.
 - Browser multipart media/subtitle staging is deliberately deferred to Task 3. Task 2 continues to accept an existing local path only at its internal service boundary and does not claim that contract is usable by browser file inputs.
 - Modified the Task 2 source/tests and this log. No project files were deleted.
+
+### Task 2 final boundary-fix pass
+
+- Added the only supported stage-diagnostic write methods. They redact known configuration secrets/references and credential-shaped values before assigning ORM fields or committing; direct diagnostic model mutation is documented as unsupported internal behavior, while public reads retain defense-in-depth redaction.
+- Replaced implicit linear retry ordering with an explicit dependency map. Translation and notes each depend on transcription, so a failed or canceled translation no longer blocks a notes-only retry.
+- Completed configuration archive lifecycle handling. Active names use SQLite partial unique indexes, nonterminal task snapshots keep their exact archived profile/connection bindings, unreferenced deletes hard-purge records, and `purge_unreferenced_archived()` releases archives after terminal tasks.
+- Added a durable credential-cleanup queue containing opaque references and operational metadata only. Credential rotation/deletion records cleanup in the same database transaction, failed secret-store deletion remains visible through non-secret status, cleanup is retryable, and queued references/secrets participate in diagnostic redaction.
+- Moved Host/Origin/CSRF checks inside the sanitized middleware boundary and explicitly rejects non-ASCII CSRF values. Defaults PATCH now rejects explicit `null` for non-nullable fields while retaining nullable profile IDs and custom notes prompts.
+- Added non-secret credential-cleanup status/retry API routes and focused lifecycle, persistence, retry, PATCH, and malformed-header regression tests. No project files were deleted.

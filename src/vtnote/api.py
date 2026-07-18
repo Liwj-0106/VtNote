@@ -136,6 +136,23 @@ class DefaultsPatch(InputModel):
     notes_custom_prompt: str | None = None
     local_whisper_options: dict[str, Any] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for field in (
+                "asr_mode",
+                "translation_enabled",
+                "translation_target_language",
+                "notes_enabled",
+                "notes_template",
+                "notes_output_language",
+                "local_whisper_options",
+            ):
+                if field in value and value[field] is None:
+                    raise ValueError(f"{field} cannot be null")
+        return value
+
 
 class SourceInput(InputModel):
     kind: Literal["url", "local_media", "local_subtitle"]
@@ -216,16 +233,23 @@ def create_app(
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
-        if request.headers.get("host") != expected_host:
-            return _error(403, "forbidden_host", "request Host is not allowed")
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            if request.headers.get("origin") != expected_origin:
-                return _error(403, "forbidden_origin", "request Origin is not allowed")
-            cookie = request.cookies.get("vtnote_csrf")
-            header = request.headers.get("x-csrf-token")
-            if not cookie or not header or not token_secrets.compare_digest(cookie, header):
-                return _error(403, "csrf_failed", "CSRF validation failed")
         try:
+            if request.headers.get("host") != expected_host:
+                return _error(403, "forbidden_host", "request Host is not allowed")
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+                if request.headers.get("origin") != expected_origin:
+                    return _error(403, "forbidden_origin", "request Origin is not allowed")
+                cookie = request.cookies.get("vtnote_csrf")
+                header = request.headers.get("x-csrf-token")
+                if not cookie or not header:
+                    return _error(403, "csrf_failed", "CSRF validation failed")
+                try:
+                    cookie.encode("ascii")
+                    header.encode("ascii")
+                except UnicodeEncodeError:
+                    return _error(403, "csrf_failed", "CSRF validation failed")
+                if not token_secrets.compare_digest(cookie, header):
+                    return _error(403, "csrf_failed", "CSRF validation failed")
             return await call_next(request)
         except Exception:
             logger.error("Unhandled request failure")
@@ -279,6 +303,22 @@ def create_app(
         session, configuration, _ = services()
         try:
             return [_dump(item) for item in configuration.list_connections()]
+        finally:
+            session.close()
+
+    @app.get("/api/credential-cleanup")
+    def credential_cleanup_status():
+        session, configuration, _ = services()
+        try:
+            return _dump(configuration.credential_cleanup_status())
+        finally:
+            session.close()
+
+    @app.post("/api/credential-cleanup/retry")
+    def retry_credential_cleanup():
+        session, configuration, _ = services()
+        try:
+            return _dump(configuration.retry_credential_cleanup())
         finally:
             session.close()
 

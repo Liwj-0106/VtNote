@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session
 
 from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
-from vtnote.models import ProviderConnectionRecord
+from vtnote.models import ProviderConnectionRecord, TaskRecord
 from vtnote.paths import StoragePaths
 from vtnote.secrets import MemorySecretStore
 from vtnote.tasks import TaskService
@@ -21,14 +21,15 @@ class PublicResolver:
         return ["142.250.72.14"]
 
 
-class DeleteFailingSecretStore(MemorySecretStore):
+class RecoveringDeleteSecretStore(MemorySecretStore):
     def __init__(self) -> None:
         super().__init__()
-        self.delete_calls = 0
+        self.fail_delete = True
 
     def delete(self, reference: str) -> None:
-        self.delete_calls += 1
-        raise RuntimeError("credential backend delete unavailable")
+        if self.fail_delete:
+            raise RuntimeError("credential backend delete unavailable")
+        super().delete(reference)
 
 
 def make_services(
@@ -134,18 +135,115 @@ def test_archiving_keeps_queued_task_profile_and_credential_resolvable(
     session.bind.dispose()
 
 
-def test_connection_archive_never_deletes_credential_even_if_delete_would_fail(
+def test_archived_names_can_be_reused_and_terminal_tasks_allow_purge(
     tmp_path: Path,
 ) -> None:
-    secrets = DeleteFailingSecretStore()
+    configuration, tasks, secrets, session = make_services(tmp_path)
+    old_connection = configuration.create_connection(
+        name="Chat", protocol="openai_compatible",
+        base_url="https://old.example/v1", parameters={}, secret="old-task-key"
+    )
+    old_profile = configuration.create_profile(
+        name="Notes", purpose="notes",
+        connection_id=old_connection.id, model="old-notes"
+    )
+    configuration.record_profile_test(old_profile.id, ok=True, message="ok")
+    task = tasks.create_task(
+        sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+    )
+    old_row = session.get(ProviderConnectionRecord, old_connection.id)
+    assert old_row is not None
+    old_reference = old_row.credential_ref
+
+    configuration.delete_profile(old_profile.id)
+    configuration.delete_connection(old_connection.id)
+    replacement = configuration.create_connection(
+        name="Chat", protocol="openai_compatible",
+        base_url="https://new.example/v1", parameters={}
+    )
+    replacement_profile = configuration.create_profile(
+        name="Notes", purpose="notes",
+        connection_id=replacement.id, model="new-notes"
+    )
+    assert replacement_profile.name == "Notes"
+    assert configuration.resolve_profile_for_execution(old_profile.id)["id"] == old_profile.id
+
+    task_row = session.get(TaskRecord, task.id)
+    assert task_row is not None
+    task_row.status = "completed"
+    session.commit()
+    purged = configuration.purge_unreferenced_archived()
+    assert purged["profiles"] == 1
+    assert purged["connections"] == 1
+    with pytest.raises(KeyError):
+        configuration.resolve_profile_for_execution(old_profile.id)
+    assert secrets.get(old_reference) is None
+    session.close()
+    session.bind.dispose()
+
+
+def test_failed_obsolete_credential_delete_is_tracked_and_retryable(
+    tmp_path: Path,
+) -> None:
+    secrets = RecoveringDeleteSecretStore()
     configuration, _, _, session = make_services(tmp_path, secrets)
     connection = configuration.create_connection(
         name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}, secret="retained-key"
+        base_url="https://api.example/v1", parameters={}, secret="old-secret"
     )
+    stored = session.get(ProviderConnectionRecord, connection.id)
+    assert stored is not None
+    old_reference = stored.credential_ref
+
+    updated = configuration.update_connection(connection.id, secret="new-secret")
+    assert updated.cleanup_pending is True
+    status = configuration.credential_cleanup_status()
+    assert status.cleanup_pending is True
+    assert status.pending_count == 1
+    assert {
+        column["name"]
+        for column in inspect(session.bind).get_columns("credential_cleanup")
+    } == {
+        "credential_ref", "connection_id", "attempts", "last_attempt_at", "created_at"
+    }
+    assert old_reference in configuration.diagnostic_sensitive_values()
+    assert "old-secret" in configuration.diagnostic_sensitive_values()
+
+    secrets.fail_delete = False
+    retried = configuration.retry_credential_cleanup()
+    assert retried.cleanup_pending is False
+    assert retried.pending_count == 0
+    assert secrets.get(old_reference) is None
+    session.close()
+    session.bind.dispose()
+
+
+def test_unreferenced_delete_hard_purges_and_tracks_failed_credential_cleanup(
+    tmp_path: Path,
+) -> None:
+    secrets = RecoveringDeleteSecretStore()
+    configuration, _, _, session = make_services(tmp_path, secrets)
+    connection = configuration.create_connection(
+        name="Disposable", protocol="openai_compatible",
+        base_url="https://api.example/v1", parameters={}, secret="purge-secret"
+    )
+    stored = session.get(ProviderConnectionRecord, connection.id)
+    assert stored is not None
+    reference = stored.credential_ref
     configuration.delete_connection(connection.id)
-    assert secrets.delete_calls == 0
-    assert configuration.secret_for_connection(connection.id) == "retained-key"
+    with pytest.raises(KeyError):
+        configuration.secret_for_connection(connection.id)
+    assert configuration.credential_cleanup_status().cleanup_pending is True
+    assert reference in configuration.diagnostic_sensitive_values()
+
+    recreated = configuration.create_connection(
+        name="Disposable", protocol="openai_compatible",
+        base_url="https://new.example/v1", parameters={}
+    )
+    assert recreated.name == "Disposable"
+    secrets.fail_delete = False
+    assert configuration.retry_credential_cleanup().cleanup_pending is False
+    assert secrets.get(reference) is None
     session.close()
     session.bind.dispose()
 

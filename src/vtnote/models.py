@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, JSON, DateTime, ForeignKey, Integer, String, Text,
-    UniqueConstraint,
+    Boolean, CheckConstraint, JSON, DateTime, ForeignKey, Index, Integer, String,
+    Text, UniqueConstraint, text,
 )
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -131,10 +131,18 @@ class StageRunRecord(Base):
 
 class ProviderConnectionRecord(Base):
     __tablename__ = "provider_connections"
+    __table_args__ = (
+        Index(
+            "uq_provider_connections_active_name",
+            "name",
+            unique=True,
+            sqlite_where=text("archived_at IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(
-        String(128, collation="NOCASE"), nullable=False, unique=True
+        String(128, collation="NOCASE"), nullable=False
     )
     protocol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
@@ -160,11 +168,19 @@ class ProviderConnectionRecord(Base):
 
 class ProcessorProfileRecord(Base):
     __tablename__ = "processor_profiles"
-    __table_args__ = (CheckConstraint("context_length > 0", name="ck_profile_context_length"),)
+    __table_args__ = (
+        CheckConstraint("context_length > 0", name="ck_profile_context_length"),
+        Index(
+            "uq_processor_profiles_active_name",
+            "name",
+            unique=True,
+            sqlite_where=text("archived_at IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(
-        String(128, collation="NOCASE"), nullable=False, unique=True
+        String(128, collation="NOCASE"), nullable=False
     )
     purpose: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     connection_id: Mapped[str] = mapped_column(
@@ -190,6 +206,20 @@ class ProcessorProfileRecord(Base):
     )
 
     connection: Mapped[ProviderConnectionRecord] = relationship(back_populates="profiles")
+
+
+class CredentialCleanupRecord(Base):
+    """Opaque references awaiting deletion from the external secret store."""
+
+    __tablename__ = "credential_cleanup"
+
+    credential_ref: Mapped[str] = mapped_column(String(128), primary_key=True)
+    connection_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
 
 
 class DefaultSettingsRecord(Base):

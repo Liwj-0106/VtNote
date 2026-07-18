@@ -1,8 +1,13 @@
-"""Durable task creation and control; this module never executes pipeline work."""
+"""Durable task control with the supported diagnostic persistence boundary.
+
+Workers must use ``record_stage_failure`` and ``record_stage_warning`` for diagnostic
+writes. Direct mutation of diagnostic ORM fields is internal and unsupported.
+"""
 
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +64,13 @@ _RETRYABLE = {"failed", "canceled"}
 _ACTIVE = {"running", "cancel_requested"}
 _SUCCESSFUL_PREREQUISITE = {"completed", "skipped"}
 _STAGE_ORDER = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
+_STAGE_DEPENDENCIES = {
+    "source": frozenset(),
+    "transcribe": frozenset({"source"}),
+    "translate": frozenset({"transcribe"}),
+    "notes": frozenset({"transcribe"}),
+}
+_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _TASK_OPTION_KEYS = frozenset(
     {
         "asr_mode",
@@ -87,6 +99,19 @@ class TaskService:
         self.configuration = configuration
         self.paths = paths
         self.source_urls = source_urls
+
+    def _stage_view(
+        self, row: StageRunRecord, sensitive_values: tuple[str, ...]
+    ) -> StageView:
+        return StageView(
+            id=row.id,
+            stage=row.stage,
+            attempt=row.attempt,
+            status=row.status,
+            error_code=row.error_code,
+            error_message=sanitize_diagnostic(row.error_message, sensitive_values),
+            warning=sanitize_diagnostic(row.warning, sensitive_values),
+        )
 
     def _load_task(self, task_id: str) -> TaskRecord:
         row = self.session.scalar(
@@ -119,17 +144,7 @@ class TaskService:
             status=row.status,
             title=row.title,
             stage_runs=tuple(
-                StageView(
-                    id=run.id,
-                    stage=run.stage,
-                    attempt=run.attempt,
-                    status=run.status,
-                    error_code=run.error_code,
-                    error_message=sanitize_diagnostic(
-                        run.error_message, redaction_values
-                    ),
-                    warning=sanitize_diagnostic(run.warning, redaction_values),
-                )
+                self._stage_view(run, redaction_values)
                 for run in sorted(
                     row.stage_runs,
                     key=lambda run: (_STAGE_ORDER.get(run.stage, 99), run.attempt),
@@ -294,6 +309,32 @@ class TaskService:
     def get_task(self, task_id: str) -> TaskView:
         return self._view(self._load_task(task_id))
 
+    def record_stage_failure(
+        self, stage_run_id: str, *, error_code: str, message: str
+    ) -> StageView:
+        if _ERROR_CODE.fullmatch(error_code) is None:
+            raise InvalidTaskOperation("invalid stage error code")
+        row = self.session.get(StageRunRecord, stage_run_id)
+        if row is None:
+            raise KeyError(stage_run_id)
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
+        safe_message = sanitize_diagnostic(message, sensitive_values)
+        row.status = "failed"
+        row.error_code = error_code
+        row.error_message = safe_message
+        self.session.commit()
+        return self._stage_view(row, sensitive_values)
+
+    def record_stage_warning(self, stage_run_id: str, warning: str) -> StageView:
+        row = self.session.get(StageRunRecord, stage_run_id)
+        if row is None:
+            raise KeyError(stage_run_id)
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
+        safe_warning = sanitize_diagnostic(warning, sensitive_values)
+        row.warning = safe_warning
+        self.session.commit()
+        return self._stage_view(row, sensitive_values)
+
     def cancel_task(self, task_id: str) -> TaskView:
         task = self._load_task(task_id)
         if task.status in _TERMINAL:
@@ -332,17 +373,16 @@ class TaskService:
         attempts = [run for run in item.stage_runs if run.stage == stage]
         if not attempts or attempts[-1].status not in _RETRYABLE:
             raise InvalidTaskOperation("only a failed or canceled stage can be retried")
-        if stage not in _STAGE_ORDER:
+        if stage not in _STAGE_DEPENDENCIES:
             raise InvalidTaskOperation("unknown pipeline stage")
         latest_by_stage: dict[str, StageRunRecord] = {}
         for run in item.stage_runs:
             previous = latest_by_stage.get(run.stage)
             if previous is None or run.attempt > previous.attempt:
                 latest_by_stage[run.stage] = run
-        for prerequisite, order in _STAGE_ORDER.items():
-            if order >= _STAGE_ORDER[stage] or prerequisite not in latest_by_stage:
-                continue
-            if latest_by_stage[prerequisite].status not in _SUCCESSFUL_PREREQUISITE:
+        for prerequisite in _STAGE_DEPENDENCIES[stage]:
+            latest = latest_by_stage.get(prerequisite)
+            if latest is None or latest.status not in _SUCCESSFUL_PREREQUISITE:
                 raise InvalidTaskOperation("stage prerequisite has not succeeded")
         next_attempt = max(run.attempt for run in attempts) + 1
         item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
