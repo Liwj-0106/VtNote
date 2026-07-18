@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -19,11 +22,12 @@ from vtnote.models import (
     RuntimeCleanupEventRecord,
     TaskRecord,
 )
-from vtnote.paths import StoragePaths
+from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 
 
 ITEM_ID = "11111111-1111-4111-8111-111111111111"
+ITEM_B_ID = "22222222-2222-4222-8222-222222222222"
 NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
 
 
@@ -362,6 +366,134 @@ def test_trash_reparse_refusal_is_recorded_with_a_safe_code(tmp_path: Path) -> N
         assert (outside / "downloaded.webm").read_bytes() == b"owned-audio"
     finally:
         close_session(session)
+
+
+def test_cross_item_audio_junction_cannot_alias_a_registered_asset(
+    tmp_path: Path,
+) -> None:
+    service, session, paths, _ = make_service(tmp_path)
+    try:
+        item_b_audio = paths.downloaded_audio(ITEM_B_ID, "webm")
+        item_b_audio.parent.mkdir(parents=True, exist_ok=True)
+        item_b_audio.write_bytes(b"item-b-audio")
+        item_a_audio_directory = paths.runtime(
+            "items", ITEM_ID, "audio"
+        )
+        item_a_audio_directory.parent.mkdir(parents=True, exist_ok=True)
+        make_directory_link(item_a_audio_directory, item_b_audio.parent)
+        alias_relative = f"items/{ITEM_ID}/audio/downloaded.webm"
+
+        with pytest.raises(UnsafePathError):
+            paths.runtime_from_relative(alias_relative)
+        with pytest.raises(RuntimeAssetError) as caught:
+            service.register_staged(
+                item_id=ITEM_ID,
+                role="downloaded_audio",
+                relative_path=alias_relative,
+            )
+        assert caught.value.code == "invalid_relative_path"
+        assert item_b_audio.read_bytes() == b"item-b-audio"
+        assert session.scalar(select(func.count()).select_from(RuntimeAssetRecord)) == 0
+    finally:
+        close_session(session)
+
+
+def test_purge_holds_writer_reservation_through_file_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, setup_session, paths, _ = make_service(tmp_path)
+    asset, _ = register_downloaded(service, paths)
+    trashed = service.trash(asset.id, now=NOW)
+    trash_path = paths.runtime_from_relative(trashed.relative_path)
+    engine = setup_session.bind
+    setup_session.close()
+
+    unlink_entered = Event()
+    allow_unlink = Event()
+    update_started = Event()
+    update_executed = Event()
+    original_unlink = Path.unlink
+
+    def blocking_unlink(path: Path, *args, **kwargs):
+        if path == trash_path:
+            unlink_entered.set()
+            assert allow_unlink.wait(5)
+        return original_unlink(path, *args, **kwargs)
+
+    def before_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("UPDATE ITEMS"):
+            update_started.set()
+
+    def after_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("UPDATE ITEMS"):
+            update_executed.set()
+
+    def run_purge() -> bool:
+        with Session(engine) as purge_session:
+            return RuntimeAssetService(purge_session, paths).purge(
+                asset.id, now=NOW + timedelta(hours=24)
+            )
+
+    def queue_item() -> None:
+        assert unlink_entered.wait(5)
+        with Session(engine) as writer_session:
+            item = writer_session.get(ItemRecord, ITEM_ID)
+            assert item is not None
+            item.status = "queued"
+            writer_session.commit()
+
+    monkeypatch.setattr(Path, "unlink", blocking_unlink)
+    sqlalchemy_event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    sqlalchemy_event.listen(engine, "after_cursor_execute", after_cursor_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            purge_future = pool.submit(run_purge)
+            assert unlink_entered.wait(5)
+            writer_future = pool.submit(queue_item)
+            assert update_started.wait(5)
+            assert not update_executed.wait(0.5)
+            allow_unlink.set()
+            assert purge_future.result(timeout=5) is True
+            writer_future.result(timeout=5)
+    finally:
+        allow_unlink.set()
+        sqlalchemy_event.remove(engine, "before_cursor_execute", before_cursor_execute)
+        sqlalchemy_event.remove(engine, "after_cursor_execute", after_cursor_execute)
+        engine.dispose()
+
+
+def test_purge_refuses_when_another_session_commits_active_state_first(
+    tmp_path: Path,
+) -> None:
+    service, setup_session, paths, _ = make_service(tmp_path)
+    asset, _ = register_downloaded(service, paths)
+    trashed = service.trash(asset.id, now=NOW)
+    trash_path = paths.runtime_from_relative(trashed.relative_path)
+    engine = setup_session.bind
+    setup_session.close()
+    try:
+        with Session(engine, expire_on_commit=False) as purge_session:
+            stale_item = purge_session.get(ItemRecord, ITEM_ID)
+            assert stale_item is not None
+            assert stale_item.status == "completed"
+            with Session(engine) as writer_session:
+                item = writer_session.get(ItemRecord, ITEM_ID)
+                assert item is not None
+                item.status = "running"
+                writer_session.commit()
+
+            with pytest.raises(RuntimeAssetError) as caught:
+                RuntimeAssetService(purge_session, paths).purge(
+                    asset.id, now=NOW + timedelta(hours=24)
+                )
+            assert caught.value.code == "active_work"
+        assert trash_path.exists()
+    finally:
+        engine.dispose()
 
 
 def test_purge_due_processes_only_assets_whose_retention_has_elapsed(

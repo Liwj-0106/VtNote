@@ -93,12 +93,13 @@ def _assert_owned_path(root: Path, candidate: Path) -> Path:
 
 
 def _resolve_under(root: Path, parts: tuple[str | Path, ...]) -> Path:
+    root = root.absolute()
     if not parts:
         return root
     converted = [Path(part) for part in parts]
     if any(part.is_absolute() or ".." in part.parts for part in converted):
         raise UnsafePathError("owned path components must be relative and cannot contain '..'")
-    candidate = root.joinpath(*converted).resolve(strict=False)
+    candidate = root.joinpath(*converted)
     try:
         candidate.relative_to(root)
     except ValueError as error:

@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from uuid import UUID
 
 from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from vtnote.models import (
@@ -162,6 +162,19 @@ class RuntimeAssetService:
             raise
         except OSError as error:
             raise RuntimeAssetError("filesystem_error") from error
+
+    def _reserve_purge_transaction(self) -> None:
+        if self.session.new or self.session.dirty or self.session.deleted:
+            raise RuntimeAssetError("pending_session_changes")
+        if self.session.in_transaction():
+            self.session.rollback()
+        connection = self.session.connection()
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        except OperationalError as error:
+            self.session.rollback()
+            raise RuntimeAssetError("database_busy") from error
+        self.session.expire_all()
 
     def register_staged(
         self, *, item_id: str, role: str, relative_path: str
@@ -321,6 +334,16 @@ class RuntimeAssetService:
         return self._view(row)
 
     def purge(self, asset_id: str, *, now: datetime | None = None) -> bool:
+        _canonical_uuid(asset_id, code="invalid_asset_id")
+        self._reserve_purge_transaction()
+        try:
+            return self._purge_reserved(asset_id, now=now)
+        except Exception:
+            if self.session.in_transaction():
+                self.session.rollback()
+            raise
+
+    def _purge_reserved(self, asset_id: str, *, now: datetime | None = None) -> bool:
         row = self._load(asset_id)
         timestamp = now or datetime.now(timezone.utc)
         if row.state != "trash":
