@@ -412,6 +412,165 @@ def test_notes_retry_depends_on_transcription_not_translation(
         session.close()
 
 
+@pytest.mark.parametrize(
+    ("retry_stage", "parallel_stage"),
+    [("notes", "translate"), ("translate", "notes")],
+)
+def test_translate_and_notes_retry_in_parallel_without_downgrading_running_state(
+    tmp_path: Path, retry_stage: str, parallel_stage: str,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example/v1",
+            parameters={},
+        )
+        translation = configuration.create_profile(
+            name="Translation",
+            purpose="translation",
+            connection_id=connection.id,
+            model="translate",
+        )
+        notes = configuration.create_profile(
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="notes",
+        )
+        configuration.record_profile_test(translation.id, ok=True, message="ok")
+        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
+            options={
+                "translation_enabled": True,
+                "translation_profile_id": translation.id,
+                "notes_enabled": True,
+                "notes_profile_id": notes.id,
+            },
+        )
+        task_row = session.get(TaskRecord, created.id)
+        assert task_row is not None
+        item = task_row.items[0]
+        for run in item.stage_runs:
+            if run.stage in {"source", "transcribe"}:
+                run.status = "completed"
+            elif run.stage == retry_stage:
+                run.status = "failed"
+            elif run.stage == parallel_stage:
+                run.status = "running"
+        item.status = "running"
+        task_row.status = "running"
+        session.commit()
+
+        retried = tasks.retry_stage(item.id, retry_stage)
+        assert retried.status == "running"
+        assert [
+            (run.attempt, run.status)
+            for run in retried.stage_runs
+            if run.stage == retry_stage
+        ] == [(1, "failed"), (2, "queued")]
+        assert next(
+            run for run in retried.stage_runs if run.stage == parallel_stage
+        ).status == "running"
+        session.refresh(task_row)
+        assert task_row.status == "running"
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+@pytest.mark.parametrize(
+    ("retry_stage", "active_dependent"),
+    [("source", "notes"), ("transcribe", "translate")],
+)
+def test_upstream_retry_conflicts_with_active_dependent_stage(
+    tmp_path: Path, retry_stage: str, active_dependent: str,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example/v1",
+            parameters={},
+        )
+        translation = configuration.create_profile(
+            name="Translation",
+            purpose="translation",
+            connection_id=connection.id,
+            model="translate",
+        )
+        notes = configuration.create_profile(
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="notes",
+        )
+        configuration.record_profile_test(translation.id, ok=True, message="ok")
+        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
+            options={
+                "translation_enabled": True,
+                "translation_profile_id": translation.id,
+                "notes_enabled": True,
+                "notes_profile_id": notes.id,
+            },
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        for run in item.stage_runs:
+            run.status = "completed"
+        next(run for run in item.stage_runs if run.stage == retry_stage).status = "failed"
+        next(run for run in item.stage_runs if run.stage == active_dependent).status = "running"
+        session.commit()
+
+        with pytest.raises(InvalidTaskOperation, match="active"):
+            tasks.retry_stage(item.id, retry_stage)
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_same_stage_active_attempt_blocks_duplicate_retry(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example/v1",
+            parameters={},
+        )
+        notes = configuration.create_profile(
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="notes",
+        )
+        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        for run in item.stage_runs:
+            run.status = "completed"
+        notes_run = next(run for run in item.stage_runs if run.stage == "notes")
+        notes_run.status = "failed"
+        item.stage_runs.append(
+            StageRunRecord(stage="notes", attempt=2, status="running")
+        )
+        session.commit()
+
+        with pytest.raises(InvalidTaskOperation, match="active"):
+            tasks.retry_stage(item.id, "notes")
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
 def make_artifacts(paths: StoragePaths, item_id: str) -> None:
     transcript = Transcript(
         language="en",

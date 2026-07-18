@@ -12,11 +12,12 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from vtnote.models import (
     CredentialCleanupRecord,
     DefaultSettingsRecord,
+    ItemRecord,
     ProcessorProfileRecord,
     ProviderConnectionRecord,
     TaskRecord,
@@ -101,6 +102,13 @@ _PURPOSE_OPTIONS = {
 _TERMINAL_TASK_STATUSES = frozenset(
     {"canceled", "completed", "completed_with_warnings", "failed"}
 )
+_RETRYABLE_STAGE_STATUSES = frozenset({"failed", "canceled"})
+_ARCHIVED_NAME_PREFIX = "__vtnote_archived__:"
+
+
+def _reject_reserved_name(value: str) -> None:
+    if value.casefold().startswith(_ARCHIVED_NAME_PREFIX):
+        raise InvalidConfiguration("configuration name uses a reserved internal prefix")
 
 
 def _validate_connection_parameters(protocol: str, parameters: dict[str, Any]) -> None:
@@ -243,15 +251,47 @@ class ConfigurationService:
             raise KeyError(profile_id)
         return row
 
-    def _nonterminal_snapshot_references(self) -> tuple[set[str], set[str]]:
+    def _retire_archived_name_conflicts(
+        self,
+        record_type: type[ProviderConnectionRecord] | type[ProcessorProfileRecord],
+        name: str,
+        *,
+        exclude_id: str | None = None,
+    ) -> None:
+        statement = select(record_type).where(
+            record_type.name == name,
+            record_type.archived_at.is_not(None),
+        )
+        if exclude_id is not None:
+            statement = statement.where(record_type.id != exclude_id)
+        for archived in self.session.scalars(statement).all():
+            archived.name = f"{_ARCHIVED_NAME_PREFIX}{archived.id}"
+
+    def _retained_snapshot_references(self) -> tuple[set[str], set[str]]:
         profile_ids: set[str] = set()
         connection_ids: set[str] = set()
-        snapshots = self.session.scalars(
-            select(TaskRecord.pipeline_snapshot_json).where(
-                TaskRecord.status.not_in(_TERMINAL_TASK_STATUSES)
+        tasks = self.session.scalars(
+            select(TaskRecord).options(
+                selectinload(TaskRecord.items).selectinload(ItemRecord.stage_runs)
             )
         ).all()
-        for snapshot in snapshots:
+        for task in tasks:
+            retained = task.status not in _TERMINAL_TASK_STATUSES
+            if not retained:
+                latest_runs: dict[tuple[str, str], Any] = {}
+                for item in task.items:
+                    for run in item.stage_runs:
+                        key = (item.id, run.stage)
+                        previous = latest_runs.get(key)
+                        if previous is None or run.attempt > previous.attempt:
+                            latest_runs[key] = run
+                retained = any(
+                    run.status in _RETRYABLE_STAGE_STATUSES
+                    for run in latest_runs.values()
+                )
+            if not retained:
+                continue
+            snapshot = task.pipeline_snapshot_json
             if not isinstance(snapshot, dict):
                 continue
             for section_name in ("asr", "translation", "notes"):
@@ -375,6 +415,7 @@ class ConfigurationService:
         cleaned_name = name.strip()
         if not cleaned_name:
             raise InvalidConfiguration("connection name cannot be empty")
+        _reject_reserved_name(cleaned_name)
         row = ProviderConnectionRecord(
             name=cleaned_name,
             protocol=protocol,
@@ -382,8 +423,12 @@ class ConfigurationService:
             parameters=dict(parameters),
             credential_ref=f"connection:{uuid.uuid4()}",
         )
-        self.session.add(row)
         try:
+            self._retire_archived_name_conflicts(
+                ProviderConnectionRecord, cleaned_name
+            )
+            self.session.flush()
+            self.session.add(row)
             self.session.flush()
             if secret is not None:
                 self.secrets.set(row.credential_ref, secret)
@@ -417,6 +462,7 @@ class ConfigurationService:
             if not isinstance(name, str) or not name.strip():
                 raise InvalidConfiguration("connection name cannot be empty")
             cleaned_name = name.strip()
+            _reject_reserved_name(cleaned_name)
         cleaned_base_url = (
             _clean_base_url(base_url, row.protocol) if base_url is not None else row.base_url
         )
@@ -438,6 +484,11 @@ class ConfigurationService:
 
         new_reference: str | None = None
         try:
+            if display_changed:
+                self._retire_archived_name_conflicts(
+                    ProviderConnectionRecord, cleaned_name, exclude_id=row.id
+                )
+                self.session.flush()
             if secret_changed or secret_cleared:
                 new_reference = f"connection:{uuid.uuid4()}"
                 if secret_changed:
@@ -481,7 +532,7 @@ class ConfigurationService:
         if any(profile.archived_at is None for profile in row.profiles):
             raise InvalidConfiguration("connection has active profiles")
         profile_references, connection_references = (
-            self._nonterminal_snapshot_references()
+            self._retained_snapshot_references()
         )
         referenced = row.id in connection_references or any(
             profile.id in profile_references for profile in row.profiles
@@ -529,24 +580,31 @@ class ConfigurationService:
         cleaned_model = model.strip()
         if not cleaned_name or not cleaned_model:
             raise InvalidConfiguration("profile name and model cannot be empty")
+        _reject_reserved_name(cleaned_name)
         if isinstance(context_length, bool) or context_length <= 0:
             raise InvalidConfiguration("context_length must be a positive integer")
         selected_options = dict(options or {})
         _validate_profile_options(purpose, selected_options)
-        row = ProcessorProfileRecord(
-            name=cleaned_name,
-            purpose=purpose,
-            connection=connection,
-            model=cleaned_model,
-            context_length=context_length,
-            options=selected_options,
-        )
-        self.session.add(row)
         try:
+            self._retire_archived_name_conflicts(
+                ProcessorProfileRecord, cleaned_name
+            )
+            self.session.flush()
+            row = ProcessorProfileRecord(
+                name=cleaned_name,
+                purpose=purpose,
+                connection=connection,
+                model=cleaned_model,
+                context_length=context_length,
+                options=selected_options,
+            )
+            self.session.add(row)
             self.session.commit()
-        except IntegrityError:
+        except Exception as error:
             self.session.rollback()
-            raise InvalidConfiguration("profile name already exists") from None
+            if isinstance(error, IntegrityError):
+                raise InvalidConfiguration("profile name already exists") from None
+            raise
         return self._profile_view(row)
 
     def update_profile(self, profile_id: str, **changes: Any) -> ProfileView:
@@ -575,6 +633,8 @@ class ConfigurationService:
                 cleaned = value.strip()
                 if not cleaned:
                     raise InvalidConfiguration(f"profile {string_field} cannot be empty")
+                if string_field == "name":
+                    _reject_reserved_name(cleaned)
                 changes[string_field] = cleaned
         if "connection_id" in changes:
             if changes["connection_id"] is None:
@@ -595,20 +655,27 @@ class ConfigurationService:
         if not changed:
             return self._profile_view(row)
         execution_changed = any(name != "name" for name in changed)
-        for name, value in changed.items():
-            setattr(row, name, value)
-        if execution_changed:
-            row.revision += 1
-            row.test_ok = None
-            row.tested_revision = None
-            row.tested_connection_revision = None
-            row.upload_authorized_revision = None
-            row.upload_authorized_connection_revision = None
         try:
+            if "name" in changed:
+                self._retire_archived_name_conflicts(
+                    ProcessorProfileRecord, changed["name"], exclude_id=row.id
+                )
+                self.session.flush()
+            for name, value in changed.items():
+                setattr(row, name, value)
+            if execution_changed:
+                row.revision += 1
+                row.test_ok = None
+                row.tested_revision = None
+                row.tested_connection_revision = None
+                row.upload_authorized_revision = None
+                row.upload_authorized_connection_revision = None
             self.session.commit()
-        except IntegrityError:
+        except Exception as error:
             self.session.rollback()
-            raise InvalidConfiguration("profile name already exists") from None
+            if isinstance(error, IntegrityError):
+                raise InvalidConfiguration("profile name already exists") from None
+            raise
         return self._profile_view(row)
 
     def list_profiles(self) -> list[ProfileView]:
@@ -636,7 +703,7 @@ class ConfigurationService:
             if defaults.notes_profile_id == row.id:
                 defaults.notes_profile_id = None
                 defaults.notes_enabled = False
-        profile_references, _ = self._nonterminal_snapshot_references()
+        profile_references, _ = self._retained_snapshot_references()
         if row.id in profile_references:
             row.archived_at = datetime.now(timezone.utc)
         else:
@@ -648,10 +715,10 @@ class ConfigurationService:
             raise InvalidConfiguration("profile could not be deleted") from None
 
     def purge_unreferenced_archived(self) -> dict[str, int]:
-        """Purge archives after their last nonterminal task snapshot releases them."""
+        """Purge archives after their last retained task snapshot releases them."""
 
         profile_references, connection_references = (
-            self._nonterminal_snapshot_references()
+            self._retained_snapshot_references()
         )
         profiles = self.session.scalars(
             select(ProcessorProfileRecord).where(

@@ -70,6 +70,12 @@ _STAGE_DEPENDENCIES = {
     "translate": frozenset({"transcribe"}),
     "notes": frozenset({"transcribe"}),
 }
+_RETRY_ACTIVE_CONFLICTS = {
+    "source": frozenset({"source", "transcribe", "translate", "notes"}),
+    "transcribe": frozenset({"source", "transcribe", "translate", "notes"}),
+    "translate": frozenset({"source", "transcribe", "translate"}),
+    "notes": frozenset({"source", "transcribe", "notes"}),
+}
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _TASK_OPTION_KEYS = frozenset(
     {
@@ -368,13 +374,19 @@ class TaskService:
             raise KeyError(item_id)
         if item.status == "cancel_requested" or item.task.status == "cancel_requested":
             raise InvalidTaskOperation("cannot retry while cancellation is active")
-        if any(run.status in _ACTIVE for run in item.stage_runs):
-            raise InvalidTaskOperation("cannot retry while another stage is active")
+        if stage not in _STAGE_DEPENDENCIES:
+            raise InvalidTaskOperation("unknown pipeline stage")
+        if any(
+            run.status in _ACTIVE
+            and run.stage in _RETRY_ACTIVE_CONFLICTS[stage]
+            for run in item.stage_runs
+        ):
+            raise InvalidTaskOperation(
+                "cannot retry while a conflicting stage is active"
+            )
         attempts = [run for run in item.stage_runs if run.stage == stage]
         if not attempts or attempts[-1].status not in _RETRYABLE:
             raise InvalidTaskOperation("only a failed or canceled stage can be retried")
-        if stage not in _STAGE_DEPENDENCIES:
-            raise InvalidTaskOperation("unknown pipeline stage")
         latest_by_stage: dict[str, StageRunRecord] = {}
         for run in item.stage_runs:
             previous = latest_by_stage.get(run.stage)
@@ -384,10 +396,22 @@ class TaskService:
             latest = latest_by_stage.get(prerequisite)
             if latest is None or latest.status not in _SUCCESSFUL_PREREQUISITE:
                 raise InvalidTaskOperation("stage prerequisite has not succeeded")
+        item_has_active_work = any(
+            run.status in _ACTIVE for run in item.stage_runs
+        )
+        task_has_active_work = self.session.scalar(
+            select(StageRunRecord.id)
+            .join(ItemRecord, StageRunRecord.item_id == ItemRecord.id)
+            .where(
+                ItemRecord.task_id == item.task_id,
+                StageRunRecord.status.in_(_ACTIVE),
+            )
+            .limit(1)
+        ) is not None
         next_attempt = max(run.attempt for run in attempts) + 1
         item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
-        item.status = "queued"
-        item.task.status = "queued"
+        item.status = "running" if item_has_active_work else "queued"
+        item.task.status = "running" if task_has_active_work else "queued"
         try:
             self.session.commit()
         except IntegrityError:

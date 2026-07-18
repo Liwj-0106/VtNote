@@ -55,3 +55,11 @@
 - Added a durable credential-cleanup queue containing opaque references and operational metadata only. Credential rotation/deletion records cleanup in the same database transaction, failed secret-store deletion remains visible through non-secret status, cleanup is retryable, and queued references/secrets participate in diagnostic redaction.
 - Moved Host/Origin/CSRF checks inside the sanitized middleware boundary and explicitly rejects non-ASCII CSRF values. Defaults PATCH now rejects explicit `null` for non-nullable fields while retaining nullable profile IDs and custom notes prompts.
 - Added non-secret credential-cleanup status/retry API routes and focused lifecycle, persistence, retry, PATCH, and malformed-header regression tests. No project files were deleted.
+
+### Task 2 independent-review follow-up
+
+- Added compatibility for databases created before active-name partial indexes. SQLite `create_all()` is not treated as a constraint migration: when a requested connection/profile name collides with an archived row, the archived row is transactionally retired to a reserved UUID-derived internal name before reuse. The operation rolls back as one unit on failure, the reserved prefix is rejected from user input, and active-name uniqueness remains database-enforced on both legacy and new schemas.
+- The archived row name becomes non-operational after a collision. Existing task `pipeline_snapshot_json` remains the provenance source for the original display name; Task 3 execution must not derive provenance from the retired configuration-row name.
+- Extended archive retention to retryable terminal tasks. A task snapshot remains pinned while the task is nonterminal or any item/stage's latest attempt is failed/canceled; historical failures stop pinning after a later successful attempt.
+- Replaced the global active-stage retry block with explicit conflict rules. Translation and notes can be retried in parallel without downgrading running item/task state, while same-stage and upstream source/transcription retries remain blocked by conflicting active work.
+- Added a real legacy-schema fixture plus compatibility, rollback, terminal retry, latest-attempt, and parallel-conflict regression tests. No table rebuild was added, and no project files were deleted.

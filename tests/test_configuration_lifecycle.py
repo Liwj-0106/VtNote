@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import event, inspect
+from sqlalchemy import Engine, MetaData, UniqueConstraint, create_engine, event, inspect
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session
 
 from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
-from vtnote.models import ProviderConnectionRecord, TaskRecord
+from vtnote.models import (
+    Base,
+    ItemRecord,
+    ProcessorProfileRecord,
+    ProviderConnectionRecord,
+    TaskRecord,
+)
 from vtnote.paths import StoragePaths
 from vtnote.secrets import MemorySecretStore
 from vtnote.tasks import TaskService
@@ -46,6 +54,37 @@ def make_services(
         session, configuration, paths, SourceUrlPolicy(PublicResolver())
     )
     return configuration, tasks, selected_secrets, session
+
+
+def create_legacy_global_name_schema(database_path: Path) -> Engine:
+    """Create the pre-partial-index schema with real SQLite UNIQUE constraints."""
+
+    legacy_metadata = MetaData()
+    for table in Base.metadata.sorted_tables:
+        table.to_metadata(legacy_metadata)
+    legacy_metadata.remove(legacy_metadata.tables["credential_cleanup"])
+    for table_name, partial_index_name, constraint_name in (
+        (
+            "provider_connections",
+            "uq_provider_connections_active_name",
+            "uq_provider_connections_name",
+        ),
+        (
+            "processor_profiles",
+            "uq_processor_profiles_active_name",
+            "uq_processor_profiles_name",
+        ),
+    ):
+        table = legacy_metadata.tables[table_name]
+        for index in list(table.indexes):
+            if index.name == partial_index_name:
+                table.indexes.remove(index)
+        UniqueConstraint(table.c.name, name=constraint_name)
+    engine = create_engine(
+        URL.create("sqlite+pysqlite", database=str(database_path))
+    )
+    legacy_metadata.create_all(engine)
+    return engine
 
 
 def test_secret_rotation_never_exposes_new_secret_with_old_database_config(
@@ -178,6 +217,264 @@ def test_archived_names_can_be_reused_and_terminal_tasks_allow_purge(
     with pytest.raises(KeyError):
         configuration.resolve_profile_for_execution(old_profile.id)
     assert secrets.get(old_reference) is None
+    session.close()
+    session.bind.dispose()
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "retryable_stage_status"),
+    [
+        ("failed", "failed"),
+        ("completed_with_warnings", "failed"),
+        ("canceled", "canceled"),
+    ],
+)
+def test_retryable_terminal_task_pins_archives_until_latest_attempt_succeeds(
+    tmp_path: Path,
+    terminal_status: str,
+    retryable_stage_status: str,
+) -> None:
+    configuration, tasks, secrets, session = make_services(tmp_path)
+    connection = configuration.create_connection(
+        name="Chat",
+        protocol="openai_compatible",
+        base_url="https://api.example/v1",
+        parameters={},
+        secret="retry-secret",
+    )
+    profile = configuration.create_profile(
+        name="Notes",
+        purpose="notes",
+        connection_id=connection.id,
+        model="notes",
+    )
+    configuration.record_profile_test(profile.id, ok=True, message="ok")
+    task = tasks.create_task(
+        sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+    )
+    task_row = session.get(TaskRecord, task.id)
+    assert task_row is not None
+    item = task_row.items[0]
+    for run in item.stage_runs:
+        run.status = (
+            retryable_stage_status if run.stage == "notes" else "completed"
+        )
+    task_row.status = terminal_status
+    item.status = terminal_status
+    connection_row = session.get(ProviderConnectionRecord, connection.id)
+    assert connection_row is not None
+    credential_ref = connection_row.credential_ref
+    session.commit()
+
+    configuration.delete_profile(profile.id)
+    configuration.delete_connection(connection.id)
+    assert configuration.purge_unreferenced_archived() == {
+        "profiles": 0,
+        "connections": 0,
+    }
+    assert configuration.resolve_profile_for_execution(profile.id)["id"] == profile.id
+    assert configuration.secret_for_connection(connection.id) == "retry-secret"
+
+    retried = tasks.retry_stage(item.id, "notes")
+    assert [
+        (run.attempt, run.status)
+        for run in retried.stage_runs
+        if run.stage == "notes"
+    ] == [(1, retryable_stage_status), (2, "queued")]
+    item_row = session.get(ItemRecord, item.id)
+    assert item_row is not None
+    latest_notes = max(
+        (run for run in item_row.stage_runs if run.stage == "notes"),
+        key=lambda run: run.attempt,
+    )
+    latest_notes.status = "completed"
+    item_row.status = "completed"
+    task_row.status = "completed"
+    session.commit()
+
+    assert configuration.purge_unreferenced_archived() == {
+        "profiles": 1,
+        "connections": 1,
+    }
+    assert secrets.get(credential_ref) is None
+    session.close()
+    session.bind.dispose()
+
+
+def test_legacy_global_unique_schema_reuses_archived_names_without_rebuild(
+    tmp_path: Path,
+) -> None:
+    paths = StoragePaths.from_settings(
+        Settings(data_root=tmp_path / "data", runtime_cache_root=tmp_path / "cache")
+    )
+    paths.database.parent.mkdir(parents=True, exist_ok=True)
+    secrets = MemorySecretStore()
+    legacy_engine = create_legacy_global_name_schema(paths.database)
+    with Session(legacy_engine) as legacy_session:
+        old_connection_row = ProviderConnectionRecord(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://old.example/v1",
+            parameters={"organization": "legacy-org"},
+            credential_ref="connection:legacy-chat",
+            archived_at=datetime.now(timezone.utc),
+        )
+        old_profile_row = ProcessorProfileRecord(
+            name="Notes",
+            purpose="notes",
+            connection=old_connection_row,
+            model="legacy-notes",
+            context_length=4096,
+            options={"temperature": 0.2},
+            archived_at=datetime.now(timezone.utc),
+        )
+        legacy_session.add(old_profile_row)
+        legacy_session.commit()
+        old_connection_id = old_connection_row.id
+        old_profile_id = old_profile_row.id
+        old_reference = old_connection_row.credential_ref
+        secrets.set(old_reference, "legacy-secret")
+    legacy_engine.dispose()
+
+    engine = initialize_database(paths.database)
+    try:
+        assert any(
+            constraint["column_names"] == ["name"]
+            for constraint in inspect(engine).get_unique_constraints(
+                "provider_connections"
+            )
+        )
+        with Session(engine) as session:
+            configuration = ConfigurationService(session, secrets, paths=paths)
+            replacement = configuration.create_connection(
+                name="Chat",
+                protocol="openai_compatible",
+                base_url="https://new.example/v1",
+                parameters={},
+            )
+            replacement_profile = configuration.create_profile(
+                name="Notes",
+                purpose="notes",
+                connection_id=replacement.id,
+                model="new-notes",
+            )
+
+            old_connection_row = session.get(
+                ProviderConnectionRecord, old_connection_id
+            )
+            old_profile_row = session.get(ProcessorProfileRecord, old_profile_id)
+            assert old_connection_row is not None
+            assert old_profile_row is not None
+            assert old_connection_row.name.startswith("__vtnote_archived__:")
+            assert old_connection_row.base_url == "https://old.example/v1"
+            assert old_connection_row.parameters == {"organization": "legacy-org"}
+            assert old_connection_row.credential_ref == old_reference
+            assert old_profile_row.name.startswith("__vtnote_archived__:")
+            assert old_profile_row.model == "legacy-notes"
+            assert old_profile_row.context_length == 4096
+            assert old_profile_row.options == {"temperature": 0.2}
+            assert old_profile_row.connection_id == old_connection_id
+            assert configuration.secret_for_connection(old_connection_id) == "legacy-secret"
+            assert replacement_profile.name == "Notes"
+
+            with pytest.raises(InvalidConfiguration, match="already exists"):
+                configuration.create_connection(
+                    name="chat",
+                    protocol="openai_compatible",
+                    base_url="https://duplicate.example/v1",
+                    parameters={},
+                )
+            with pytest.raises(InvalidConfiguration, match="already exists"):
+                configuration.create_profile(
+                    name="notes",
+                    purpose="notes",
+                    connection_id=replacement.id,
+                    model="duplicate-notes",
+                )
+    finally:
+        engine.dispose()
+
+
+def test_reserved_archived_name_prefix_is_rejected_for_user_configuration(
+    tmp_path: Path,
+) -> None:
+    configuration, _, _, session = make_services(tmp_path)
+    try:
+        with pytest.raises(InvalidConfiguration, match="reserved"):
+            configuration.create_connection(
+                name="__VTNOTE_ARCHIVED__:manual",
+                protocol="openai_compatible",
+                base_url="https://api.example/v1",
+                parameters={},
+            )
+        connection = configuration.create_connection(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example/v1",
+            parameters={},
+        )
+        with pytest.raises(InvalidConfiguration, match="reserved"):
+            configuration.update_connection(
+                connection.id, name="__vtnote_archived__:manual"
+            )
+        with pytest.raises(InvalidConfiguration, match="reserved"):
+            configuration.create_profile(
+                name="__vtnote_archived__:manual",
+                purpose="notes",
+                connection_id=connection.id,
+                model="notes",
+            )
+        profile = configuration.create_profile(
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="notes",
+        )
+        with pytest.raises(InvalidConfiguration, match="reserved"):
+            configuration.update_profile(
+                profile.id, name="__vtnote_archived__:manual"
+            )
+    finally:
+        session.close()
+        session.bind.dispose()
+
+
+def test_archived_name_retirement_rolls_back_if_profile_create_fails(
+    tmp_path: Path,
+) -> None:
+    configuration, _, _, session = make_services(tmp_path)
+    connection = configuration.create_connection(
+        name="Chat",
+        protocol="openai_compatible",
+        base_url="https://api.example/v1",
+        parameters={},
+    )
+    old_profile = configuration.create_profile(
+        name="Notes",
+        purpose="notes",
+        connection_id=connection.id,
+        model="old-notes",
+    )
+    old_row = session.get(ProcessorProfileRecord, old_profile.id)
+    assert old_row is not None
+    old_row.archived_at = datetime.now(timezone.utc)
+    session.commit()
+
+    def fail_commit(_: Session) -> None:
+        raise RuntimeError("database unavailable")
+
+    event.listen(session, "before_commit", fail_commit, once=True)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        configuration.create_profile(
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="replacement-notes",
+        )
+
+    assert session.in_transaction() is False
+    session.refresh(old_row)
+    assert old_row.name == "Notes"
     session.close()
     session.bind.dispose()
 
