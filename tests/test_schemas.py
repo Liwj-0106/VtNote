@@ -42,17 +42,34 @@ def transcript(*segments: TranscriptSegment) -> Transcript:
 )
 def test_transcript_segment_requires_a_positive_time_range(start_ms: int, end_ms: int) -> None:
     with pytest.raises(ValidationError):
-        segment("segment-1", start_ms, end_ms)
+        segment("seg_000001", start_ms, end_ms)
+
+
+@pytest.mark.parametrize("segment_id", ["segment-000001", "seg_1", "seg_0000001", "cue-1"])
+def test_transcript_segment_requires_canonical_id(segment_id: str) -> None:
+    with pytest.raises(ValidationError):
+        segment(segment_id, 0, 100)
+
+
+def test_transcript_segment_rejects_speaker_extension() -> None:
+    with pytest.raises(ValidationError):
+        TranscriptSegment(
+            id="seg_000001",
+            start_ms=0,
+            end_ms=100,
+            text="hello",
+            speaker="Alice",
+        )
 
 
 def test_transcript_requires_unique_segment_ids() -> None:
     with pytest.raises(ValidationError, match="segment IDs must be unique"):
-        transcript(segment("same", 0, 100), segment("same", 100, 200))
+        transcript(segment("seg_000001", 0, 100), segment("seg_000001", 100, 200))
 
 
 def test_transcript_requires_chronological_cues() -> None:
     with pytest.raises(ValidationError, match="chronological"):
-        transcript(segment("later", 100, 200), segment("earlier", 0, 100))
+        transcript(segment("seg_000001", 100, 200), segment("seg_000002", 0, 100))
 
 
 def test_transcript_duration_covers_its_last_cue() -> None:
@@ -65,12 +82,12 @@ def test_transcript_duration_covers_its_last_cue() -> None:
                 provider="manual_upload",
                 model=None,
             ),
-            segments=[segment("segment-1", 0, 100)],
+            segments=[segment("seg_000001", 0, 100)],
         )
 
 
 def test_transcript_persisted_shape_uses_fixed_v1_contract() -> None:
-    source = transcript(segment("segment-1", 0, 100))
+    source = transcript(segment("seg_000001", 0, 100))
 
     assert json.loads(canonical_transcript_bytes(source)) == {
         "schema_version": 1,
@@ -82,9 +99,17 @@ def test_transcript_persisted_shape_uses_fixed_v1_contract() -> None:
             "model": None,
         },
         "segments": [
-            {"id": "segment-1", "start_ms": 0, "end_ms": 100, "text": "hello"}
+            {"id": "seg_000001", "start_ms": 0, "end_ms": 100, "text": "hello"}
         ],
     }
+
+
+def test_transcript_language_remains_multilingual() -> None:
+    source = transcript(segment("seg_000001", 0, 100)).model_copy(
+        update={"language": "zh-Hans"}
+    )
+
+    assert source.language == "zh-Hans"
 
 
 @pytest.mark.parametrize("method", ["manual", "native", "unknown"])
@@ -94,13 +119,13 @@ def test_provenance_rejects_methods_outside_the_fixed_contract(method: str) -> N
 
 
 def test_translation_must_match_every_source_cue_in_order() -> None:
-    source = transcript(segment("cue-1", 0, 100), segment("cue-2", 100, 200))
+    source = transcript(segment("seg_000001", 0, 100), segment("seg_000002", 100, 200))
     translation = Translation(
         language="zh-CN",
         source_transcript_sha256=transcript_sha256(source),
         entries=[
-            TranslationEntry(cue_id="cue-2", text="第二句"),
-            TranslationEntry(cue_id="cue-1", text="第一句"),
+            TranslationEntry(cue_id="seg_000002", text="第二句"),
+            TranslationEntry(cue_id="seg_000001", text="第一句"),
         ],
     )
 
@@ -109,13 +134,13 @@ def test_translation_must_match_every_source_cue_in_order() -> None:
 
 
 def test_translation_accepts_one_entry_for_each_source_cue() -> None:
-    source = transcript(segment("cue-1", 0, 100), segment("cue-2", 100, 200))
+    source = transcript(segment("seg_000001", 0, 100), segment("seg_000002", 100, 200))
     translation = Translation(
         language="zh-CN",
         source_transcript_sha256=transcript_sha256(source),
         entries=[
-            TranslationEntry(cue_id="cue-1", text="第一句"),
-            TranslationEntry(cue_id="cue-2", text="第二句"),
+            TranslationEntry(cue_id="seg_000001", text="第一句"),
+            TranslationEntry(cue_id="seg_000002", text="第二句"),
         ],
     )
 
@@ -125,18 +150,18 @@ def test_translation_accepts_one_entry_for_each_source_cue() -> None:
         "language": "zh-CN",
         "source_transcript_sha256": transcript_sha256(source),
         "entries": [
-            {"cue_id": "cue-1", "text": "第一句"},
-            {"cue_id": "cue-2", "text": "第二句"},
+            {"cue_id": "seg_000001", "text": "第一句"},
+            {"cue_id": "seg_000002", "text": "第二句"},
         ],
     }
 
 
 def test_translation_rejects_a_different_source_hash() -> None:
-    source = transcript(segment("cue-1", 0, 100))
+    source = transcript(segment("seg_000001", 0, 100))
     translation = Translation(
         language="zh-CN",
         source_transcript_sha256="0" * 64,
-        entries=[TranslationEntry(cue_id="cue-1", text="第一句")],
+        entries=[TranslationEntry(cue_id="seg_000001", text="第一句")],
     )
 
     with pytest.raises(ValueError, match="hash"):

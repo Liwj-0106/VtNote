@@ -22,4 +22,5 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "--basetemp=D:/Workspace/Codex/cache/VtNote-pytest"
 cache_dir = "D:/Workspace/Codex/cache/VtNote-runtime/pytest-cache"
+pythonpath = ["src"]
 testpaths = ["tests"]

@@ -34,12 +34,19 @@ class Settings(BaseSettings):
     def validate_absolute_root(cls, value: Path) -> Path:
         if not value.is_absolute():
             raise ValueError("storage roots must be absolute")
-        return value.resolve(strict=False)
+        return value.absolute()
 
     @model_validator(mode="after")
     def validate_separate_roots(self) -> Self:
-        if _contains(self.data_root, self.runtime_cache_root) or _contains(
-            self.runtime_cache_root, self.data_root
+        resolved_data = self.data_root.resolve(strict=False)
+        resolved_cache = self.runtime_cache_root.resolve(strict=False)
+        if _contains(resolved_data, resolved_cache) or _contains(
+            resolved_cache, resolved_data
         ):
             raise ValueError("data and runtime cache roots must not overlap")
+        if (
+            os.name == "nt"
+            and resolved_data.anchor.casefold() != resolved_cache.anchor.casefold()
+        ):
+            raise ValueError("data and runtime cache roots must use the same Windows drive")
         return self

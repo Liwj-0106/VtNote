@@ -29,11 +29,10 @@ class Provenance(CanonicalModel):
 
 
 class TranscriptSegment(CanonicalModel):
-    id: str = Field(min_length=1)
+    id: str = Field(pattern=r"^seg_\d{6}$")
     start_ms: int = Field(ge=0)
     end_ms: int = Field(gt=0)
     text: str = Field(min_length=1)
-    speaker: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def validate_time_range(self) -> Self:
@@ -63,7 +62,7 @@ class Transcript(CanonicalModel):
 
 
 class TranslationEntry(CanonicalModel):
-    cue_id: str = Field(min_length=1)
+    cue_id: str = Field(pattern=r"^seg_\d{6}$")
     text: str = Field(min_length=1)
 
 

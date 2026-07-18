@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from vtnote.schemas import TranscriptSegment
 from vtnote.subtitles import (
+    SubtitleExportError,
     export_ass,
     export_markdown,
     export_srt,
@@ -26,13 +29,13 @@ Last cue
 
     assert parse_srt(source) == [
         TranscriptSegment(
-            id="segment-000001",
+            id="seg_000001",
             start_ms=1_250,
             end_ms=3_500,
             text="First line\nsecond line",
         ),
         TranscriptSegment(
-            id="segment-000002",
+            id="seg_000002",
             start_ms=4_000,
             end_ms=5_100,
             text="Last cue",
@@ -57,13 +60,13 @@ Goodbye
 
     assert parse_vtt(source) == [
         TranscriptSegment(
-            id="segment-000001",
+            id="seg_000001",
             start_ms=1_000,
             end_ms=2_500,
             text="Hello\nworld",
         ),
         TranscriptSegment(
-            id="segment-000002",
+            id="seg_000002",
             start_ms=2_500,
             end_ms=4_000,
             text="Goodbye",
@@ -83,17 +86,15 @@ Dialogue: 0,0:00:04.00,0:00:05.50,Default,Bob,0,0,0,,A comma, stays here
 
     assert parse_ass(source) == [
         TranscriptSegment(
-            id="segment-000001",
+            id="seg_000001",
             start_ms=1_200,
             end_ms=3_400,
-            speaker="Alice",
             text="Hello\nworld",
         ),
         TranscriptSegment(
-            id="segment-000002",
+            id="seg_000002",
             start_ms=4_000,
             end_ms=5_500,
-            speaker="Bob",
             text="A comma, stays here",
         ),
     ]
@@ -101,8 +102,8 @@ Dialogue: 0,0:00:04.00,0:00:05.50,Default,Bob,0,0,0,,A comma, stays here
 
 def test_srt_export_is_stable_after_round_trip() -> None:
     cues = [
-        TranscriptSegment(id="a", start_ms=1_001, end_ms=2_345, text="Hello\nworld"),
-        TranscriptSegment(id="b", start_ms=3_000, end_ms=4_000, text="Goodbye"),
+        TranscriptSegment(id="seg_000001", start_ms=1_001, end_ms=2_345, text="Hello\nworld"),
+        TranscriptSegment(id="seg_000002", start_ms=3_000, end_ms=4_000, text="Goodbye"),
     ]
 
     rendered = export_srt(cues)
@@ -112,8 +113,8 @@ def test_srt_export_is_stable_after_round_trip() -> None:
 
 def test_vtt_export_is_stable_after_round_trip() -> None:
     cues = [
-        TranscriptSegment(id="a", start_ms=1_001, end_ms=2_345, text="Hello\nworld"),
-        TranscriptSegment(id="b", start_ms=3_000, end_ms=4_000, text="Goodbye"),
+        TranscriptSegment(id="seg_000001", start_ms=1_001, end_ms=2_345, text="Hello\nworld"),
+        TranscriptSegment(id="seg_000002", start_ms=3_000, end_ms=4_000, text="Goodbye"),
     ]
 
     rendered = export_vtt(cues)
@@ -124,11 +125,10 @@ def test_vtt_export_is_stable_after_round_trip() -> None:
 def test_ass_export_is_stable_after_round_trip() -> None:
     cues = [
         TranscriptSegment(
-            id="a",
+            id="seg_000001",
             start_ms=1_200,
             end_ms=2_340,
             text="Hello\nworld",
-            speaker="Alice",
         )
     ]
 
@@ -139,8 +139,8 @@ def test_ass_export_is_stable_after_round_trip() -> None:
 
 def test_plain_text_and_markdown_exports_are_deterministic() -> None:
     cues = [
-        TranscriptSegment(id="a", start_ms=1_000, end_ms=2_000, text="Hello"),
-        TranscriptSegment(id="b", start_ms=3_000, end_ms=4_000, text="Goodbye"),
+        TranscriptSegment(id="seg_000001", start_ms=1_000, end_ms=2_000, text="Hello"),
+        TranscriptSegment(id="seg_000002", start_ms=3_000, end_ms=4_000, text="Goodbye"),
     ]
 
     assert export_txt(cues) == "Hello\nGoodbye\n"
@@ -148,3 +148,43 @@ def test_plain_text_and_markdown_exports_are_deterministic() -> None:
         "- **00:00:01.000 → 00:00:02.000** Hello\n"
         "- **00:00:03.000 → 00:00:04.000** Goodbye\n"
     )
+
+
+@pytest.mark.parametrize("exporter", [export_srt, export_vtt])
+def test_srt_and_vtt_exports_reject_internal_blank_lines(exporter) -> None:
+    segment = TranscriptSegment(
+        id="seg_000001",
+        start_ms=0,
+        end_ms=1_000,
+        text="first line\n\nsecond line",
+    )
+
+    with pytest.raises(SubtitleExportError, match="blank line"):
+        exporter([segment])
+
+
+def test_ass_export_rejects_a_range_that_quantizes_to_zero_duration() -> None:
+    segment = TranscriptSegment(
+        id="seg_000001",
+        start_ms=1,
+        end_ms=9,
+        text="too short",
+    )
+
+    with pytest.raises(SubtitleExportError, match="centisecond"):
+        export_ass([segment])
+
+
+def test_ass_export_preserves_override_like_literal_text_stably() -> None:
+    segment = TranscriptSegment(
+        id="seg_000001",
+        start_ms=1_000,
+        end_ms=2_000,
+        text=r"{\i1}\N literal, not styling",
+    )
+
+    rendered = export_ass([segment])
+    parsed = parse_ass(rendered)
+
+    assert parsed[0].text == segment.text
+    assert export_ass(parsed) == rendered
