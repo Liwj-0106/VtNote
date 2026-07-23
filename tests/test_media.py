@@ -23,7 +23,12 @@ from vtnote.media import (
     MediaError,
     MediaLimits,
 )
-from vtnote.models import ItemRecord, RuntimeAssetRecord, TaskRecord
+from vtnote.models import (
+    ItemRecord,
+    RuntimeAssetRecord,
+    RuntimeCleanupEventRecord,
+    TaskRecord,
+)
 from vtnote.paths import StoragePaths
 from vtnote.runtime_assets import RuntimeAssetService
 
@@ -277,6 +282,9 @@ def test_real_ffmpeg_cloud_conversion_is_mono_opus_with_16khz_opushead(
         assert int.from_bytes(ogg[opus_head + 12 : opus_head + 16], "little") == 16_000
         assert hashlib.sha256(source.read_bytes()).hexdigest() == original_hash
 
+        active = processor.convert_for_cloud(item_id, source)
+        assert active.asset_id == prepared.asset_id
+
         trashed = assets.trash(prepared.asset_id)
         assert trashed.state == "trash"
         assert not output.exists()
@@ -285,6 +293,14 @@ def test_real_ffmpeg_cloud_conversion_is_mono_opus_with_16khz_opushead(
         assert recovered.asset_id == prepared.asset_id
         assert recovered.path == output
         assert assets.active_for_role(item_id=item_id, role="cloud_audio") is not None
+
+        registered = session.get(RuntimeAssetRecord, recovered.asset_id)
+        assert registered is not None
+        session.delete(registered)  # crash-shaped: canonical move survived, registration did not
+        session.commit()
+        crash_recovered = processor.convert_for_cloud(item_id, source)
+        assert crash_recovered.asset_id != recovered.asset_id
+        assert assets.resolve(crash_recovered.asset_id) == output
     finally:
         session.bind.dispose()
         session.close()
@@ -305,6 +321,51 @@ class FailFirstConversionRunner:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(b"partial-not-valid-ogg")
             raise CommandError("command_timeout")
+        return self.delegate.run(
+            argv, timeout=timeout, max_output_bytes=max_output_bytes
+        )
+
+
+class InvalidFirstSuccessfulConversionRunner:
+    """Produce one invalid-but-complete FFmpeg output, then delegate normally."""
+
+    def __init__(self, delegate: CommandRunner, ffmpeg: str, mode: str) -> None:
+        self.delegate = delegate
+        self.ffmpeg = ffmpeg
+        self.mode = mode
+        self.invalidated = False
+
+    def run(
+        self, argv: tuple[str, ...], *, timeout: float, max_output_bytes: int
+    ) -> CommandResult:
+        if argv[0] == self.ffmpeg and not self.invalidated:
+            self.invalidated = True
+            modified = list(argv)
+            if self.mode == "cloud":
+                modified[modified.index("-f") + 1] = "matroska"
+            else:
+                modified[modified.index("-ar") + 1] = "8000"
+            return self.delegate.run(
+                tuple(modified), timeout=timeout, max_output_bytes=max_output_bytes
+            )
+        return self.delegate.run(
+            argv, timeout=timeout, max_output_bytes=max_output_bytes
+        )
+
+
+class EmptyFailedConversionRunner:
+    def __init__(self, delegate: CommandRunner, ffmpeg: str) -> None:
+        self.delegate = delegate
+        self.ffmpeg = ffmpeg
+
+    def run(
+        self, argv: tuple[str, ...], *, timeout: float, max_output_bytes: int
+    ) -> CommandResult:
+        if argv[0] == self.ffmpeg:
+            destination = Path(argv[-1])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.touch()
+            raise CommandError("command_failed")
         return self.delegate.run(
             argv, timeout=timeout, max_output_bytes=max_output_bytes
         )
@@ -338,6 +399,129 @@ def test_failed_ffmpeg_partial_is_quarantined_and_never_adopted_on_retry(
         assert prepared.media_info.audio_codec == "opus"
         assert prepared.asset_id != failed_assets[0].id
         assert assets.resolve(prepared.asset_id) == paths.cloud_ogg(item_id)
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_invalid_cloud_container_is_quarantined_before_publish_and_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    binaries = FfmpegBinaries.discover()
+    if not (Path(binaries.ffmpeg).is_file() and Path(binaries.ffprobe).is_file()):
+        pytest.skip("verified Conda FFmpeg binaries are unavailable")
+    assets, paths, session, item_id = make_asset_service(tmp_path)
+    source = tmp_path / "user-original.wav"
+    write_tiny_wav(source)
+    runner = InvalidFirstSuccessfulConversionRunner(
+        CommandRunner(), binaries.ffmpeg, "cloud"
+    )
+    processor = FfmpegMediaProcessor(
+        runner=runner, binaries=binaries, paths=paths, assets=assets
+    )
+    try:
+        with pytest.raises(MediaError) as failed:
+            processor.convert_for_cloud(item_id, source)
+        assert failed.value.code == "invalid_cloud_ogg"
+        assert not paths.cloud_ogg(item_id).exists()
+        assert session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.role == "cloud_audio"
+            )
+        ).all() == []
+        quarantined = session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.role == "failed_media"
+            )
+        ).all()
+        assert len(quarantined) == 1
+        assert quarantined[0].state == "trash"
+
+        prepared = processor.convert_for_cloud(item_id, source)
+        assert "ogg" in prepared.media_info.format_name.casefold().split(",")
+        assert prepared.media_info.audio_codec == "opus"
+        assert assets.resolve(prepared.asset_id) == paths.cloud_ogg(item_id)
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_invalid_local_pcm_is_quarantined_before_publish_and_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    binaries = FfmpegBinaries.discover()
+    if not (Path(binaries.ffmpeg).is_file() and Path(binaries.ffprobe).is_file()):
+        pytest.skip("verified Conda FFmpeg binaries are unavailable")
+    assets, paths, session, item_id = make_asset_service(tmp_path)
+    source = tmp_path / "user-original.wav"
+    write_tiny_wav(source, sample_rate=44_100)
+    runner = InvalidFirstSuccessfulConversionRunner(
+        CommandRunner(), binaries.ffmpeg, "local"
+    )
+    processor = FfmpegMediaProcessor(
+        runner=runner, binaries=binaries, paths=paths, assets=assets
+    )
+    try:
+        with pytest.raises(MediaError) as failed:
+            processor.prepare_for_local(item_id, source)
+        assert failed.value.code == "invalid_local_audio"
+        assert not paths.local_prepared_audio(item_id).exists()
+        assert session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.role == "local_audio"
+            )
+        ).all() == []
+        quarantined = session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.role == "failed_media"
+            )
+        ).all()
+        assert len(quarantined) == 1
+        assert quarantined[0].state == "trash"
+
+        prepared = processor.prepare_for_local(item_id, source)
+        assert prepared.media_info.audio_codec == "pcm_s16le"
+        assert prepared.media_info.sample_rate == 16_000
+        assert prepared.media_info.channels == 1
+        assert assets.resolve(prepared.asset_id) == paths.local_prepared_audio(
+            item_id
+        )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_zero_byte_ffmpeg_staging_is_discarded_by_typed_path_and_audited(
+    tmp_path: Path,
+) -> None:
+    binaries = FfmpegBinaries.discover()
+    if not (Path(binaries.ffmpeg).is_file() and Path(binaries.ffprobe).is_file()):
+        pytest.skip("verified Conda FFmpeg binaries are unavailable")
+    assets, paths, session, item_id = make_asset_service(tmp_path)
+    source = tmp_path / "user-original.wav"
+    write_tiny_wav(source)
+    processor = FfmpegMediaProcessor(
+        runner=EmptyFailedConversionRunner(CommandRunner(), binaries.ffmpeg),
+        binaries=binaries,
+        paths=paths,
+        assets=assets,
+    )
+    try:
+        with pytest.raises(MediaError) as failed:
+            processor.convert_for_cloud(item_id, source)
+        assert failed.value.code == "command_failed"
+        staging_directory = paths.runtime(
+            "items", item_id, "audio", "staging"
+        )
+        assert not list(staging_directory.glob("*"))
+        events = session.scalars(
+            select(RuntimeCleanupEventRecord).where(
+                RuntimeCleanupEventRecord.action == "discard"
+            )
+        ).all()
+        assert len(events) == 1
+        assert events[0].outcome == "succeeded"
+        assert events[0].code == "zero_byte_media_staging"
     finally:
         session.bind.dispose()
         session.close()

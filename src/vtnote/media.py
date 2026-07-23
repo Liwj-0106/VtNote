@@ -11,7 +11,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Callable, Protocol
 from uuid import uuid4
 
 from vtnote.paths import StoragePaths, UnsafePathError
@@ -289,8 +289,12 @@ class FfmpegMediaProcessor:
         return self.paths, self.assets
 
     def _existing_or_recovered(
-        self, item_id: str, role: str, destination: Path
-    ) -> tuple[str, Path] | None:
+        self,
+        item_id: str,
+        role: str,
+        destination: Path,
+        validate_output: Callable[[Path], MediaInfo],
+    ) -> tuple[str, Path, MediaInfo] | None:
         paths, assets = self._runtime_dependencies()
         try:
             existing = assets.active_for_role(item_id=item_id, role=role)
@@ -298,20 +302,21 @@ class FfmpegMediaProcessor:
                 resolved = assets.resolve(existing.id)
                 if resolved != destination:
                     raise MediaError("runtime_asset_path_mismatch")
-                return existing.id, resolved
+                return existing.id, resolved, validate_output(resolved)
             recovered = assets.restore_trashed_for_role(item_id=item_id, role=role)
             if recovered is not None:
                 resolved = assets.resolve(recovered.id)
                 if resolved != destination:
                     raise MediaError("runtime_asset_path_mismatch")
-                return recovered.id, resolved
+                return recovered.id, resolved, validate_output(resolved)
             if destination.exists():
+                info = validate_output(destination)
                 view = assets.register_staged(
                     item_id=item_id,
                     role=role,
                     relative_path=paths.runtime_relative(destination),
                 )
-                return view.id, destination
+                return view.id, destination, info
         except (RuntimeAssetError, UnsafePathError):
             raise MediaError("runtime_asset_error") from None
         return None
@@ -323,7 +328,14 @@ class FfmpegMediaProcessor:
 
         paths, assets = self._runtime_dependencies()
         try:
-            if not staging.is_file() or staging.stat().st_size == 0:
+            if not staging.is_file():
+                return
+            if staging.stat().st_size == 0:
+                assets.discard_empty_conversion_staging(
+                    item_id=item_id,
+                    staging_id=staging.stem,
+                    extension=staging.suffix.removeprefix("."),
+                )
                 return
             failed = assets.register_staged(
                 item_id=item_id,
@@ -356,9 +368,12 @@ class FfmpegMediaProcessor:
         destination: Path,
         role: str,
         audio_args: tuple[str, ...],
-    ) -> tuple[str, Path]:
+        validate_output: Callable[[Path], MediaInfo],
+    ) -> tuple[str, Path, MediaInfo]:
         paths, assets = self._runtime_dependencies()
-        existing = self._existing_or_recovered(item_id, role, destination)
+        existing = self._existing_or_recovered(
+            item_id, role, destination, validate_output
+        )
         if existing is not None:
             return existing
         extension = destination.suffix.removeprefix(".")
@@ -397,6 +412,7 @@ class FfmpegMediaProcessor:
         if not staging.is_file():
             raise MediaError("conversion_output_missing")
         try:
+            info = validate_output(staging)
             paths.assert_runtime_destination(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             paths.assert_runtime_destination(destination)
@@ -416,17 +432,44 @@ class FfmpegMediaProcessor:
         except (OSError, RuntimeAssetError, UnsafePathError):
             self._quarantine_failed_conversion(item_id=item_id, staging=staging)
             raise MediaError("runtime_asset_error") from None
-        return view.id, destination
+        return view.id, destination, info
+
+    def _validate_cloud_output(self, path: Path) -> MediaInfo:
+        info = self.probe_local(path)
+        formats = {
+            name.strip().casefold()
+            for name in info.format_name.split(",")
+            if name.strip()
+        }
+        if (
+            "ogg" not in formats
+            or info.audio_codec != "opus"
+            or info.channels != 1
+            or self._opus_input_rate(path) != 16_000
+        ):
+            raise MediaError("invalid_cloud_ogg")
+        return info
+
+    def _validate_local_output(self, path: Path) -> MediaInfo:
+        info = self.probe_local(path)
+        if (
+            info.audio_codec != "pcm_s16le"
+            or info.sample_rate != 16_000
+            or info.channels != 1
+        ):
+            raise MediaError("invalid_local_audio")
+        return info
 
     def convert_for_cloud(self, item_id: str, source: Path) -> PreparedAudio:
         self.probe_local(source)
         paths, _ = self._runtime_dependencies()
         destination = paths.cloud_ogg(item_id)
-        asset_id, output = self._run_conversion(
+        asset_id, output, info = self._run_conversion(
             item_id=item_id,
             source=source,
             destination=destination,
             role="cloud_audio",
+            validate_output=self._validate_cloud_output,
             audio_args=(
                 "-ac",
                 "1",
@@ -442,13 +485,6 @@ class FfmpegMediaProcessor:
                 "ogg",
             ),
         )
-        info = self.probe_local(output)
-        if (
-            info.audio_codec != "opus"
-            or info.channels != 1
-            or self._opus_input_rate(output) != 16_000
-        ):
-            raise MediaError("invalid_cloud_ogg")
         return PreparedAudio(output, asset_id, True, info)
 
     def prepare_for_local(self, item_id: str, source: Path) -> PreparedAudio:
@@ -461,11 +497,12 @@ class FfmpegMediaProcessor:
             return PreparedAudio(Path(source), None, False, source_info)
         paths, _ = self._runtime_dependencies()
         destination = paths.local_prepared_audio(item_id)
-        asset_id, output = self._run_conversion(
+        asset_id, output, info = self._run_conversion(
             item_id=item_id,
             source=source,
             destination=destination,
             role="local_audio",
+            validate_output=self._validate_local_output,
             audio_args=(
                 "-ac",
                 "1",
@@ -477,11 +514,4 @@ class FfmpegMediaProcessor:
                 "wav",
             ),
         )
-        info = self.probe_local(output)
-        if (
-            info.audio_codec != "pcm_s16le"
-            or info.sample_rate != 16_000
-            or info.channels != 1
-        ):
-            raise MediaError("invalid_local_audio")
         return PreparedAudio(output, asset_id, True, info)

@@ -9,6 +9,12 @@
 - Hardened conversion recovery: cloud/local outputs are staged under UUID-typed paths and promoted only after FFmpeg succeeds; non-empty failed staging output is registered and moved to 24-hour trash. A retained cloud output can be restored/reused, and upload cleanup failures record a safe lifecycle event.
 - Verified focused Task 3B tests (94 passed) and the full suite (234 passed) using isolated runtime-cache pytest roots; `compileall`, `pip check`, and `git diff --check` passed. No user originals or `D:\Workspace\Project\VtNote-data` content was modified or deleted.
 
+### Task 3B lifecycle review fix
+
+- Moved cloud/local conversion contract validation onto UUID-typed staging files before canonical promotion or active runtime-asset registration. Cloud output now also requires an OGG container in addition to Opus, mono audio, and a 16 kHz OpusHead input rate; local output requires 16 kHz mono PCM.
+- Invalid non-empty outputs become `failed_media` assets in recoverable trash, allowing a later valid retry to publish normally. Zero-byte FFmpeg staging files are removed only through an exact item/staging UUID path and write a persistent cleanup event.
+- Added RED/GREEN regressions for a successful FFmpeg call returning a non-OGG Opus container, invalid local PCM, and zero-byte staging cleanup, plus characterization of valid active, restored, and move-before-registration canonical reuse. Focused tests passed 98/98 and the full suite passed 238/238; D-drive `compileall`, `pip check`, and diff checks passed.
+
 ## 2026-07-18
 
 - Established the original research documents as the Git baseline on `main`.

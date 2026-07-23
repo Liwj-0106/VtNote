@@ -284,6 +284,56 @@ class RuntimeAssetService:
         self.resolve(rows[0].id)
         return self._view(rows[0])
 
+    def discard_empty_conversion_staging(
+        self, *, item_id: str, staging_id: str, extension: str
+    ) -> None:
+        """Remove only one exact typed zero-byte FFmpeg staging file and audit it."""
+
+        canonical_item_id = _canonical_uuid(item_id, code="invalid_item_id")
+        canonical_staging_id = _canonical_uuid(
+            staging_id, code="invalid_staging_id"
+        )
+        if self.session.get(ItemRecord, canonical_item_id) is None:
+            raise RuntimeAssetError("item_not_found")
+        try:
+            staging = self.paths.conversion_staging(
+                canonical_item_id, canonical_staging_id, extension
+            )
+            self.paths.assert_runtime_destination(staging)
+            if staging.exists():
+                if not staging.is_file() or staging.stat().st_size != 0:
+                    raise RuntimeAssetError("staging_not_empty")
+                staging.unlink()
+            event = self._event(
+                canonical_staging_id,
+                "discard",
+                "succeeded",
+                "zero_byte_media_staging",
+            )
+        except RuntimeAssetError as error:
+            event = self._event(
+                canonical_staging_id,
+                "discard",
+                "failed",
+                "zero_byte_media_discard_failed",
+            )
+            self.session.add(event)
+            self.session.commit()
+            raise error
+        except (OSError, UnsafePathError):
+            self.session.add(
+                self._event(
+                    canonical_staging_id,
+                    "discard",
+                    "failed",
+                    "zero_byte_media_discard_failed",
+                )
+            )
+            self.session.commit()
+            raise RuntimeAssetError("filesystem_error") from None
+        self.session.add(event)
+        self.session.commit()
+
     def restore_trashed_for_role(
         self, *, item_id: str, role: str
     ) -> RuntimeAssetView | None:

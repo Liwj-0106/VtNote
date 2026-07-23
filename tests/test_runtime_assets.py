@@ -129,6 +129,72 @@ def test_register_resolve_hash_and_idempotency(tmp_path: Path) -> None:
         close_session(session)
 
 
+def test_zero_byte_conversion_discard_is_exact_typed_and_audited(
+    tmp_path: Path,
+) -> None:
+    service, session, paths, item = make_service(tmp_path)
+    staging_id = "33333333-3333-4333-8333-333333333333"
+    sibling_id = "44444444-4444-4444-8444-444444444444"
+    staging = paths.conversion_staging(item.id, staging_id, "ogg")
+    sibling = paths.conversion_staging(item.id, sibling_id, "ogg")
+    uploaded_source = paths.uploaded_source(item.id, "ogg")
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    uploaded_source.parent.mkdir(parents=True, exist_ok=True)
+    staging.touch()
+    sibling.touch()
+    uploaded_source.touch()
+    try:
+        service.discard_empty_conversion_staging(
+            item_id=item.id,
+            staging_id=staging_id,
+            extension="ogg",
+        )
+
+        assert not staging.exists()
+        assert sibling.is_file()
+        assert uploaded_source.is_file()
+        event = session.scalar(
+            select(RuntimeCleanupEventRecord).where(
+                RuntimeCleanupEventRecord.asset_id == staging_id
+            )
+        )
+        assert event is not None
+        assert event.action == "discard"
+        assert event.outcome == "succeeded"
+        assert event.code == "zero_byte_media_staging"
+
+        nonempty = paths.conversion_staging(item.id, staging_id, "wav")
+        nonempty.write_bytes(b"owned")
+        with pytest.raises(RuntimeAssetError) as caught:
+            service.discard_empty_conversion_staging(
+                item_id=item.id,
+                staging_id=staging_id,
+                extension="wav",
+            )
+        assert caught.value.code == "staging_not_empty"
+        assert nonempty.read_bytes() == b"owned"
+        failed = session.scalars(
+            select(RuntimeCleanupEventRecord).where(
+                RuntimeCleanupEventRecord.asset_id == staging_id,
+                RuntimeCleanupEventRecord.outcome == "failed",
+            )
+        ).all()
+        assert len(failed) == 1
+        assert failed[0].code == "zero_byte_media_discard_failed"
+
+        with pytest.raises(RuntimeAssetError) as invalid:
+            service.discard_empty_conversion_staging(
+                item_id=item.id,
+                staging_id="../not-a-uuid",
+                extension="ogg",
+            )
+        assert invalid.value.code == "invalid_staging_id"
+        assert sibling.is_file()
+        assert uploaded_source.is_file()
+    finally:
+        close_session(session)
+
+
 def test_item_deletion_cannot_orphan_a_registered_runtime_file(tmp_path: Path) -> None:
     service, session, paths, item = make_service(tmp_path)
     try:
