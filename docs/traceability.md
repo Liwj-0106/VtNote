@@ -23,15 +23,15 @@ mock 合同，当前没有 live credential 或 30–50 视频 POC 结果。
 
 | ID | 需求摘要 | 计划任务 | 当前状态 | 当前代码/测试证据 | 完成所需验证 |
 |---|---|---|---|---|---|
-| FR-001 | 首次启动与就绪检查 | Task 2, 5, 6 | 部分实现 | storage/env 配置与 `tests/test_environment_contract.py`, `test_storage.py`；无 setup UI/launcher | FFmpeg/目录/模型三态 UI；缺失组件与部分可用 E2E；启动器仅回环 |
+| FR-001 | 首次启动与就绪检查 | Task 2, 5, 6 | 部分实现 | storage/env 配置与 `tests/test_environment_contract.py`, `test_storage.py`；当前环境缺 `yt-dlp-ejs`/Deno；无 setup UI/launcher | FFmpeg/目录/模型及 yt-dlp/EJS/Deno 三态 UI；YouTube 缺链时局部禁用；启动器仅回环 |
 | FR-002 | 连接、profile、默认项、修订快照 | Task 2, 4, 5 | 部分实现 | `configuration.py`；`test_configuration.py`, `test_configuration_lifecycle.py`, `test_api.py` 覆盖 keyring、测试/授权修订、归档、默认项 | 真实连接测试 adapter；设置 UI；修订失效 E2E；secret DOM/network 扫描 |
-| FR-003 | URL 校验与安全探测 | Task 2, 3, 6 | 部分实现 | `url_security.py`; `test_url_security.py`; API 注入探测和 redirect 报告重校验测试；一次 direct-only YouTube 超时仅为环境观察 | `trust_env=false` transport、逐连接 DNS pin、受控 redirect、yt-dlp 网络边界；中国网络 direct-only corpus 与本地文件后备；代理另立 ADR |
+| FR-003 | URL 校验与安全探测 | Task 2, 3, 6 | 部分实现 | `url_security.py`; `test_url_security.py`; API 注入探测和 redirect 报告重校验测试；一次 direct-only YouTube 超时仅为环境观察；现有 C 盘 Node 不作发行依赖 | `trust_env=false` transport、逐连接 DNS pin、受控 redirect；固定 yt-dlp/EJS/Deno D 盘链、哈希、禁远程 component；中国网络 direct-only corpus/本地后备；代理另立 ADR |
 | FR-004 | 浏览器上传与受信本机文件 | Task 3, 5, 6 | 部分实现 | `uploads.py`; `test_uploads.py` 覆盖流式大小限制、sniff、失败回收、原件只读、UNC 拒绝 | 网站文件选择/上传取消；跨进程/崩溃 E2E；普通 task/item API 不泄露来源绝对路径；setup/storage 只返回应用根 |
 | FR-005 | 持久 task/item/stage、快照和历史 | Task 2, 3, 5 | 部分实现 | `tasks.py`, `models.py`; `test_tasks.py::test_enqueue_creates_durable_rows_and_immutable_redacted_snapshot`; API list/get | lease worker 与重启恢复；创建禁重/成功跳转；历史和详情 UI |
 | FR-006 | 固定字幕优先顺序 | Task 1, 3, 7 | 部分实现 | `sources.py`; `test_source_contracts.py` 覆盖人工/自动、语言/格式顺序和音频只取一次 | 真实 Bilibili/YouTube adapter；有字幕 corpus 的音频/ASR 调用数为 0 |
 | FR-007 | 音频取得与 FFmpeg 预处理 | Task 3, 6 | 部分实现 | `media.py`; `test_media.py` 覆盖 shell-free、超时、真实 FFmpeg、部分文件隔离、原子发布；开发机 7.1.1 buildconf 已只读记录 | 平台 audio handoff；worker 取消/重试；资源/磁盘故障 E2E；实际发行 FFmpeg build/SBOM/NOTICE 审计 |
 | FR-008 | ASR 路由、修订授权、费用提示 | Task 2, 3, 5 | 部分实现 | `configuration.py`, `tasks.py`; `test_profiles_enforce_protocol_and_upload_consent_revision`, `test_auto_mode_omits_cloud_profile_until_upload_is_authorized` 证明无授权时 auto 快照不含云 profile | 创建页显示 auto 落本地且仍可提交、仅 cloud 阻塞；worker 按快照路由；未授权网络调用为 0 |
-| FR-009 | 火山极速版 Base64 ASR | Task 3, 7 | 部分实现 | 固定 resource/config 与云音频原语；`test_pipeline_contract.py::test_volc_resource_is_fixed_and_not_caller_configurable`; `test_real_ffmpeg_cloud_conversion...` | 16k mono OGG/Opus、`audio.data`、`bigmodel`、时长/二进制/Base64/语言预检；auto/cloud 分类、429/5xx/config/unknown；脱敏 logid、无 raw response；live POC |
+| FR-009 | 火山极速版 Base64 ASR | Task 3, 7 | 部分实现 | 固定 resource/config 与云音频原语；`test_pipeline_contract.py::test_volc_resource_is_fixed_and_not_caller_configurable`; `test_real_ffmpeg_cloud_conversion...` | 完整 headers、`user.uid`/`audio.data`/`bigmodel`、时长/二进制/Base64/语言预检；`X-Api-Status-Code` 成功/静音/450/550/未知合法码/缺失畸形分类；auto/cloud、脱敏 logid/status、无 raw response；live POC |
 | FR-010 | faster-whisper 与云转本地 | Task 3, 7 | 部分实现 | 依赖精确 pin；配置/测试已有 `large-v3-turbo/int8_float16/VAD` 与 D 盘根；当前 `device:auto` 尚未落实 GPU 必需；无生产 transcribe 调用 | segment、GPU concurrency=1、固定模型/CUDA、禁止静默 CPU、取消/provenance、明确失败 fallback、unknown 不重发 |
 | FR-011 | 不可变规范转录 | Task 1 | 已实现（当前范围） | `schemas.py`, `artifacts.py`; `test_schemas.py`, `test_storage.py::test_transcript_write_is_immutable...`, export tests | 在真实字幕/云/本地三条链路做 E2E；schema 兼容与产物唯一性门禁 |
 | FR-012 | 可选 cue 对齐翻译 | Task 1, 2, 4, 5 | 部分实现 | translation schema/hash、配置快照、平行 stage、按需译文导出已有测试 | chat adapter、chunk/一次小 batch retry、结构错误隔离、UI、真实 provider contract |
@@ -56,7 +56,7 @@ mock 合同，当前没有 live credential 或 30–50 视频 POC 结果。
 | NFR-007 | 结构化脱敏日志与诊断包 | Task 2, 3, 6, 7 | 部分实现 | `sanitize_diagnostic` 写入边界与统一 API error shape 测试 | worker/launcher 结构化日志、轮转、关联 ID、限长 provider logid、禁止 raw cloud response、诊断包与全局 secret/path scan |
 | NFR-008 | worker 性能与诚实进度 | Task 3, 5, 7 | 未实现（仅合同） | 长任务未执行；UI 未实现；media runner 有界 | POC RTF/内存/磁盘/轮询；无假百分比；API 交互基准 |
 | NFR-009 | 显式 adapter、版本化、测试先行 | Task 1–7 | 部分实现 | typed protocols、schema、迁移、238 项基线测试；真实 adapter/orchestration/UI 未完成 | 全套单元/合同/集成/E2E/安全；依赖锁与迁移复核；review 关闭 |
-| NFR-010 | 条款、版权、依赖许可与无绕过 | Task 3, 5, 6, 7 | 持续门禁 | URL allowlist、无 Cookie/plugin、参考项目许可审计；当前 FFmpeg GPL v3+ 开发 build 已记录 | UI 权利提示；实际发行 FFmpeg/依赖/模型 artifact 的 buildconf、源码、SBOM/NOTICE；平台/供应商条款复核 |
+| NFR-010 | 条款、版权、依赖许可与无绕过 | Task 3, 5, 6, 7 | 持续门禁 | URL allowlist、无 Cookie/plugin、参考项目许可审计；yt-dlp/EJS/Deno 许可已登记；当前 FFmpeg GPL v3+ 开发 build 已记录 | UI 权利提示；实际发行 FFmpeg、yt-dlp/EJS/Deno、其他依赖/模型 artifact 的 hash/buildconf、源码、SBOM/NOTICE；平台/供应商条款复核 |
 
 ## 4. 计划任务到验收包
 
@@ -64,11 +64,11 @@ mock 合同，当前没有 live credential 或 30–50 视频 POC 结果。
 |---|---|---|---|
 | Task 1 | transcript schema、parser、artifact、export、DB | 已完成并历经修复 | 规范/导出回归持续通过 |
 | Task 2 | config/task/API/local security | 已完成并历经修复 | secret、revision、status、URL 输入策略回归 |
-| Task 3 | worker、来源、Volc/local ASR、回收 | 仅 3A runtime asset 与 3B ingress/media 原语完成；主体未完成 | lease/heartbeat、真实 adapter、`trust_env=false`/逐连接网络边界、完整 Volc 分类与本地批准默认、fallback、取消/重试 E2E |
+| Task 3 | worker、来源、Volc/local ASR、回收 | 仅 3A runtime asset 与 3B ingress/media 原语完成；主体未完成 | lease/heartbeat、真实 adapter、`trust_env=false`/逐连接网络边界、固定 yt-dlp/EJS/Deno 链、完整 Volc provider-status 分类与本地批准默认、fallback、取消/重试 E2E |
 | Task 4 | 翻译、笔记、编排 | 未完成 | AI failure 不重跑 source/transcribe；固定模板/默认语言、顺序分块、cue 可解析引用、结构化产物/一次受控 retry |
 | Task 5 | React 网站 | 未完成 | 三个顶层 surface、API client/component tests、静态 build |
-| Task 6 | launcher、集成、安全、文档 | 未完成 | first-run、监督、日志、静态深链、安装/运行、FFmpeg 发行构建留证、安全回归 |
-| Task 7 | 全项目 review/release | 未完成 | POC、全测试、实际 artifact 依赖/许可/secret scan、构建/启动 smoke、未决项签字 |
+| Task 6 | launcher、集成、安全、文档 | 未完成 | first-run、监督、日志、静态深链、D 盘 EJS/Deno 资产/哈希/禁远程 component、安装/运行、FFmpeg 发行构建留证、安全回归 |
+| Task 7 | 全项目 review/release | 未完成 | POC、全测试、实际 FFmpeg/yt-dlp/EJS/Deno/模型 artifact 依赖许可与 secret scan、构建/启动 smoke、未决项签字 |
 
 ## 5. 用户旅程验收
 
@@ -76,10 +76,12 @@ mock 合同，当前没有 live credential 或 30–50 视频 POC 结果。
 |---|---|---|
 | URL 有人工首选语言字幕 | FR-003, FR-005, FR-006, FR-011, FR-017 | 探测 → 选轨 → 规范转录 → 导出；断言音频/ASR 0 调用 |
 | URL 人工字幕坏、自动字幕可用 | FR-006, FR-014, FR-019 | 下一候选成功；警告与最终选择可见 |
+| YouTube EJS/Deno 缺失 | FR-001, FR-003, NFR-010 | 只禁用 YouTube URL；不调用系统 Node/远程 component；本地/Bilibili 路径继续 |
 | 中国网络 direct-only URL 超时 | FR-003, FR-004, NFR-010 | 不继承代理、不外推平台结论；错误带环境限定；合法本地文件后备可继续 |
 | URL 无字幕、授权有效、云成功 | FR-007–FR-011, FR-019 | OGG/Opus Base64 → Volc mapping → 单一规范转录 |
 | 火山预检不合格 | FR-008–FR-010, FR-014 | 时长/二进制/Base64/语言发送前判定；auto 本地、cloud 阻止；云调用 0 |
 | 云明确失败、auto 转本地 | FR-008–FR-010, FR-014 | 网络未受理/明确 429/5xx 后本地成功、fallback provenance；配置错停止修复 |
+| 火山 HTTP 200 业务失败 | FR-009, FR-010, FR-014 | 按 provider status 分类静音、450、550、未知合法码、缺失/畸形/非法 body；验证 fallback 与不重发 |
 | 云结果未知 | FR-009, FR-010, FR-016, FR-019 | 不自动再云请求；可转本地；可能计费警告保持 |
 | 本地媒体仅本地 | FR-004, FR-007, FR-010, FR-018 | 原件哈希不变、受控资产、本地转录 |
 | 本地字幕 | FR-004, FR-006, FR-011 | 无 ASR、解析/规范化/导出 |
@@ -92,13 +94,14 @@ mock 合同，当前没有 live credential 或 30–50 视频 POC 结果。
 
 | 研究门禁 | 关联需求/ADR | 当前状态 | 所需产物 |
 |---|---|---|---|
-| 30–50 视频平台/ASR POC | FR-003, FR-006, FR-009, FR-010; ADR-005/006/008 | 未运行 | direct-only 网络/地区、合法本地后备、批准本地默认、候选付费 ASR 同样本、固定版本、原始度量、失败样本、签字结论 |
-| 火山合同/价格/区域复核 | FR-008, FR-009, NFR-002 | 仅官方网页审计 | 发布日控制台/合同记录；接口/limit/成本刷新 |
+| 30–50 视频平台/ASR POC | FR-003, FR-006, FR-009, FR-010; ADR-005/006/008 | 未运行 | direct-only 网络/地区、合法本地后备、yt-dlp/EJS/Deno 版本/哈希/solver 与缺失场景、批准本地默认、候选付费 ASR 同样本、原始度量、失败样本、签字结论 |
+| 火山合同/价格/区域复核 | FR-008, FR-009, NFR-002 | 仅官方网页审计 | 发布日控制台/合同记录；headers/body/provider-status/limit/成本刷新 |
+| YouTube JS 运行链 | FR-001, FR-003, NFR-010; ADR-005 | 官方 yt-dlp/EJS/Deno 静态审计；当前环境缺 EJS/Deno | D 盘受控资产、哈希/SBOM、禁系统 Node/远程 component、readiness 与真实公开 corpus |
 | 付费 ASR 候选矩阵 | FR-009, FR-010, NFR-002 | 一手来源有界对照；无质量/价格实测排名 | Volc provisional；OpenAI/AssemblyAI 只作自愿 POC；同样本真实账单、区域/保留/授权留证 |
 | Bilibili 字幕适配风险 | FR-003, FR-006, NFR-010 | 官方目录 + yt-dlp/BiliNote 静态审计 | 真实公开 corpus、错误分类、平台 drift runbook |
 | chat 翻译/笔记质量 | FR-012, FR-013 | 未运行 | cue 完整、意义保持、时间引用可解析率、事实覆盖/虚构率、人工双评 |
 | Windows 性能矩阵 | NFR-005, NFR-008 | 仅依赖/FFmpeg 基础 | 批准模型/compute/VAD、GPU/CUDA、RTF、显存/内存、磁盘、模型下载；CPU 仅诊断 |
-| 实际分发许可证 | NFR-010; ADR-013 | FFmpeg 7.1.1 当前开发 buildconf 已确认 GPL v3+；非发行结论 | 实际 FFmpeg `-version/-buildconf`、源码对应关系、lock、wheel/binary/model SBOM、NOTICE、license bundle |
+| 实际分发许可证 | NFR-010; ADR-013 | yt-dlp/EJS/Deno 许可已登记；FFmpeg 7.1.1 当前开发 buildconf 已确认 GPL v3+；非发行结论 | 实际 FFmpeg `-version/-buildconf`、yt-dlp/EJS/Deno 与其他 lock/wheel/binary/model 哈希、源码对应关系、SBOM、NOTICE、license bundle |
 
 来源链接与历史更正集中在 [research-sources.md](research-sources.md)，参考项目采用/拒绝
 记录在 [reference-projects.md](reference-projects.md)，技术取舍在

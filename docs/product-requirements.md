@@ -172,15 +172,18 @@ item/task 聚合状态为 `queued`、`running`、`cancel_requested`、`canceled`
 
 ### FR-001 首次启动与就绪检查
 
-应用首次启动必须显示数据目录、运行缓存目录、FFmpeg、数据库、密钥存储和本地模型
-状态。缺少必要组件时应提供可执行修复信息；只有必需项通过后才能创建依赖该组件的
-任务。默认监听 `127.0.0.1:8765`。
+应用首次启动必须显示数据目录、运行缓存目录、FFmpeg、数据库、密钥存储、本地模型，
+以及 YouTube 完整支持所需的 yt-dlp/`yt-dlp-ejs`/Deno 状态。缺少必要组件时应提供
+可执行修复信息；只有必需项通过后才能创建依赖该组件的任务。默认监听
+`127.0.0.1:8765`。
 
 验收：
 
 - 就绪页区分“必需失败”“可选未配置”“已就绪”；
 - 检查不会向前端返回密钥值；
-- 未配置云端或聊天模型时，本地转录仍可使用。
+- 未配置云端或聊天模型时，本地转录仍可使用；
+- 缺少 `yt-dlp-ejs` 或受控 Deno 时，YouTube URL 显示“运行链未就绪”且不宣称完整
+  支持；Bilibili、本地文件和本地字幕按自身依赖继续可用。
 
 ### FR-002 连接、配置档与默认项
 
@@ -216,6 +219,10 @@ HTTP(S) 代理。中国网络环境不保证 YouTube 直连；一次直连超时
 - 未注册真实平台适配器时返回明确的“不支持/未实现”，不伪造成功；
 - direct-only Bilibili/YouTube 可达性进入 30–50 视频 POC；不可达时建议使用用户合法
   持有的本地文件，不提供绕过说明；
+- YouTube adapter 使用固定 `yt-dlp==2026.7.4`、`yt-dlp-ejs==0.8.0` 与受控 Deno
+  2.8.1 初始研究组合。`yt-dlp-ejs` wheel 和 Deno Windows x64 单文件按哈希放在 D 盘，
+  Deno cache 也重定向到 D 盘；禁止自动更新、系统 C 盘 Node 兜底和运行时下载远程
+  EJS component。该组合必须通过平台 POC 后才可冻结为发行支持；
 - 显式可信代理不属于 V1。若未来加入，必须新增 ADR、代理威胁模型和逐用户同意；
   HTTP CONNECT 使客户端通常只能对代理地址做 DNS/IP pin，与目的站逐连接 pin 冲突，
   不得为了可达性静默放松 SSRF 边界。
@@ -296,11 +303,12 @@ URL 来源必须先枚举并排序可用字幕。固定顺序为“首选语言�
 
 ### FR-009 火山引擎极速版 ASR
 
-云端实现按当前官方极速版合同发送 `X-Api-Key`、唯一请求 ID 和
-`X-Api-Resource-Id: volc.bigasr.auc_turbo`，固定以 JSON `audio.data` Base64
-上传 16 kHz、单声道 OGG/Opus；`request.model_name` 固定为 `bigmodel`。响应中的
-utterance/word 时间映射为提供商无关结果。V1 不实现 `audio.url`、云端切片或
-submit/query 轮询。实现前必须重新核验
+云端实现按当前官方极速版合同发送 `X-Api-Key`、唯一 `X-Api-Request-Id`、
+`X-Api-Resource-Id: volc.bigasr.auc_turbo` 和 `X-Api-Sequence: -1`。请求体在内存中
+构造 `user.uid`（按当前新控制台合同取当前 AppKey，按密钥处理）、JSON
+`audio.data` Base64 和 `request.model_name: bigmodel`，上传 16 kHz、单声道
+OGG/Opus。响应中的 utterance/word 时间映射为提供商无关结果。V1 不实现
+`audio.url`、云端切片或 submit/query 轮询。实现前必须重新核验
 [官方文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh)的端点、限制和
 计费。
 
@@ -315,11 +323,28 @@ submit/query 轮询。实现前必须重新核验
 - 网络失败被证明发生在远端受理前，或收到明确 429/5xx 时，`auto` 转本地；鉴权、
   endpoint、resource ID、`model_name` 等配置错误必须停止并提示修复，不能以本地
   成功掩盖错误配置；
+- HTTP 状态不能单独决定业务成功。明确 HTTP 429/5xx 按上一条作为远端失败处理，
+  若携带 provider status 仍须安全校验/记录；对可能承载业务结果的响应，尤其 HTTP
+  2xx，必须读取并校验 `X-Api-Status-Code`：`20000000` 才进入响应体校验和成功
+  映射；`20000003` 映射为
+  `cloud_audio_silent` 并停止，不自动转本地或重发；`45000001`（参数无效）、
+  `45000002`（空音频）和 `45000151`（格式错误）映射为配置/请求/预处理合同失败，
+  停止并提示修复，不以自动本地成功掩盖；`55000031`（繁忙）和其他 `550xxxx`
+  内部错误属于明确服务端失败，`auto` 可转本地但不得自动重发云端；
+- 格式合法但未在当前合同中识别的 `X-Api-Status-Code` 不得猜测为成功、配置失败
+  或可免费重试；统一记录 `cloud_outcome_unknown`，禁止自动云重发，`auto` 可转
+  本地并保留“云端可能已计费”警告。安全诊断可保留该限长状态码；
+- 可能承载业务结果的响应（尤其 HTTP 2xx）缺失/畸形 `X-Api-Status-Code`，或
+  `20000000` 携带不可解析/不完整响应体，视为结果不可安全判断：记录
+  `cloud_outcome_unknown`，不重发；`auto` 可转本地并保留“云端可能已计费”警告；
 - 请求体可能已发送而连接中断/超时、服务端结果未知时标记
   `cloud_outcome_unknown`，不得自动重发付费请求；`auto` 可转本地并持续显示
   “云端可能已计费”；
-- 保存脱敏且长度受限的 `X-Tt-Logid`、请求 ID、HTTP/供应商状态和安全错误码用于
-  支持审计；密钥、Base64 音频和原始云响应不得进入日志或持久化产物；
+- 保存脱敏且长度受限的 `X-Tt-Logid`、请求 ID、HTTP 状态、已校验的
+  `X-Api-Status-Code` 和安全错误码用于支持审计；`X-Api-Key`/`user.uid`、Base64
+  音频、原始 provider message 和原始云响应不得进入日志或持久化产物；
+- 合同测试覆盖 HTTP 200 + 每个已知 provider code、未知 code、缺失/畸形 status
+  header、成功码 + 非法 body，并断言云请求次数、是否自动转本地和是否允许显式新尝试；
 - 授权继续绑定当前 profile 与 connection 修订；地址、endpoint、resource、model
   或其他相关配置变化会使测试与上传授权失效。
 
@@ -529,8 +554,9 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
 
 产品只处理用户有权访问和处理的内容，UI 提醒遵守平台条款与版权。V1 不规避访问控制，
 不声称 Bilibili 网站接口为官方开放 API。第三方依赖的许可证与 NOTICE 随分发清单
-审计。FFmpeg 直接作为第三方工具复用，不自研 codec/封装；实际发行二进制的
-`-buildconf`、对应源码和 LGPL/GPL 条件必须在发布冻结时审计。
+审计；yt-dlp、`yt-dlp-ejs`、Deno 及其实际 wheel/binary 的版本、哈希、传递组件和
+许可证必须进入 SBOM。FFmpeg 直接作为第三方工具复用，不自研 codec/封装；实际发行
+二进制的 `-buildconf`、对应源码和 LGPL/GPL 条件必须在发布冻结时审计。
 
 ## 9. 成功指标与发布门禁
 
@@ -539,7 +565,7 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
 | 指标 | V1 发布门禁 |
 |---|---|
 | 字幕优先正确性 | 验收集中所有可用且可解析的原生字幕样本，音频下载/ASR 调用均为 0 |
-| 平台网络边界 | `trust_env=false` 下按目标中国网络环境记录可达性/错误；不继承系统代理，不把单次超时外推为平台结论，本地文件后备可完成 |
+| 平台网络边界 | `trust_env=false` 下按目标中国网络环境记录可达性/错误；不继承系统代理，不把单次超时外推为平台结论；受控 EJS/Deno 链通过就绪/许可证/YouTube corpus 门禁；本地文件后备可完成 |
 | 核心任务可靠性 | 合法、在支持边界内的验收样本无任务丢失；重启/崩溃注入后可恢复或进入明确终态 |
 | 产物完整性 | 每个成功 item 有且只有一个不可变规范转录；schema 与哈希校验 100% 通过 |
 | 可选分支隔离 | 翻译/笔记故障注入不降低原文可查看、可导出能力 |
@@ -583,6 +609,8 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
   内容；中国网络下 YouTube 超时按失败样本保留；
 - V1 POC 的平台访问固定 `trust_env=false`；本地文件作为合法后备。显式代理另立研究，
   不混入 V1 直连成功率。
+- YouTube 样本记录 yt-dlp、`yt-dlp-ejs`、Deno 版本/哈希和 EJS solver 路径；至少
+  包含“完整链已就绪”“缺 EJS”“缺 Deno”“禁止远程 component”四类合同测试。
 
 ### 11.2 基准与标注
 

@@ -4,6 +4,7 @@
 分支：`feature/vtnote-v1`
 初始任务基线：`2a36eb0ac0419caf1a9b297c90bfb1e7d0baf8d7`
 Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
+最终外部合同复审基线：`5ec52f8`
 
 ## 1. 任务结果
 
@@ -15,7 +16,7 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 - `docs/website-specification.md`：工作区创建/历史、详情、设置三个顶层界面；路由、状态、交互、错误恢复、隐私和可访问性约束。
 - `docs/technical-decisions.md`：十三项 ADR，覆盖分层、任务状态、字幕选择、上传授权、云端配置、取消、网络边界、导出、FFmpeg 分发审计和演进策略。
 - `docs/reference-projects.md`：产品与组件分层比较，BiliNote 本地副本审计，以及采用、改造、仅参考和拒绝决策。
-- `docs/research-sources.md`：SRC-001～SRC-034 来源登记、用户输入/本地证据、访问日期、版本/地区/币种/波动性和来源到文档结论的映射。
+- `docs/research-sources.md`：SRC-001～SRC-039 来源登记、用户输入/本地证据、访问日期、版本/地区/币种/波动性和来源到文档结论的映射。
 - `docs/traceability.md`：全部 29 项 FR/NFR 到 Tasks 1～7、当前代码/测试证据和剩余验收工作的映射。
 - `.superpowers/sdd/task-product-docs-report.md`：本任务范围、验证、风险和异常处理记录。
 
@@ -66,6 +67,22 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
   youtube-transcript-api 因 YouTube-only、非官方站点行为和第二套网络/漂移合同而
   仅参考、不采用。
 
+### 最终外部合同复审
+
+- 火山极速版合同补齐 `X-Api-Sequence: -1`、请求体 `user.uid`/AppKey 密钥边界和
+  `X-Api-Status-Code` 业务判定。HTTP 200 不再被视为业务成功；`20000000`、静音
+  `20000003`、参数/空音频/格式 `45000001/2/151`、繁忙/内部 `55000031/550xxxx`
+  以及未知合法码、缺失/畸形 status、非法成功 body 均有明确停止、fallback、
+  未知计费和禁止自动云重发合同。
+- yt-dlp 2026.7.4 的官方包说明要求完整 YouTube 支持具备 `yt-dlp-ejs` 和受支持
+  JavaScript runtime。V1 初始研究组合固定 `yt-dlp-ejs==0.8.0` 与 Deno 2.8.1，
+  wheel、单文件、哈希和 Deno cache 置于 D 盘；禁止自动更新、C 盘系统 Node 兜底和
+  运行时远程 EJS component。当前环境缺 EJS/Deno，因此此能力仍是 POC/发行门禁，
+  不是已实现声明。
+- 增加 yt-dlp、yt-dlp-ejs、Deno 的官方版本、安装与许可证来源，来源登记扩展至
+  SRC-039；OpenAI 音频输出格式的官方材料差异改为逐模型 capability test，不再作
+  绝对格式结论。
+
 ## 3. 当前实现边界
 
 当前代码已覆盖基础 API、任务持久化、确定性字幕轨选择、受信本地路径解析、URL/DNS 预检查、云端配置测试状态、上传授权快照、取消请求和基础 Markdown 导出等能力。
@@ -79,8 +96,9 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 - THR-001～THR-005 的实测冻结；
 - “因取消而已取消”的任务再次取消时返回当前资源的契约；当前实现仍会拒绝该重复请求；
 - FR-019 要求的完整来源追踪导出；当前 Markdown 导出只有基础确定性内容。
-- `trust_env=false` 平台 transport、火山完整错误分类、本地 ASR 批准默认、笔记 cue
-  引用和发行 FFmpeg 合规门禁都只是本轮文档合同，不代表代码已实现。
+- `trust_env=false` 平台 transport、受控 yt-dlp/EJS/Deno 运行链、火山完整
+  header/body/provider-status 分类、本地 ASR 批准默认、笔记 cue 引用和发行
+  FFmpeg 合规门禁都只是本轮文档合同，不代表代码已实现。
 
 ## 4. 验证证据
 
@@ -88,10 +106,17 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 - 提交前最终完整测试：`238 passed`，同一条既有警告，耗时 13.20 秒。
 - Important 修订最终完整测试：`238 passed in 11.57s`；`compileall` 通过，
   `pip check` 返回 `No broken requirements found.`。
+- 最终外部合同复审初次验证为 `238 passed in 11.71s`；关闭最后一项未知 provider
+  status 映射和来源消费映射后，再次完整验证为 `238 passed in 13.28s`。两次都只有
+  既有的 pytest `cache_dir` 配置警告；`compileall`、`pip check` 和
+  `git diff --check` 通过。29 项 FR/NFR、
+  5 项 THR、13 项 ADR、39 项 SRC 及其追踪/来源映射差异均为 0；相对链接、BOM、
+  尾随空白、遗留 live-citation token 和范围外变更均为 0。
 - `python -m compileall -q src tests` 通过，`python -m pip check` 返回 `No broken requirements found.`。
 - 六份核心交付文档中的需求标识共 29 项，与追踪矩阵完全一致，差异为 0。
 - THR 标识共 5 项，与追踪矩阵完全一致，差异为 0。
-- 初始提交时 SRC 标识共 26 项；Important 修订扩展到 SRC-034。最终来源登记与来源
+- 初始提交时 SRC 标识共 26 项；Important 修订扩展到 SRC-034，最终合同复审扩展到
+  SRC-039。最终来源登记与来源
   消费映射差异为 0。
 - 新增核心文档中遗留 `turn…` 引用为 0，UTF-8 BOM 文件为 0，尾随空白为 0。
 - Important 修订严格只改变 8 份允许的研究/产品文档；相对链接断链为 0；两份旧研究
@@ -99,6 +124,9 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 - Python 环境使用现有 Conda 环境 `vtnote`；pytest 临时目录和字节码缓存均写入 `D:\Workspace\Codex\cache\VtNote-product-docs\` 下的专用目录。
 - Important 修订复核的 pytest 临时目录与字节码缓存写入
   `D:\Workspace\Codex\cache\VtNote-product-docs-final\`；未写入 C 盘项目文件。
+- 最终复审的测试、字节码和临时文件写入
+  `D:\Workspace\Codex\cache\VtNote-product-docs-final\validation-20260724-03\` 与
+  `D:\Workspace\Codex\cache\VtNote-product-docs-final\validation-20260724-04\`。
 
 ## 5. 外部配置异常与回滚
 
@@ -119,6 +147,10 @@ Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 - Bilibili 网页提取路径容易受登录、风控、页面变化和地区差异影响，必须以 POC 成功率和错误样本决定是否进入 V1。
 - 当前网络的一次 YouTube 直连超时不是平台定论；中国目标环境的 direct-only 结果尚未
   形成分布。V1 不提供代理；本地文件是可控后备。
+- 当前环境缺 `yt-dlp-ejs` 与 Deno，不能宣称具备完整 YouTube 支持；受控 D 盘运行链
+  必须先通过版本/哈希/许可证/readiness 与真实公开 corpus 门禁。
+- 火山 HTTP 状态不足以判断业务成功；正式实现和发布必须按
+  `X-Api-Status-Code` 与响应体双重校验，并保留未知结果可能计费语义。
 - 当前开发 FFmpeg 是 GPL v3+ 构建观察，不能直接进入发行包；发行构建和合规路径尚未
   冻结。
 - 五项待定阈值必须由对应负责人基于实测冻结，不能以文档示例替代发布决策。

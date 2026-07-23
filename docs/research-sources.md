@@ -44,7 +44,7 @@ Owner：VtNote 产品/技术负责人
 | [SRC-014](https://developers.openai.com/api/docs/guides/speech-to-text) | OpenAI speech-to-text guide | 支持流程与按模型区分的语音转文本行为 | 全球 API | 很高 | 2026-07-24 |
 | [SRC-015](https://platform.openai.com/docs/models/default-usage-policies-by-endpoint) | OpenAI data controls | API 数据默认不用于训练；endpoint 资格与保留控制取决于 endpoint/account | 合同/account 相关 | 很高 | 2026-07-24 |
 | [SRC-016](https://openai.com/enterprise-privacy/) | OpenAI enterprise privacy | 默认不训练声明及 enterprise/API 隐私定位 | 合同/account 相关 | 高 | 2026-07-24 |
-| [SRC-017](https://docs.volcengine.com/docs/6561/1631584?lang=zh) | 火山引擎录音文件极速版文档 | 单请求识别、header、`request.model_name`、payload、`X-Tt-Logid`、响应时间戳与时长/大小/容器限制 | 中国大陆服务；页面显示 2026-06-26 更新 | 很高 | 2026-07-24 |
+| [SRC-017](https://docs.volcengine.com/docs/6561/1631584?lang=zh) | 火山引擎录音文件极速版文档 | 单请求识别、`X-Api-Sequence` 等 header、`user.uid`/`request.model_name`/audio payload、`X-Api-Status-Code` 错误码、`X-Tt-Logid`、响应时间戳与时长/大小/容器限制 | 中国大陆服务；页面显示 2026-04-01 更新 | 很高 | 2026-07-24 |
 | [SRC-018](https://www.volcengine.com/product/asr) | 火山引擎 ASR 产品页 | 商业 ASR 定位和当前采购入口 | CNY；促销/计费会变 | 很高 | 2026-07-24 |
 | [SRC-019](https://docs.bibigpt.co/getting-started/bibigpt-supported-platforms) | BibiGPT 文档 | 支持的平台链接与本地文件流程 | 商业服务；限制会变 | 很高 | 2026-07-24 |
 | [SRC-020](https://api.bibigpt.co/) | BibiGPT API 文档 | 存在 API/产品集成；使用前需复核当前合同 | 商业服务 | 很高 | 2026-07-24 |
@@ -62,6 +62,11 @@ Owner：VtNote 产品/技术负责人
 | [SRC-032](https://www.assemblyai.com/docs/api-reference/transcripts/get?explorer=true) | AssemblyAI transcript API reference | transcript 响应 schema 的 words/utterances 含 start/end 等时间字段；具体模型和输出仍需 POC | 商业服务/API 高波动 | 很高 | 2026-07-24 |
 | [SRC-033](https://pypi.org/project/youtube-transcript-api/) | youtube-transcript-api PyPI | 访问日发行版 1.2.4、MIT 元数据；项目说明其依赖 undocumented YouTube Web API，并提示 IP block/Cookie 限制 | 社区项目；站点行为高波动 | 很高 | 2026-07-24 |
 | [SRC-034](https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit) | AssemblyAI submit transcript API reference | pre-recorded async 提交需要可访问 URL/上传结果，返回 transcript ID，后续 poll 或 webhook | 商业服务/API 高波动 | 很高 | 2026-07-24 |
+| [SRC-035](https://pypi.org/project/yt-dlp/) | yt-dlp PyPI 2026.7.4 | `yt-dlp-ejs` 与受支持 JavaScript runtime/engine 被列为完整 YouTube 支持所需的强烈推荐依赖；Deno 是推荐 runtime，远程 EJS component 默认不允许 | VtNote yt-dlp pin；依赖要求高波动 | 很高 | 2026-07-24 |
+| [SRC-036](https://pypi.org/project/yt-dlp-ejs/) | yt-dlp-ejs PyPI | 访问日发行版 0.8.0；wheel 包含 Unlicense、ISC、MIT 组件 | PyPI；需与 yt-dlp/YouTube 合同一起固定 | 很高 | 2026-07-24 |
+| [SRC-037](https://github.com/denoland/deno/releases/tag/v2.8.1) | Deno v2.8.1 release | Windows x64 发行资产、校验文件和固定版本入口 | 固定 release；运行兼容仍需 POC | 中 | 2026-07-24 |
+| [SRC-038](https://github.com/denoland/deno/blob/main/LICENSE.md) | Deno license | MIT 许可证 | default branch；发布时随固定 artifact 再留证 | 低 | 2026-07-24 |
+| [SRC-039](https://docs.deno.com/runtime/getting_started/installation/) | Deno 官方安装文档 | Windows 可手动取得单文件 runtime；安装目录和 `DENO_DIR` 缓存可显式改到受控位置 | 文档高波动；VtNote 不运行在线安装脚本 | 高 | 2026-07-24 |
 
 ### 来源使用映射
 
@@ -89,6 +94,9 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 | SRC-028 | P, T, R | SRC-031 | R |
 | SRC-029 | R, S | SRC-032 | R |
 | SRC-033 | R, S | SRC-034 | R |
+| SRC-035 | P, W, T, R, S | SRC-036 | P, W, T, R, S |
+| SRC-037 | P, W, T, R, S | SRC-038 | T, R, S |
+| SRC-039 | P, W, T, R, S |  |  |
 
 ## 本地证据登记
 
@@ -106,6 +114,7 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 | LOCAL-010 | 基线 HEAD 的 VtNote source/tests | 计划 Tasks 1、2、3A、3B 基础存在；live adapter、ASR 调用、worker loop、AI 执行、React UI、launcher 不存在。 |
 | LOCAL-011 | `D:\ProgramData\Anaconda3\envs\vtnote\Library\bin\ffmpeg.exe -version/-buildconf` | 本机开发环境为 FFmpeg 7.1.1；configure 含 `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-shared --disable-static`，未见 `--enable-nonfree`，所以该开发构建按 GPL v3+ 审计，不能代表未来发行构建。 |
 | LOCAL-012 | 2026-07-24 审查会话的一次“不继承环境代理”的 YouTube 只读直连探测 | 在当前中国网络环境中超时；这是单次环境观察，不证明 YouTube 平台永久不可用，也不构成成功率或地区支持结论。V1 的 `trust_env=false` 是由该观察与安全设计导出的产品合同，并非对当次探测客户端实现的反向描述。 |
+| LOCAL-013 | `vtnote` Conda 环境 `pip show yt-dlp-ejs`、`Get-Command node/deno` | 当前未安装 `yt-dlp-ejs` 或 Deno；只发现 C 盘系统 Node。它不能作为未来发行依赖，也不能证明当前环境具备完整 YouTube 支持。 |
 
 ## 用户输入登记
 
@@ -126,11 +135,11 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 
 历史材料把不同模型的格式混为一谈。当前
 [OpenAI transcription reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)
-把请求接受的音频容器和响应格式分别列出；在该 endpoint 中，
-`gpt-4o-transcribe` 与 `gpt-4o-mini-transcribe` 只支持 `json` response format，
-`whisper-1` 才与 `verbose_json`、SRT/VTT 等字幕文本格式相关。Diarization 与
-timestamp granularities 还有额外的模型/格式限制。VtNote 必须按所选模型做 capability
-test，不能从 endpoint 全部选项的并集推断某一模型能力。
+与 [speech-to-text guide](https://developers.openai.com/api/docs/guides/speech-to-text)
+对 `gpt-4o-transcribe`/mini 是否支持 plain `text` 的公开表述并不完全一致；两者都把
+`verbose_json`、SRT/VTT、diarization 与 timestamp granularities 约束到具体模型或
+格式。VtNote 必须按所选模型做 capability test 并在采购/发布日复核，不能从 endpoint
+全部选项的并集推断单个模型能力，也不能把其中一页的枚举当作永久合同。
 
 <a id="cor-002--videosays-pricing-and-delivery-model"></a>
 
@@ -196,6 +205,9 @@ VtNote 必须显示所选 provider/profile 与上传授权状态，不能承诺�
   自动继承当作可用性修复；
 - 当前开发环境 FFmpeg 构建按 GPL v3+ 审计；实际发布二进制、configure、源码对应关系、
   LGPL/GPL 义务与 NOTICE 尚未冻结；
+- 当前环境缺少 `yt-dlp-ejs` 与 Deno，不能声称具备 yt-dlp 的完整 YouTube 支持；
+  V1 已选择受控 D 盘 EJS/Deno 链，但固定资产、哈希、许可证与真实 corpus 尚待技术
+  闸门验证；
 - Argos Translate 仅是 V1.1 候选；语言对模型包质量与再分发义务尚未验证；
 - INPUT-002 的私有会话正文尚未取得；用户提供正文前不得把其内容写入结论；
 - 本次审计中的 OpenAI 事实仅来自上表所列 OpenAI 官方网页，访问日期为 2026-07-24。

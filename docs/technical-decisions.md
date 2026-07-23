@@ -186,10 +186,15 @@ Bilibili 官方开放平台目录在审计日未提供面向任意公开视频�
 其提取器追随网站变化；官方 README 也体现了平台能力和依赖的滚动变化
 （[yt-dlp](https://github.com/yt-dlp/yt-dlp)）。
 
-当前中国网络环境中曾有一次 `trust_env=false` 的 YouTube 只读直连探测超时。这只
+当前中国网络环境中曾有一次不继承环境代理（direct-only）的 YouTube 只读直连探测超时。这只
 证明该时刻/环境不可达，不能外推为平台定论。另一方面，自动继承系统或环境代理会把
 SSRF、DNS 与凭据边界交给未审计的中间节点；HTTP CONNECT 下客户端通常只连接并解析
 代理，无法同时证明目的站逐连接 DNS pin。
+
+yt-dlp 2026.7.4 的官方包说明把 `yt-dlp-ejs` 和受支持 JavaScript runtime/engine
+列为完整 YouTube 支持所需的强烈推荐依赖，并说明 Deno 是推荐 runtime、远程 EJS
+component 默认禁用。当前 VtNote 环境没有 `yt-dlp-ejs` 或 Deno，只存在 C 盘系统
+Node；该 Node 不是受控发行依赖，也不能证明 YouTube 运行链已就绪。
 
 ### 选项
 
@@ -207,6 +212,13 @@ Cookie，不读取浏览器登录态。
   `HTTPS_PROXY`、`ALL_PROXY`、系统代理或代理凭据；
 - transport 对直连目标的每次 DNS 解析、连接和 redirect 重新执行允许主机与公网 IP
   校验；yt-dlp 也必须位于同一受控网络边界；
+- 初始研究组合固定为 `yt-dlp==2026.7.4`、`yt-dlp-ejs==0.8.0` 与 Deno 2.8.1
+  Windows x64。EJS wheel、Deno 单文件和哈希放在 D 盘受控目录，`DENO_DIR` 同样
+  指向 D 盘；不自动更新、不回退到 C 盘系统 Node、不允许运行时下载远程 EJS
+  component；
+- setup/readiness 必须分别验证三者版本、哈希、solver 可执行性和 remote component
+  禁用状态。缺少 EJS/Deno 时只禁用 YouTube URL，不影响 Bilibili、本地媒体或字幕；
+  只有通过 30–50 视频 POC 的 YouTube 子集后才可把该组合冻结为发行支持；
 - 中国网络下不承诺 YouTube 直连；平台 POC 按实际部署地区/运营商记录 direct-only
   成功与失败，本地文件是正式后备；
 - V1 不提供代理设置。若未来支持显式可信代理，必须单独新增 ADR、威胁模型、目标域
@@ -218,8 +230,9 @@ Cookie，不读取浏览器登录态。
 - 版本升级和目标网络环境变更必须先跑 30–50 视频 POC 中的平台子集；
 - 错误口径必须区分 unsupported、auth/region、removed、temporary 和 adapter drift；
 - 单次超时只进入环境样本，产品不得显示为“该平台在中国永久不可用”；
-- 许可证清单需同时审计 yt-dlp 源码/轮子与发布二进制所带组件，不能只写
-  “Unlicense”。
+- 许可证清单需同时审计 yt-dlp、`yt-dlp-ejs` wheel、Deno 和发布二进制所带组件，
+  不能只写 “Unlicense”；初始 EJS wheel 的登记表达式是
+  `Unlicense AND MIT AND ISC`，Deno 为 MIT，仍以实际发行 artifact 为准。
 
 ### 重审触发器
 
@@ -234,19 +247,21 @@ Cookie，不读取浏览器登录态。
 
 需要一个中文友好、单请求返回的云端后备。火山引擎当前
 [极速版文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh)描述
-`X-Api-Key`、`volc.bigasr.auc_turbo`、JSON Base64/URL 请求、
-`request.model_name: bigmodel`、utterance/word 时间结果、2 小时/100 MB 上限、
-上传二进制尽量约 20 MB 内的建议和 `X-Tt-Logid`。外部合同、价格与保留政策易变；
-公开 DPA 没有给出此 endpoint 可直接承诺的固定 TTL。
+`X-Api-Key`、`X-Api-Request-Id`、`X-Api-Resource-Id`、`X-Api-Sequence`、
+`user.uid`、JSON Base64/URL 请求、`request.model_name: bigmodel`、
+`X-Api-Status-Code` 业务状态、utterance/word 时间结果、2 小时/100 MB 上限、上传
+二进制尽量约 20 MB 内的建议和 `X-Tt-Logid`。外部合同、价格与保留政策易变；公开
+DPA 没有给出此 endpoint 可直接承诺的固定 TTL。
 
 ### 决定
 
 V1 只实现：
 
 - `POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash`；
-- `X-Api-Key`、唯一请求 ID、`X-Api-Resource-Id: volc.bigasr.auc_turbo`；
+- `X-Api-Key`、唯一 `X-Api-Request-Id`、
+  `X-Api-Resource-Id: volc.bigasr.auc_turbo`、`X-Api-Sequence: -1`；
 - 本地转码为 16 kHz、单声道、32 kbps OGG/Opus；
-- JSON `audio.data` Base64 上传；
+- JSON `user.uid` 取当前 AppKey 并按密钥处理，`audio.data` 使用 Base64 上传；
 - `request.model_name` 固定为 `bigmodel`；
 - 同一响应内映射 utterance/word 信息到 provider-neutral 中间结果。
 
@@ -256,17 +271,35 @@ V1 不实现 `audio.url`、云端对象存储、客户端/云端切片、轮询�
 THR-002 必须低于 2 小时/100 MB，并尊重二进制尽量约 20 MB 内的官方建议。
 
 预检超过时长/大小/语言边界时，`auto` 在任何云请求前转本地，`cloud` 阻止并说明。
-明确 429/5xx 或可证明远端未受理的网络失败允许 `auto` 转本地；鉴权、endpoint、
-resource ID、`model_name` 配置错误停止并要求修复。请求体可能已发送但结果未知时
-不得重发，允许本地完成并保留可能计费警告。
+HTTP 状态不能单独判定业务成功。明确 HTTP 429/5xx 作为远端失败处理，若携带
+provider status 仍须安全校验/记录；可能承载业务结果的响应，尤其 HTTP 2xx，必须
+校验 `X-Api-Status-Code`：
+
+- `20000000`：继续严格校验响应体并映射成功；
+- `20000003`：静音音频，映射 `cloud_audio_silent`；停止且不自动转本地或重发；
+- `45000001`、`45000002`、`45000151`：分别作为参数、空音频、格式合同失败，停止
+  并提示修复，不用本地成功掩盖；
+- `55000031` 与其他 `550xxxx`：明确服务端繁忙/内部失败，`auto` 可转本地，但不得
+  自动重发云端；
+- 格式合法但当前合同未识别的 provider status：`cloud_outcome_unknown`；禁止自动
+  云重发，`auto` 可转本地并保留可能计费警告，限长状态码可进入安全诊断；
+- 可能承载业务结果的响应缺失/畸形状态码，或 `20000000` 携带无法解析或不完整的响应体：
+  `cloud_outcome_unknown`，不得重发；`auto` 可转本地并保留可能计费警告。
+
+明确 HTTP 429/5xx 或可证明远端未受理的网络失败也允许 `auto` 转本地；鉴权、
+endpoint、resource ID、`model_name` 配置错误停止并要求修复。请求体可能已发送但
+结果未知时不得重发，允许本地完成并保留可能计费警告。
 
 ### 后果
 
 - 单一协议降低实现与故障状态数量；
 - Base64 有约 4/3 体积放大，必须在构造请求前检查内存和请求体；
 - OGG/Opus 解码采样率细节需用 FFprobe/解码结果验证，不能只相信容器头；
-- 只持久化脱敏且长度受限的 `X-Tt-Logid`、请求 ID、状态与 provider-neutral 结果；
-  不持久化原始云响应、Base64 或认证头；
+- 只持久化脱敏且长度受限的 `X-Tt-Logid`、请求 ID、HTTP 状态、已校验的
+  `X-Api-Status-Code`、安全错误码与 provider-neutral 结果；不持久化原始云响应、
+  provider message、Base64、`user.uid` 或认证头；
+- 合同测试必须覆盖 HTTP 200 搭配所有已知/未知 provider status、缺失/畸形 status
+  header、成功码搭配非法 body，并验证云调用数、fallback 与显式新尝试权限；
 - 供应商价格、区域、保留策略以用户当前控制台/合同为准；
 - OpenAI、AssemblyAI 只作研究对照，不进入 V1 provider 列表。
 
@@ -510,6 +543,8 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 - 可选分支失败不改变核心原文成功；
 - 云端未知结果不自动重复远程副作用；
 - outbound HTTP 不继承系统/环境代理；新增显式代理前必须有独立 ADR/威胁模型/同意；
+- YouTube 完整支持依赖受控、固定版本且通过就绪门禁的 yt-dlp/EJS/Deno 链；不使用
+  系统 Node 或运行时远程 component 兜底；
 - 任务使用创建时配置/授权快照，不读取“最新默认项”改变历史；
 - 密钥不进入数据库、API、日志或产物；
 - 原始云响应不持久化；provider log ID 只能脱敏、限长并按审计字段保存；
@@ -526,8 +561,8 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 | ADR-002 | SQLite task/item/stage 模型与服务已实现；lease/heartbeat/worker 未实现 | Task 3C |
 | ADR-003 | schema、不可变写入与按需导出已实现 | 后续只扩展调用链 |
 | ADR-004 | 选择/逐条字幕校验原语已实现；真实平台调用未接通 | Task 3C |
-| ADR-005 | 仅输入 URL/DNS 预检与 source protocol 基础已实现；`trust_env=false` transport、逐连接 DNS pin、受控 redirect、yt-dlp 网络边界和平台 adapter 均未实现 | Task 3C |
-| ADR-006 | FFmpeg 云音频原语部分已实现；火山 eligibility/HTTP/映射/logid 审计未实现 | Task 3C |
+| ADR-005 | 仅输入 URL/DNS 预检与 source protocol 基础已实现；`trust_env=false` transport、逐连接 DNS pin、受控 redirect、yt-dlp 网络边界、`yt-dlp-ejs`/Deno 受控运行链和平台 adapter 均未实现；当前环境缺 EJS/Deno | Task 3C/6 |
+| ADR-006 | FFmpeg 云音频原语部分已实现；火山 eligibility/HTTP、完整 header/body、`X-Api-Status-Code` 分类、响应映射与 logid 审计未实现 | Task 3C |
 | ADR-007 | 测试/上传授权修订与任务快照已实现；worker 远程副作用状态未实现 | Task 3C |
 | ADR-008 | 依赖与 `large-v3-turbo/int8_float16/VAD` 默认快照已实现；当前 `device:auto` 尚未落实“GPU 必需、CPU 不静默回退”，实际模型加载/单并发转录未实现 | Task 3C |
 | ADR-009 | `summary/key_points/custom` 内部值、`zh-Hans`、一次性自动启用和阶段依赖已实现；中文 UI 标签、chat 调用、顺序分块/cue 引用与产物生成未实现 | Task 4/5 |
@@ -541,12 +576,14 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 ## 5. 发布前必须关闭的技术问题
 
 1. 30–50 视频 POC 尚未运行：云/本地质量、RTF、成本和平台覆盖无结果；
-2. 火山引擎二进制/Base64/内存硬限制、语言 eligibility 和超时值需以真实样本冻结；
+2. 火山引擎完整 header/body、`X-Api-Status-Code` 分类、二进制/Base64/内存硬限制、
+   语言 eligibility 和超时值需以真实样本冻结；
 3. 已批准的 faster-whisper 默认与 GPU/CUDA 支持矩阵需实测验证；改变默认需用户批准；
 4. worker 租约时长、心跳、启动恢复和关机取消策略需故障注入；
-5. Bilibili/YouTube adapter pin 升级与验收语料的维护责任需指定；
+5. Bilibili/YouTube adapter pin 升级与验收语料的维护责任需指定；yt-dlp/EJS/Deno
+   D 盘资产、哈希、solver、禁远程 component 和 SBOM 门禁需验证；
 6. chat provider 的最大输入、结构化输出与一次小 batch 重试合同需测试；
-7. Windows 启动器、静态深链、日志轮转、回收恢复，以及实际 FFmpeg/依赖/模型
-   artifact 的许可证清单需完成；
+7. Windows 启动器、静态深链、日志轮转、回收恢复，以及实际 FFmpeg、
+   yt-dlp/EJS/Deno、其他依赖/模型 artifact 的许可证清单需完成；
 8. 外部供应商接口、价格、区域和数据保留需在发布日重新核验
    [来源登记](research-sources.md)。

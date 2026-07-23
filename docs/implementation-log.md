@@ -2,6 +2,36 @@
 
 ## 2026-07-24
 
+### Product-document final external-contract review
+
+- Starting from documentation commit `5ec52f8`, closed the final independent
+  review's two Important external-contract gaps without changing source, tests,
+  dependencies, environment, project configuration, or user data.
+- Completed the Volc flash request/response contract with
+  `X-Api-Sequence: -1`, secret `user.uid`/AppKey handling, and
+  `X-Api-Status-Code` routing for success, silent audio, request/input errors,
+  server busy/internal errors, unknown valid provider codes, and malformed or
+  missing outcomes. HTTP 200 alone is not treated as business success, and no
+  classified path permits blind paid resubmission.
+- Added the current yt-dlp full-YouTube dependency chain. The initial research
+  combination is `yt-dlp==2026.7.4`, `yt-dlp-ejs==0.8.0`, and Deno 2.8.1,
+  pinned and hashed under managed D-drive storage with Deno cache on D:. It
+  forbids automatic updates, fallback to the existing C-drive system Node, and
+  runtime remote EJS downloads; readiness, corpus, license, and SBOM gates are
+  explicit. The current environment remains not ready because EJS/Deno are not
+  installed.
+- Expanded the official source register through SRC-039 and synchronized the
+  PRD, website specification, ADRs, reference audit, and traceability matrix.
+  The OpenAI audio response-format inconsistency is now a per-model capability
+  test rather than an absolute claim.
+- Final validation found 19 FR, 10 NFR, 5 THR, 13 ADR, and 39 SRC registrations
+  with zero trace/source mapping delta, broken relative link, BOM, trailing
+  whitespace, legacy live-citation token, or out-of-scope changed file. The
+  unchanged codebase passed 238 tests in the final 13.28-second run; D-drive `compileall`,
+  `pip check`, and `git diff --check` passed.
+- This pass remained research/documentation-only. No third-party project source
+  was copied and no repository or user file was deleted.
+
 ### Product-document Important review follow-up
 
 - Starting from documentation commit `3240f5679976bd85681bd504ff2f505877a98cc6`,

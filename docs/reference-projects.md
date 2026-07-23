@@ -11,8 +11,8 @@ Owner：VtNote 产品/技术负责人
 - 本地 BiliNote 快照适合参考入口、进度、历史、转录查看与设置的信息架构；其
   Cookie、浏览器扩展、明文 provider secret、进程内执行器和一体化 note pipeline
   不符合 VtNote V1 安全/持久性边界。
-- 平台接入采用 VtNote 自有显式 adapter + 固定版本 yt-dlp，不直接移植 BiliNote
-  downloader。
+- 平台接入采用 VtNote 自有显式 adapter + 固定版本 yt-dlp；YouTube 还需受控的
+  `yt-dlp-ejs`/Deno 运行链，不直接移植 BiliNote downloader。
 - 本地 ASR 采用 VtNote 自有 faster-whisper adapter；WhisperX、VideoLingo 和 Argos
   是后续候选/工程参考，不进入 V1 依赖。
 - BibiGPT、Videosays、AssemblyAI、OpenAI 和火山引擎用于产品/服务对照，不代表 V1
@@ -37,7 +37,7 @@ Owner：VtNote 产品/技术负责人
 
 用于回答“某个技术能力能否作为依赖或适配器实现”：
 
-- yt-dlp；
+- yt-dlp / yt-dlp-ejs / Deno；
 - faster-whisper / CTranslate2；
 - WhisperX；
 - Argos Translate。
@@ -101,7 +101,7 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 | BiliNote 模块/模式 | 标签 | VtNote 决定 | 原因/约束 |
 |---|---|---|---|
 | `downloaders/base.py` 的职责拆分 | 适配重写 | 保留 `probe / fetch_subtitle / fetch_audio` 概念，自行定义 typed protocol | VtNote 需 URL 安全、不可变产物和 DI 合同 |
-| YouTube downloader/subtitle | 适配重写 | 通过固定版本 yt-dlp 的 VtNote adapter 实现 | 不复制平台代码，统一错误与安全策略 |
+| YouTube downloader/subtitle | 适配重写 | 通过固定 yt-dlp/EJS/Deno 运行链的 VtNote adapter 实现 | 不复制平台代码，统一错误、安全与运行时边界 |
 | Bilibili downloader/subtitle | 仅参考 | 用 yt-dlp adapter + 平台语料合同测试 | BiliNote 路径依赖网站接口/Cookie，非官方稳定合同 |
 | `local_downloader.py` | 适配重写 | 浏览器上传与受信本机路径分开，原件只读 | VtNote 已有自己的安全上传/本地校验 |
 | transcriber base/factory | 适配重写 | 显式 `Transcriber`，编译期注册 Volc/local 两项 | 不采用动态 provider/plugin 工厂 |
@@ -181,6 +181,8 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 | 组件 | 能力 | 已核验版本/状态 | 许可证 | V1 决定 |
 |---|---|---|---|---|
 | yt-dlp | 平台媒体/字幕提取（[仓库](https://github.com/yt-dlp/yt-dlp)） | VtNote pin `2026.7.4` | 源码/轮子核心 Unlicense；发布二进制及依赖有额外条款 | **直接依赖**，放 adapter 后 |
+| yt-dlp-ejs | yt-dlp 的 YouTube 外部 JavaScript solver（[PyPI](https://pypi.org/project/yt-dlp-ejs/)） | 初始研究 pin `0.8.0`，须与 yt-dlp 一起过 POC | wheel 为 Unlicense、MIT、ISC 组件组合 | **直接依赖**；本地 wheel，禁止运行时远程 component |
+| Deno | 执行 yt-dlp-ejs 的受支持 JavaScript runtime（[安装文档](https://docs.deno.com/runtime/getting_started/installation/)） | 初始研究 pin `2.8.1` Windows x64 | MIT（[LICENSE](https://github.com/denoland/deno/blob/main/LICENSE.md)） | **受控运行时**；D 盘单文件和 cache，不用系统 Node 兜底 |
 | youtube-transcript-api | 通过非官方 YouTube Web 行为取得字幕（[仓库](https://github.com/jdepoix/youtube-transcript-api)、[PyPI](https://pypi.org/project/youtube-transcript-api/)） | PyPI 访问日为 `1.2.4` | MIT；但许可证不提供平台合同 | **仅参考/不采用**：YouTube-only，并增加第二套网络、安全、IP-block 与漂移合同 |
 | faster-whisper | CTranslate2 本地 ASR、CPU/GPU（[仓库](https://github.com/SYSTRAN/faster-whisper)） | VtNote pin `1.2.1` | MIT（[LICENSE](https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE)） | **直接依赖**，自有 adapter |
 | CTranslate2 | faster-whisper 推理后端 | VtNote pin `4.8.1` | 分发前按锁文件与官方 license 复核 | faster-whisper 的固定依赖 |
@@ -201,12 +203,18 @@ BiliNote 上游是 MIT。若未来复制其源码的全部或实质部分，必�
 没有复制代码，所以不产生该复制链路；“看过代码并重写职责”仍应在设计审计中保留
 本文件记录。
 
-### 6.2 yt-dlp
+### 6.2 yt-dlp、yt-dlp-ejs 与 Deno
 
 yt-dlp 仓库/源码分发标为 Unlicense，但其 README 明确提示不同发布文件可能打包 MIT、
 ISC 或 GPLv3+ 等组件（[licensing 说明](https://github.com/yt-dlp/yt-dlp/blob/master/README.md)）。
 VtNote 当前使用 Python package pin，不应把某个 PyInstaller 二进制的许可证结论套到
 wheel；发布构建必须以实际 artifact 生成 SBOM/NOTICE。
+
+yt-dlp 2026.7.4 的官方包说明把 `yt-dlp-ejs` 与受支持 JavaScript runtime 列为完整
+YouTube 支持所需依赖。初始 `yt-dlp-ejs==0.8.0` wheel 同时包含 Unlicense、ISC 和
+MIT 组件；Deno 2.8.1 为 MIT。二者都进入 lock、哈希、SBOM/NOTICE 和升级合同测试，
+不能因为主包是 Unlicense 而省略。V1 只用 D 盘受控 Deno，不借用当前 C 盘系统
+Node，也不允许 yt-dlp 在运行时下载远程 EJS component。
 
 ### 6.3 faster-whisper、WhisperX、Argos、VideoLingo
 
@@ -232,7 +240,9 @@ FFmpeg [legal 页面](https://ffmpeg.org/legal.html)与
 
 ### V1 采用
 
-- yt-dlp 固定版本 + VtNote 显式平台 adapter；
+- `yt-dlp==2026.7.4` + `yt-dlp-ejs==0.8.0` + Deno 2.8.1 初始研究组合，放在
+  VtNote 显式平台 adapter 后；EJS wheel、Deno 单文件及 cache 位于 D 盘、校验哈希，
+  禁止自动更新、系统 Node 兜底和运行时远程 component；最终发行 pin 由 POC 冻结；
 - faster-whisper/CTranslate2 固定版本 + VtNote 本地 ASR adapter，批准默认是
   `large-v3-turbo`、`int8_float16`、VAD、segment 时间戳、GPU worker 单并发；
 - 固定且经发行审计的 FFmpeg/FFprobe 二进制；直接复用，不自研 codec/封装；
