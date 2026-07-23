@@ -2,6 +2,52 @@
 
 ## 2026-07-24
 
+### Product-document Important review follow-up
+
+- Starting from documentation commit `3240f5679976bd85681bd504ff2f505877a98cc6`,
+  closed the independent review's Important findings without changing source,
+  tests, dependencies, environment, project configuration, or user data.
+- Registered the user-provided `bilinote.net` page as an unverified,
+  high-volatility BiliNote Pro marketing input distinct from the upstream
+  README's `bilinote.app` link and the local 2.4.4 archive. Registered the
+  private ChatGPT URL as unread/unreviewed after the recorded login redirect
+  and enterprise Chrome-policy block; it is not evidence until the user exports
+  or pastes its body.
+- Fixed the platform network contract at `trust_env=false`, made the one
+  direct-only YouTube timeout an environment observation rather than a platform
+  conclusion, added China-network POC/local-file fallback, and required a new
+  ADR/threat model/user consent before any explicit trusted proxy.
+- Restored the approved local ASR default
+  `large-v3-turbo/int8_float16/VAD/segment/GPU concurrency=1`, fixed model/CUDA
+  artifacts to managed D-drive storage, and made POC a validation/review gate
+  rather than permission for silent default changes. CPU is diagnostic/future
+  fallback, not a V1 release requirement.
+- Expanded the Volc flash contract for 16 kHz mono OGG/Opus,
+  Base64 `audio.data`, fixed resource/model, duration/binary/Base64/language
+  preflight, routing/error classes, unknown paid outcome, revision-bound
+  authorization, sanitized `X-Tt-Logid`, and no raw cloud response persistence.
+  Added a bounded Volc/OpenAI/AssemblyAI paid-ASR matrix without unmeasured
+  quality or price ranking.
+- Added FFmpeg official legal/license evidence. A read-only check of
+  `D:\ProgramData\Anaconda3\envs\vtnote\Library\bin\ffmpeg.exe` reported 7.1.1
+  with `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265` and
+  `--enable-shared --disable-static`, and no `--enable-nonfree`, so this developer
+  build is treated as GPL v3+; the actual release build remains a separate
+  buildconf/source/SBOM/NOTICE gate. VtNote directly reuses FFmpeg rather than
+  implementing codecs or containers.
+- Fixed AI-note templates/defaults and the direct-original, chronological
+  chunk/map/reduce, cue-resolvable timestamp-reference contract. Pinned the
+  yt-dlp extractor evidence commit, added WhisperX PyPI evidence, and recorded
+  youtube-transcript-api as reference-only/not adopted.
+- Final follow-up validation found 19 FR, 10 NFR, 5 THR, and 34 SRC registrations
+  with no requirement/source mapping delta, broken relative links, UTF-8 BOM,
+  trailing whitespace, legacy live-citation token, or out-of-scope changed file.
+  The unchanged codebase passed `238` tests in 11.57 seconds; D-drive
+  `compileall`, `pip check`, and `git diff --check` also passed.
+- No repository or user file was deleted. This follow-up used only
+  `apply_patch` for repository edits and did not access or modify global Codex
+  configuration.
+
 ### Product research, PRD, website, and technical-decision baseline
 
 - Created `docs/product-requirements.md`, `docs/website-specification.md`,

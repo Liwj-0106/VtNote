@@ -2,7 +2,8 @@
 
 日期：2026-07-24
 分支：`feature/vtnote-v1`
-任务基线：`2a36eb0ac0419caf1a9b297c90bfb1e7d0baf8d7`
+初始任务基线：`2a36eb0ac0419caf1a9b297c90bfb1e7d0baf8d7`
+Important 审查修订基线：`3240f5679976bd85681bd504ff2f505877a98cc6`
 
 ## 1. 任务结果
 
@@ -12,9 +13,9 @@
 
 - `docs/product-requirements.md`：V1、V1.1、Later 和明确不做事项；用户旅程；FR-001～FR-019；NFR-001～NFR-010；验收门槛；30～50 个视频的可行性验证；THR-001～THR-005 待冻结阈值。
 - `docs/website-specification.md`：工作区创建/历史、详情、设置三个顶层界面；路由、状态、交互、错误恢复、隐私和可访问性约束。
-- `docs/technical-decisions.md`：十二项 ADR，覆盖分层、任务状态、字幕选择、上传授权、云端配置、取消、网络边界、导出和演进策略。
+- `docs/technical-decisions.md`：十三项 ADR，覆盖分层、任务状态、字幕选择、上传授权、云端配置、取消、网络边界、导出、FFmpeg 分发审计和演进策略。
 - `docs/reference-projects.md`：产品与组件分层比较，BiliNote 本地副本审计，以及采用、改造、仅参考和拒绝决策。
-- `docs/research-sources.md`：SRC-001～SRC-026 一手来源登记、访问日期、版本/地区/币种/波动性和来源到文档结论的映射。
+- `docs/research-sources.md`：SRC-001～SRC-034 来源登记、用户输入/本地证据、访问日期、版本/地区/币种/波动性和来源到文档结论的映射。
 - `docs/traceability.md`：全部 29 项 FR/NFR 到 Tasks 1～7、当前代码/测试证据和剩余验收工作的映射。
 - `.superpowers/sdd/task-product-docs-report.md`：本任务范围、验证、风险和异常处理记录。
 
@@ -35,6 +36,36 @@
 - 火山引擎极速版按当前官方协议记录为 `X-Api-Key`、`volc.bigasr.auc_turbo`、V1 Base64 JSON `audio.data` 和规定音频格式；没有虚构 URL 模式或云端分片方案。
 - yt-dlp、faster-whisper、WhisperX、VideoLingo 和 Argos Translate 的版本与许可证按官方仓库或 PyPI 记录，并保留二进制分发、传递依赖和模型资产的额外合规检查。
 
+### Important 审查修订
+
+- 用户提供的 `https://www.bilinote.net/` 已单列为高波动 BiliNote Pro 商业/内测营销
+  输入。upstream README 明示的 Pro 链接是 `https://www.bilinote.app/`，因此 `.net`
+  与 upstream、本地 2.4.4 archive 的身份、运营方、版本和代码关系均保持未知。
+- 私有 ChatGPT 会话
+  `https://chatgpt.com/g/g-p-6a4a5f6817148191b4f4c7dde86eb336/c/6a5adf72-7784-83ec-b45e-a2a4a618d57d`
+  已原样登记。审查记录为 Web 跳登录、已登录 Chrome 被企业安全策略阻止；正文未读取、
+  不作证据，等待用户导出/粘贴后再做差异核对。
+- 平台 outbound HTTP 合同固定 `trust_env=false`，不继承系统/环境代理。当前中国网络
+  环境的一次 YouTube 直连超时只作为环境观察；平台 POC 必须保留失败样本和本地文件
+  后备。显式可信代理需要新的 ADR、威胁模型和用户同意。
+- 本地 ASR 恢复已批准默认：`large-v3-turbo`、`int8_float16`、VAD、segment 时间戳、
+  GPU worker 单并发；模型/CUDA 发行组合固定版本放 D 盘。POC 只验证/触发重审，不能
+  静默改回 TBD；CPU 不是 V1 发布必选项。
+- 火山路由补齐时长、编码后二进制、Base64、语言预检，`auto/cloud` 分流，429/5xx、
+  配置错误和未知结果分类，脱敏 `X-Tt-Logid` 及禁止持久化原始响应等合同。
+- 付费 ASR 候选矩阵把火山列为 V1 provisional；OpenAI/AssemblyAI 只作自愿 POC/
+  研究对照，按相同样本、真实账单、账户地区和保留合同验证，不做无实测质量/价格排名。
+- 本机只读审计确认 FFmpeg 7.1.1 开发构建含 `--enable-gpl --enable-version3`
+  `--enable-libx264 --enable-libx265 --enable-shared --disable-static`，未见
+  `--enable-nonfree`，因此当前构建按 GPL v3+ 审计。未来发行 artifact 必须单独冻结
+  buildconf、对应源码、SBOM/NOTICE；VtNote 直接复用 FFmpeg，不自研 codec/封装。
+- AI 笔记固定“综合总结/干货提炼/自定义提示词”；AI 配置成功后一次性默认开启且输出
+  简体中文；长原文按时间顺序分块/合并，每个时间引用必须解析回规范 cue。
+- yt-dlp Bilibili extractor 证据固定到 commit
+  `997fa140840a08df3938b40da470c78049fef1f6`；WhisperX 版本增加 PyPI 证据；
+  youtube-transcript-api 因 YouTube-only、非官方站点行为和第二套网络/漂移合同而
+  仅参考、不采用。
+
 ## 3. 当前实现边界
 
 当前代码已覆盖基础 API、任务持久化、确定性字幕轨选择、受信本地路径解析、URL/DNS 预检查、云端配置测试状态、上传授权快照、取消请求和基础 Markdown 导出等能力。
@@ -48,18 +79,26 @@
 - THR-001～THR-005 的实测冻结；
 - “因取消而已取消”的任务再次取消时返回当前资源的契约；当前实现仍会拒绝该重复请求；
 - FR-019 要求的完整来源追踪导出；当前 Markdown 导出只有基础确定性内容。
+- `trust_env=false` 平台 transport、火山完整错误分类、本地 ASR 批准默认、笔记 cue
+  引用和发行 FFmpeg 合规门禁都只是本轮文档合同，不代表代码已实现。
 
 ## 4. 验证证据
 
 - 初始基线：`238 passed`，1 条既有的未知 pytest `cache_dir` 配置警告，耗时 10.38 秒。
 - 提交前最终完整测试：`238 passed`，同一条既有警告，耗时 13.20 秒。
+- Important 修订最终完整测试：`238 passed in 11.57s`；`compileall` 通过，
+  `pip check` 返回 `No broken requirements found.`。
 - `python -m compileall -q src tests` 通过，`python -m pip check` 返回 `No broken requirements found.`。
 - 六份核心交付文档中的需求标识共 29 项，与追踪矩阵完全一致，差异为 0。
 - THR 标识共 5 项，与追踪矩阵完全一致，差异为 0。
-- SRC 标识共 26 项，来源登记与来源消费映射差异为 0。
+- 初始提交时 SRC 标识共 26 项；Important 修订扩展到 SRC-034。最终来源登记与来源
+  消费映射差异为 0。
 - 新增核心文档中遗留 `turn…` 引用为 0，UTF-8 BOM 文件为 0，尾随空白为 0。
-- 八份受检文档的相对链接断链为 0；两份旧研究报告均包含历史材料说明。
+- Important 修订严格只改变 8 份允许的研究/产品文档；相对链接断链为 0；两份旧研究
+  报告均包含历史材料说明。
 - Python 环境使用现有 Conda 环境 `vtnote`；pytest 临时目录和字节码缓存均写入 `D:\Workspace\Codex\cache\VtNote-product-docs\` 下的专用目录。
+- Important 修订复核的 pytest 临时目录与字节码缓存写入
+  `D:\Workspace\Codex\cache\VtNote-product-docs-final\`；未写入 C 盘项目文件。
 
 ## 5. 外部配置异常与回滚
 
@@ -78,6 +117,10 @@
 
 - 外部服务的价格、限额、区域可用性、模型名称和保留政策具有时间敏感性，实施和发布前必须重新核验。
 - Bilibili 网页提取路径容易受登录、风控、页面变化和地区差异影响，必须以 POC 成功率和错误样本决定是否进入 V1。
+- 当前网络的一次 YouTube 直连超时不是平台定论；中国目标环境的 direct-only 结果尚未
+  形成分布。V1 不提供代理；本地文件是可控后备。
+- 当前开发 FFmpeg 是 GPL v3+ 构建观察，不能直接进入发行包；发行构建和合规路径尚未
+  冻结。
 - 五项待定阈值必须由对应负责人基于实测冻结，不能以文档示例替代发布决策。
 - 本任务只形成可执行基线，不代表 Tasks 4～7 的实现已经完成。
 

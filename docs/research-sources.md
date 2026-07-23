@@ -15,10 +15,13 @@ Owner：VtNote 产品/技术负责人
 - 优先使用发布者的产品页、API reference、仓库、release 页或 license 文件；
 - 当地区、币种、版本会改变结论时，必须同时记录；
 - 搜索不到某能力只能记为有边界的审计观察，不能证明该能力永远不存在；
-- “当前实现”仅依据本仓库基线
-  `2a36eb0ac0419caf1a9b297c90bfb1e7d0baf8d7`，不能从实现计划反推；
+- “当前实现”仍依据生产代码审计基线
+  `2a36eb0ac0419caf1a9b297c90bfb1e7d0baf8d7`；Important 文档修订从
+  `3240f5679976bd85681bd504ff2f505877a98cc6` 开始，不能从实现计划反推代码能力；
 - 本地 BiliNote archive 没有 `.git`；README 自报 `BiliNote v2.4.4`，但无法证明其
   upstream commit 或与任何 GitHub release 等价；
+- 用户提供的网页或私有会话只登记为输入；未经一手来源交叉核对或无法读取正文时，
+  不升级为事实证据；
 - 本次调研没有复制 BiliNote 或其他第三方源码。
 
 ## 来源登记
@@ -29,10 +32,10 @@ Owner：VtNote 产品/技术负责人
 | [SRC-002](https://github.com/JefferyHcool/BiliNote/blob/master/LICENSE) | BiliNote license | upstream 为 MIT；复制实质部分需保留 notice | upstream default branch | 中 | 2026-07-24 |
 | [SRC-003](https://openhome.bilibili.com/doc) | 哔哩哔哩开放平台 | 已发布目录包含授权、用户、稿件、数据、专栏与直播；审计目录未见任意公开视频通用字幕读取 API | 中国大陆服务 | 高 | 2026-07-24 |
 | [SRC-004](https://github.com/yt-dlp/yt-dlp) | yt-dlp 仓库/README | 广泛 extractor、字幕列出/取得能力，以及二进制/依赖许可证注意事项 | VtNote pin：`yt-dlp==2026.7.4` | 很高 | 2026-07-24 |
-| [SRC-005](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py) | yt-dlp Bilibili extractor | Bilibili 字幕实现使用网站/player endpoint，不是已发布的通用开放平台字幕合同 | 滚动 default branch | 很高 | 2026-07-24 |
+| [SRC-005](https://github.com/yt-dlp/yt-dlp/blob/997fa140840a08df3938b40da470c78049fef1f6/yt_dlp/extractor/bilibili.py) | yt-dlp Bilibili extractor | Bilibili 字幕实现使用网站/player endpoint，不是已发布的通用开放平台字幕合同 | 固定审计 commit `997fa140840a08df3938b40da470c78049fef1f6` | 很高 | 2026-07-24 |
 | [SRC-006](https://github.com/SYSTRAN/faster-whisper) | faster-whisper 仓库 | CTranslate2 本地 Whisper、CPU/GPU 模式及 segment/word 数据 | VtNote pin：`faster-whisper==1.2.1`、`ctranslate2==4.8.1` | 高 | 2026-07-24 |
 | [SRC-007](https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE) | faster-whisper license | MIT 及 notice 保留义务 | default branch | 低 | 2026-07-24 |
-| [SRC-008](https://github.com/m-bain/whisperX) | WhisperX 仓库 | 强制对齐、word timestamp、可选 diarization、额外模型及已声明限制 | PyPI 稳定版显示 3.8.6；3.8.7rc1 是预发布 | 高 | 2026-07-24 |
+| [SRC-008](https://github.com/m-bain/whisperX) | WhisperX 仓库 | 强制对齐、word timestamp、可选 diarization、额外模型及已声明限制 | default branch；发行版本另见 SRC-029 | 高 | 2026-07-24 |
 | [SRC-009](https://github.com/m-bain/whisperX/blob/main/LICENSE) | WhisperX license | BSD-2-Clause | default branch | 低 | 2026-07-24 |
 | [SRC-010](https://github.com/Huanshere/VideoLingo) | VideoLingo 仓库 | 字幕切分、翻译、对齐、配音的端到端参考流程 | 未经新复核不固定 “latest” | 高 | 2026-07-24 |
 | [SRC-011](https://github.com/Huanshere/VideoLingo/blob/main/LICENSE) | VideoLingo license | Apache-2.0 | default branch | 低 | 2026-07-24 |
@@ -41,7 +44,7 @@ Owner：VtNote 产品/技术负责人
 | [SRC-014](https://developers.openai.com/api/docs/guides/speech-to-text) | OpenAI speech-to-text guide | 支持流程与按模型区分的语音转文本行为 | 全球 API | 很高 | 2026-07-24 |
 | [SRC-015](https://platform.openai.com/docs/models/default-usage-policies-by-endpoint) | OpenAI data controls | API 数据默认不用于训练；endpoint 资格与保留控制取决于 endpoint/account | 合同/account 相关 | 很高 | 2026-07-24 |
 | [SRC-016](https://openai.com/enterprise-privacy/) | OpenAI enterprise privacy | 默认不训练声明及 enterprise/API 隐私定位 | 合同/account 相关 | 高 | 2026-07-24 |
-| [SRC-017](https://docs.volcengine.com/docs/6561/1631584?lang=zh) | 火山引擎录音文件极速版文档 | 单请求识别、header、endpoint、payload 与时长/大小/容器限制 | 中国大陆服务；页面显示 2026-06-26 更新 | 很高 | 2026-07-24 |
+| [SRC-017](https://docs.volcengine.com/docs/6561/1631584?lang=zh) | 火山引擎录音文件极速版文档 | 单请求识别、header、`request.model_name`、payload、`X-Tt-Logid`、响应时间戳与时长/大小/容器限制 | 中国大陆服务；页面显示 2026-06-26 更新 | 很高 | 2026-07-24 |
 | [SRC-018](https://www.volcengine.com/product/asr) | 火山引擎 ASR 产品页 | 商业 ASR 定位和当前采购入口 | CNY；促销/计费会变 | 很高 | 2026-07-24 |
 | [SRC-019](https://docs.bibigpt.co/getting-started/bibigpt-supported-platforms) | BibiGPT 文档 | 支持的平台链接与本地文件流程 | 商业服务；限制会变 | 很高 | 2026-07-24 |
 | [SRC-020](https://api.bibigpt.co/) | BibiGPT API 文档 | 存在 API/产品集成；使用前需复核当前合同 | 商业服务 | 很高 | 2026-07-24 |
@@ -51,16 +54,25 @@ Owner：VtNote 产品/技术负责人
 | [SRC-024](https://www.assemblyai.com/deployments/self-hosted) | AssemblyAI self-hosted | 指定 API/模型现提供客户基础设施上的商业自托管；不是开源本地包 | enterprise/商业访问 | 很高 | 2026-07-24 |
 | [SRC-025](https://www.assemblyai.com/docs/pre-recorded-audio/select-the-region) | AssemblyAI region guide | region 取决于 endpoint/workflow；数据驻留要求需另验 | US/EU offering | 高 | 2026-07-24 |
 | [SRC-026](https://bibigpt.co/) | BibiGPT 产品页 | 转录、摘要、思维导图/聊天方向的产品对照 | 商业服务 | 很高 | 2026-07-24 |
+| [SRC-027](https://ffmpeg.org/legal.html) | FFmpeg legal 页面 | FFmpeg 默认 LGPL，但启用 GPL 部件会使对应构建受 GPL 约束；发布需核对实际 configure 与合规义务 | 许可证；低频变化但必须按构建审计 | 中 | 2026-07-24 |
+| [SRC-028](https://ffmpeg.org/doxygen/trunk/md_LICENSE.html) | FFmpeg license 文档 | `--enable-gpl`、`--enable-version3` 和可选库会改变实际构建的适用许可证 | trunk 文档；发布时按所用版本复核 | 中 | 2026-07-24 |
+| [SRC-029](https://pypi.org/project/whisperx/) | WhisperX PyPI | 访问日稳定发行版为 3.8.6，3.8.7rc1 是预发布；Python 与发行文件元数据 | PyPI；版本高波动 | 很高 | 2026-07-24 |
+| [SRC-030](https://github.com/jdepoix/youtube-transcript-api) | youtube-transcript-api upstream | 仅面向 YouTube、通过非官方站点行为取得人工/自动字幕；不是 YouTube 官方 API 合同 | 社区项目；站点行为高波动 | 很高 | 2026-07-24 |
+| [SRC-031](https://www.assemblyai.com/docs/data-retention-and-model-training) | AssemblyAI 数据保留/训练文档 | async 产物、上传音频、TTL、删除与模型训练 opt-out 取决于账户/合同配置 | 商业服务；合同高波动 | 很高 | 2026-07-24 |
+| [SRC-032](https://www.assemblyai.com/docs/api-reference/transcripts/get?explorer=true) | AssemblyAI transcript API reference | transcript 响应 schema 的 words/utterances 含 start/end 等时间字段；具体模型和输出仍需 POC | 商业服务/API 高波动 | 很高 | 2026-07-24 |
+| [SRC-033](https://pypi.org/project/youtube-transcript-api/) | youtube-transcript-api PyPI | 访问日发行版 1.2.4、MIT 元数据；项目说明其依赖 undocumented YouTube Web API，并提示 IP block/Cookie 限制 | 社区项目；站点行为高波动 | 很高 | 2026-07-24 |
+| [SRC-034](https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit) | AssemblyAI submit transcript API reference | pre-recorded async 提交需要可访问 URL/上传结果，返回 transcript ID，后续 poll 或 webhook | 商业服务/API 高波动 | 很高 | 2026-07-24 |
 
 ### 来源使用映射
 
 缩写：P=`product-requirements.md`，W=`website-specification.md`，
-T=`technical-decisions.md`，R=`reference-projects.md`。W 中的外部事实通过 P/T 的
-已审计结论使用；页面规格不自行扩大供应商声明。
+T=`technical-decisions.md`，R=`reference-projects.md`，
+S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/T 的已审计
+结论使用；页面规格不自行扩大供应商声明。
 
 | 来源 | 使用文档 | 来源 | 使用文档 |
 |---|---|---|---|
-| SRC-001 | R | SRC-014 | T, R |
+| SRC-001 | R, S | SRC-014 | T, R |
 | SRC-002 | R | SRC-015 | P, W, T, R |
 | SRC-003 | P, W, T, R | SRC-016 | P, W, T, R |
 | SRC-004 | P, T, R | SRC-017 | P, W, T, R |
@@ -73,6 +85,10 @@ T=`technical-decisions.md`，R=`reference-projects.md`。W 中的外部事实通
 | SRC-011 | R | SRC-024 | R |
 | SRC-012 | P, T, R | SRC-025 | R |
 | SRC-013 | T, R | SRC-026 | R |
+| SRC-027 | P, T, R, S | SRC-030 | R, S |
+| SRC-028 | P, T, R | SRC-031 | R |
+| SRC-029 | R, S | SRC-032 | R |
+| SRC-033 | R, S | SRC-034 | R |
 
 ## 本地证据登记
 
@@ -88,6 +104,17 @@ T=`technical-decisions.md`，R=`reference-projects.md`。W 中的外部事实通
 | LOCAL-008 | `D:\Workspace\Project\BiliNote-master\BillNote_frontend\src\pages\` | 创建、历史、onboarding、进度、转录、聊天和设置可作 UX 参考。 |
 | LOCAL-009 | 基线 HEAD 的 `D:\Workspace\Project\VtNote\pyproject.toml` | pin 为 yt-dlp 2026.7.4、faster-whisper 1.2.1、CTranslate2 4.8.1。 |
 | LOCAL-010 | 基线 HEAD 的 VtNote source/tests | 计划 Tasks 1、2、3A、3B 基础存在；live adapter、ASR 调用、worker loop、AI 执行、React UI、launcher 不存在。 |
+| LOCAL-011 | `D:\ProgramData\Anaconda3\envs\vtnote\Library\bin\ffmpeg.exe -version/-buildconf` | 本机开发环境为 FFmpeg 7.1.1；configure 含 `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-shared --disable-static`，未见 `--enable-nonfree`，所以该开发构建按 GPL v3+ 审计，不能代表未来发行构建。 |
+| LOCAL-012 | 2026-07-24 审查会话的一次“不继承环境代理”的 YouTube 只读直连探测 | 在当前中国网络环境中超时；这是单次环境观察，不证明 YouTube 平台永久不可用，也不构成成功率或地区支持结论。V1 的 `trust_env=false` 是由该观察与安全设计导出的产品合同，并非对当次探测客户端实现的反向描述。 |
+
+## 用户输入登记
+
+用户输入不是已审计事实。只有在正文可访问并与一手来源交叉核对后，才能提升证据等级。
+
+| ID | 用户输入 | 可观察状态 | 使用边界 | 使用文档 |
+|---|---|---|---|---|
+| INPUT-001 | `https://www.bilinote.net/` | 公开页面自称 “BiliNote Pro”，营销快照描述 Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要与多种导出；页面和陈述高波动 | upstream README 的 Pro 链接是 `https://www.bilinote.app/`；`.net` 与 upstream、本地 2.4.4 archive 的身份、版本、运营方和代码关系均未知。只作商业/内测营销输入，不采信速度、准确率、用户数、Stars 或其他促销数字 | R, S |
+| INPUT-002 | `https://chatgpt.com/g/g-p-6a4a5f6817148191b4f4c7dde86eb336/c/6a5adf72-7784-83ec-b45e-a2a4a618d57d` | 审查记录显示 Web 打开跳转登录；尝试使用已登录 Chrome 时被企业安全策略阻止；本任务未读取会话正文 | 不作证据、不推断内容；等待用户导出或粘贴正文后，再与当前来源登记逐项做差异核对 | R, S |
 
 ## 历史报告纠错
 
@@ -130,7 +157,7 @@ test，不能从 endpoint 全部选项的并集推断某一模型能力。
 在证据截止日，审计到的
 [哔哩哔哩开放平台目录](https://openhome.bilibili.com/doc)没有发布面向任意公开视频的
 通用第三方字幕读取 endpoint。这是有边界的审计发现，不是永久不存在的证明。
-[yt-dlp extractor](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py)
+[yt-dlp extractor](https://github.com/yt-dlp/yt-dlp/blob/997fa140840a08df3938b40da470c78049fef1f6/yt_dlp/extractor/bilibili.py)
 与本地 BiliNote 快照都使用网站/player 行为。因此 VtNote 把 Bilibili URL/字幕支持
 视为 best-effort、版本固定、由公开 corpus 测试的 adapter，并提供明确的
 unsupported/auth/region 错误和本地文件后备；不能把它写成官方稳定 API 权利。
@@ -163,5 +190,12 @@ VtNote 必须显示所选 provider/profile 与上传授权状态，不能承诺�
   retention 取决于用户/account；
 - Bilibili/YouTube extractor 天生易变；固定版本不能替代定期 corpus test 与
   unsupported-source fallback；
+- 当前中国网络环境的一次直连超时不能外推平台结论；V1 的 direct-only 网络策略、
+  Bilibili/YouTube 可达性和本地文件后备必须进入平台 POC；
+- 未来若支持显式可信代理，必须先新增 ADR、威胁模型与用户同意流程，不能把系统代理
+  自动继承当作可用性修复；
+- 当前开发环境 FFmpeg 构建按 GPL v3+ 审计；实际发布二进制、configure、源码对应关系、
+  LGPL/GPL 义务与 NOTICE 尚未冻结；
 - Argos Translate 仅是 V1.1 候选；语言对模型包质量与再分发义务尚未验证；
+- INPUT-002 的私有会话正文尚未取得；用户提供正文前不得把其内容写入结论；
 - 本次审计中的 OpenAI 事实仅来自上表所列 OpenAI 官方网页，访问日期为 2026-07-24。

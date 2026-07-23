@@ -186,6 +186,11 @@ Bilibili 官方开放平台目录在审计日未提供面向任意公开视频�
 其提取器追随网站变化；官方 README 也体现了平台能力和依赖的滚动变化
 （[yt-dlp](https://github.com/yt-dlp/yt-dlp)）。
 
+当前中国网络环境中曾有一次 `trust_env=false` 的 YouTube 只读直连探测超时。这只
+证明该时刻/环境不可达，不能外推为平台定论。另一方面，自动继承系统或环境代理会把
+SSRF、DNS 与凭据边界交给未审计的中间节点；HTTP CONNECT 下客户端通常只连接并解析
+代理，无法同时证明目的站逐连接 DNS pin。
+
 ### 选项
 
 1. 在业务层直接调用 yt-dlp；
@@ -198,11 +203,21 @@ Bilibili 官方开放平台目录在审计日未提供面向任意公开视频�
 返回安全元数据、字幕描述或运行资产引用；URL 每次重定向都经过安全策略。V1 不传
 Cookie，不读取浏览器登录态。
 
+- 所有 outbound HTTP session 固定 `trust_env=false`，不继承 `HTTP_PROXY`、
+  `HTTPS_PROXY`、`ALL_PROXY`、系统代理或代理凭据；
+- transport 对直连目标的每次 DNS 解析、连接和 redirect 重新执行允许主机与公网 IP
+  校验；yt-dlp 也必须位于同一受控网络边界；
+- 中国网络下不承诺 YouTube 直连；平台 POC 按实际部署地区/运营商记录 direct-only
+  成功与失败，本地文件是正式后备；
+- V1 不提供代理设置。若未来支持显式可信代理，必须单独新增 ADR、威胁模型、目标域
+  约束、凭据存储和用户同意；在解决 CONNECT 与目的站 DNS pin 冲突前不得上线。
+
 ### 后果
 
 - yt-dlp 更新可被隔离和回滚，但仍可能因平台变更失效；
-- 版本升级必须先跑 30–50 视频 POC 中的平台子集；
+- 版本升级和目标网络环境变更必须先跑 30–50 视频 POC 中的平台子集；
 - 错误口径必须区分 unsupported、auth/region、removed、temporary 和 adapter drift；
+- 单次超时只进入环境样本，产品不得显示为“该平台在中国永久不可用”；
 - 许可证清单需同时审计 yt-dlp 源码/轮子与发布二进制所带组件，不能只写
   “Unlicense”。
 
@@ -219,8 +234,10 @@ Cookie，不读取浏览器登录态。
 
 需要一个中文友好、单请求返回的云端后备。火山引擎当前
 [极速版文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh)描述
-`X-Api-Key`、`volc.bigasr.auc_turbo`、JSON Base64/URL 请求，以及 2 小时、100 MB
-等当前限制。外部合同和价格易变。
+`X-Api-Key`、`volc.bigasr.auc_turbo`、JSON Base64/URL 请求、
+`request.model_name: bigmodel`、utterance/word 时间结果、2 小时/100 MB 上限、
+上传二进制尽量约 20 MB 内的建议和 `X-Tt-Logid`。外部合同、价格与保留政策易变；
+公开 DPA 没有给出此 endpoint 可直接承诺的固定 TTL。
 
 ### 决定
 
@@ -230,16 +247,26 @@ V1 只实现：
 - `X-Api-Key`、唯一请求 ID、`X-Api-Resource-Id: volc.bigasr.auc_turbo`；
 - 本地转码为 16 kHz、单声道、32 kbps OGG/Opus；
 - JSON `audio.data` Base64 上传；
+- `request.model_name` 固定为 `bigmodel`；
 - 同一响应内映射 utterance/word 信息到 provider-neutral 中间结果。
 
 V1 不实现 `audio.url`、云端对象存储、客户端/云端切片、轮询或其他火山模型。发送前
-重新核验官方合同，并执行比 2 小时/100 MB 更保守的应用预检/建议阈值。
+重新核验官方合同，并依次预检时长、OGG/Opus 编码后字节数、按
+`4 * ceil(binary_bytes / 3)` 计算的 Base64 量级、JSON/峰值内存和 profile 支持语言。
+THR-002 必须低于 2 小时/100 MB，并尊重二进制尽量约 20 MB 内的官方建议。
+
+预检超过时长/大小/语言边界时，`auto` 在任何云请求前转本地，`cloud` 阻止并说明。
+明确 429/5xx 或可证明远端未受理的网络失败允许 `auto` 转本地；鉴权、endpoint、
+resource ID、`model_name` 配置错误停止并要求修复。请求体可能已发送但结果未知时
+不得重发，允许本地完成并保留可能计费警告。
 
 ### 后果
 
 - 单一协议降低实现与故障状态数量；
 - Base64 有约 4/3 体积放大，必须在构造请求前检查内存和请求体；
 - OGG/Opus 解码采样率细节需用 FFprobe/解码结果验证，不能只相信容器头；
+- 只持久化脱敏且长度受限的 `X-Tt-Logid`、请求 ID、状态与 provider-neutral 结果；
+  不持久化原始云响应、Base64 或认证头；
 - 供应商价格、区域、保留策略以用户当前控制台/合同为准；
 - OpenAI、AssemblyAI 只作研究对照，不进入 V1 provider 列表。
 
@@ -267,8 +294,11 @@ POC 质量/成本不达阈值、官方接口/资源 ID/格式变化，或单请�
 - 任务快照保存所用 profile/connection/授权修订，不保存密钥；
 - 创建页持续显示供应商、路由、隐私和可能计费，并允许切 `local`；
 - 明确未受理/明确失败时，`auto` 可转本地；
+- 明确 429/5xx 或可证明远端未受理的网络失败属于上述可转本地类；鉴权、endpoint、
+  resource/model 配置错误停止并提示修复；
 - 请求已发送但结果未知时记录 `cloud_outcome_unknown`，不得自动再次发云请求；可转
   本地并保留“可能已计费”警告；
+- 原始云响应不持久化；只保存 provider-neutral 映射、脱敏 `X-Tt-Logid` 和安全状态；
 - 用户若显式新建云 attempt，必须二次确认重复计费风险。
 
 ### 后果
@@ -284,7 +314,7 @@ POC 质量/成本不达阈值、官方接口/资源 ID/格式变化，或单请�
 
 ## ADR-008：本地 ASR 使用 faster-whisper 分段时间戳
 
-状态：Accepted（模型/精度参数待 POC）
+状态：Accepted（V1 默认已批准，性能待 POC 验证）
 关联：FR-010、FR-011、NFR-005、NFR-008
 
 ### 背景
@@ -296,9 +326,18 @@ Hugging Face 条件和更多故障面；其官方 README 也列出重叠说话�
 
 ### 决定
 
-V1 固定 `faster-whisper==1.2.1` 与 `ctranslate2==4.8.1`，懒加载模型，CPU 必须可用，
-GPU 仅在探测通过时启用。规范 schema 以 segment 起止时间为门禁；若 provider 返回
-word，可保留为可选 provenance/扩展，但 V1 UI 与导出不依赖逐字级时间。
+V1 固定 `faster-whisper==1.2.1` 与 `ctranslate2==4.8.1`。批准的运行默认是：
+
+- 模型 `large-v3-turbo`；
+- `compute_type=int8_float16`；
+- VAD 开启；
+- 规范输出使用 segment 起止时间；
+- 单个 GPU worker 并发 1。
+
+模型文件、模型哈希与 CUDA/cuBLAS/cuDNN 发行组合固定版本、按需取得并放在 D 盘受控
+目录，不得静默升级或写入 C 盘。NVIDIA GPU 是 V1 本地 ASR 发布路径；CPU 仅保留
+诊断/未来备选，不是 V1 发布必选项，也不得成为静默性能降级。若 provider 返回 word，
+可保留为可选 provenance/扩展，但 V1 UI 与导出不依赖逐字级时间。
 
 WhisperX 不进入 V1；V1.1/Later 只有在 POC 证明逐字对齐的用户价值大于模型、显存、
 许可证与运维成本后再评估。
@@ -308,7 +347,8 @@ WhisperX 不进入 V1；V1.1/Later 只有在 POC 证明逐字对齐的用户价�
 - 依赖较少、离线可运行、与当前实现 pin 一致；
 - 分段边界不等同专业字幕切分，产品需诚实说明；
 - 模型文件按需下载到 D 盘，校验来源/哈希/空间；不得隐式写 C 盘；
-- 默认模型、compute type、VAD 参数必须由 POC 决定，本文不编造性能。
+- POC 验证质量、时间戳、显存、RTF 与目标 Windows/CUDA 矩阵；它可以触发重审，但
+  不能让实现者静默改变已批准默认。任何默认变更都需用户明确批准并更新本 ADR。
 
 ### 重审触发器
 
@@ -329,10 +369,14 @@ POC 时间戳门禁失败、用户明确需要逐字高亮/说话人，或 faste
 
 - 显式 `ChatConnection/Profile` 支持 OpenAI-compatible HTTP 合同，不动态加载插件；
 - `Translator` 输入规范 cue，输出相同 cue ID 和源哈希的结构化译文；
-- `NoteGenerator` 输入原始规范转录，支持摘要/关键点/自定义模板；
+- `NoteGenerator` 直接输入原始规范转录，不读取译文；模板固定为“综合总结”
+  “干货提炼”“自定义提示词”，默认输出简体中文；
 - `translate` 与 `notes` 都只依赖 `transcribe`，由 worker 独立领取；
 - 结构化响应失败时，翻译只允许一次更小 batch 的受控重试；不得重跑 source/ASR；
-- 长笔记采用有界 chunk/map/reduce，记录模板/模型/config revision；
+- 长笔记按 cue 时间顺序做有界 chunk/map/reduce；每块记录首末 cue/时间，map 摘要
+  保留 cue 映射，reduce 严格按原顺序合并；
+- 最终笔记的每个时间点引用携带稳定 cue ID，可从 UI 点击并解析回同一规范转录的
+  时间和原文；无法解析的引用不得发布；
 - 可选分支失败使 item `completed_with_warnings`，不遮蔽原文。
 
 ### 后果
@@ -340,7 +384,8 @@ POC 时间戳门禁失败、用户明确需要逐字高亮/说话人，或 faste
 - 可更换兼容供应商，且阶段重试成本可控；
 - “兼容”需通过 profile connection test 验证，不能假定所有端点完全相同；
 - 提示词、响应、token/字符限制和错误必须脱敏并有界；
-- 笔记默认开启规则依赖当前测试成功 profile，用户关闭后不得自行重新开启。
+- 首个当前修订 AI profile 测试成功后，笔记一次性默认开启且输出简体中文；用户关闭
+  或改语言后不得自行重新覆盖。
 
 ### 重审触发器
 
@@ -424,6 +469,38 @@ V1.1 可重新评估“显式浏览器助手”，前提是主动安装、最小
 
 导出成本成为交互瓶颈，或需要签名归档、用户编辑版和批量打包。
 
+## ADR-013：直接复用 FFmpeg，按实际发行构建审计许可证
+
+状态：Accepted
+关联：FR-001、FR-007、NFR-004、NFR-005、NFR-010
+
+### 背景
+
+FFmpeg 的[法律说明](https://ffmpeg.org/legal.html)和
+[许可证文档](https://ffmpeg.org/doxygen/trunk/md_LICENSE.html)说明：基础项目通常为
+LGPL，但 `--enable-gpl`、`--enable-version3` 和所启用的可选库会改变实际构建的适用
+许可证。当前本机开发环境 FFmpeg 7.1.1 的 buildconf 含
+`--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-shared`
+和 `--disable-static`，且未见 `--enable-nonfree`；因此该开发构建按 GPL v3+ 审计，
+不能把它当作未来发行包的 LGPL 证明。
+
+### 决定
+
+VtNote 直接调用经过固定和审计的 FFmpeg/FFprobe 二进制，不自研 codec、demuxer、
+muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-buildconf`，保存完整
+输出、二进制哈希、对应源码、修改说明、动态/静态链接形状、许可证文本与 NOTICE。
+发行团队依据该实际构建选择并满足 LGPL 或 GPL 路径；开发环境观察不得代替发行审计。
+
+### 后果
+
+- 媒体能力复用成熟实现，但发行 artifact 成为明确的合规门禁；
+- 更换 FFmpeg build、codec 库或分发方式都需重新审计，不能只比较版本号；
+- 本 ADR 记录工程边界，不构成法律意见。
+
+### 重审触发器
+
+发行渠道、FFmpeg build configuration、链接方式、启用 codec/库或许可证发生变化。
+
 ## 3. 跨 ADR 不变量
 
 以下规则不得由单个适配器自行改变：
@@ -432,8 +509,11 @@ V1.1 可重新评估“显式浏览器助手”，前提是主动安装、最小
 - `transcript.json` 已发布后不可覆盖；
 - 可选分支失败不改变核心原文成功；
 - 云端未知结果不自动重复远程副作用；
+- outbound HTTP 不继承系统/环境代理；新增显式代理前必须有独立 ADR/威胁模型/同意；
 - 任务使用创建时配置/授权快照，不读取“最新默认项”改变历史；
 - 密钥不进入数据库、API、日志或产物；
+- 原始云响应不持久化；provider log ID 只能脱敏、限长并按审计字段保存；
+- 本地 ASR 默认只能经用户明确批准和 ADR 更新后改变；
 - 用户原件不修改、不删除；
 - 所有长任务只在 worker 执行；
 - 任何未测得的速度、准确率和成本都保持“待验证”。
@@ -446,25 +526,27 @@ V1.1 可重新评估“显式浏览器助手”，前提是主动安装、最小
 | ADR-002 | SQLite task/item/stage 模型与服务已实现；lease/heartbeat/worker 未实现 | Task 3C |
 | ADR-003 | schema、不可变写入与按需导出已实现 | 后续只扩展调用链 |
 | ADR-004 | 选择/逐条字幕校验原语已实现；真实平台调用未接通 | Task 3C |
-| ADR-005 | 仅输入 URL/DNS 预检与 source protocol 基础已实现；逐连接 DNS pin、受控 redirect、yt-dlp 网络边界和平台 adapter 均未实现 | Task 3C |
-| ADR-006 | FFmpeg 云音频原语部分已实现；火山 eligibility/HTTP/映射未实现 | Task 3C |
+| ADR-005 | 仅输入 URL/DNS 预检与 source protocol 基础已实现；`trust_env=false` transport、逐连接 DNS pin、受控 redirect、yt-dlp 网络边界和平台 adapter 均未实现 | Task 3C |
+| ADR-006 | FFmpeg 云音频原语部分已实现；火山 eligibility/HTTP/映射/logid 审计未实现 | Task 3C |
 | ADR-007 | 测试/上传授权修订与任务快照已实现；worker 远程副作用状态未实现 | Task 3C |
-| ADR-008 | 依赖已 pin；实际模型加载/转录未实现 | Task 3C |
-| ADR-009 | 配置/schema/阶段依赖已实现；chat 调用与产物生成未实现 | Task 4 |
+| ADR-008 | 依赖与 `large-v3-turbo/int8_float16/VAD` 默认快照已实现；当前 `device:auto` 尚未落实“GPU 必需、CPU 不静默回退”，实际模型加载/单并发转录未实现 | Task 3C |
+| ADR-009 | `summary/key_points/custom` 内部值、`zh-Hans`、一次性自动启用和阶段依赖已实现；中文 UI 标签、chat 调用、顺序分块/cue 引用与产物生成未实现 | Task 4/5 |
 | ADR-010 | 路径、keyring、回收与清理原语大部已实现；监督/完整清理流程待集成 | Task 3C/6 |
 | ADR-011 | 当前无插件/Cookie 实现，符合 | 持续安全门禁 |
 | ADR-012 | 后端导出纯函数与 API 已实现；网站下载交互未实现 | Task 5 |
+| ADR-013 | 当前开发 FFmpeg build 已只读审计；发行 artifact/SBOM/NOTICE 尚未冻结 | Task 6/7 |
 
 该表是 2026-07-24 的代码审计快照，不是路线图完成声明。
 
 ## 5. 发布前必须关闭的技术问题
 
 1. 30–50 视频 POC 尚未运行：云/本地质量、RTF、成本和平台覆盖无结果；
-2. 火山引擎请求体内存上限、应用更保守硬限制和超时值需以真实样本冻结；
-3. faster-whisper 默认模型、compute type、CPU/GPU 支持矩阵需实测；
+2. 火山引擎二进制/Base64/内存硬限制、语言 eligibility 和超时值需以真实样本冻结；
+3. 已批准的 faster-whisper 默认与 GPU/CUDA 支持矩阵需实测验证；改变默认需用户批准；
 4. worker 租约时长、心跳、启动恢复和关机取消策略需故障注入；
 5. Bilibili/YouTube adapter pin 升级与验收语料的维护责任需指定；
 6. chat provider 的最大输入、结构化输出与一次小 batch 重试合同需测试；
-7. Windows 启动器、静态深链、日志轮转、回收恢复和依赖许可证清单需完成；
+7. Windows 启动器、静态深链、日志轮转、回收恢复，以及实际 FFmpeg/依赖/模型
+   artifact 的许可证清单需完成；
 8. 外部供应商接口、价格、区域和数据保留需在发布日重新核验
    [来源登记](research-sources.md)。
