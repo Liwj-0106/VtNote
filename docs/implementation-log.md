@@ -2,6 +2,41 @@
 
 ## 2026-07-24
 
+### Product research, PRD, website, and technical-decision baseline
+
+- Created `docs/product-requirements.md`, `docs/website-specification.md`,
+  `docs/technical-decisions.md`, `docs/reference-projects.md`,
+  `docs/research-sources.md`, and `docs/traceability.md`. The documents define
+  stable FR/NFR IDs, V1/V1.1/Later boundaries, all task/failure/cancel/retry/
+  warning states, a 30–50-video POC, website acceptance, ADRs, reference-project
+  adoption/rejection, official-source corrections, and requirement-to-plan/test
+  traceability.
+- Audited the local `D:\Workspace\Project\BiliNote-master` archive without
+  changing it. The archive README self-reports 2.4.4, but no Git metadata exists,
+  so no local commit or upstream-release equivalence is claimed. No BiliNote or
+  other third-party source code was copied.
+- Audited first-party sources for Bilibili Open Platform, yt-dlp,
+  faster-whisper, WhisperX, VideoLingo, Argos Translate, OpenAI, Volcengine,
+  BibiGPT, Videosays, and AssemblyAI as of 2026-07-24. Added explicit corrections
+  for historical OpenAI output-format, Videosays pricing, AssemblyAI self-hosting,
+  Bilibili subtitle-access, BiliNote provenance, and OpenAI privacy wording.
+- Added prominent historical-material notices to
+  `docs/deep-research-report-1.md` and `docs/deep-research-report-2.md`; their
+  original bodies and unresolved legacy citation tokens remain untouched.
+- Baseline verification used the existing `vtnote` Conda environment and a
+  dedicated `D:\Workspace\Codex\cache\VtNote-product-docs\` temp root: 238 tests
+  passed with one pre-existing pytest `cache_dir` warning. No source, test,
+  production configuration, dependency, or user-data file was changed.
+- During source-tool discovery, a global Codex MCP entry was added outside the
+  repository in error. It was immediately removed after a full configuration
+  backup; exact comparison proved that only the added stanza disappeared.
+  Backup and SHA-256/mtime rollback evidence are retained under
+  `D:\Workspace\Codex\cache\VtNote-product-docs\`. No other global configuration
+  content changed.
+- No project or user file was deleted. The repository changes in this section
+  are documentation-only; final verification and the focused documentation
+  commit are recorded in the task report.
+
 ### Task 3B: upload/local ingress and media primitives
 
 - Added bounded multipart streaming on the existing task-creation route. The deterministic wire contract is one UTF-8 JSON `metadata` part followed by one file part; browser uploads are written only to typed `D:` runtime paths, receive opaque asset locators, and retain only a bounded sanitized display name.
