@@ -23,7 +23,13 @@ from vtnote.paths import StoragePaths, UnsafePathError
 
 TRASH_RETENTION = timedelta(hours=24)
 RUNTIME_ASSET_ROLES = frozenset(
-    {"uploaded_source", "downloaded_audio", "cloud_audio", "local_audio"}
+    {
+        "uploaded_source",
+        "downloaded_audio",
+        "cloud_audio",
+        "local_audio",
+        "failed_media",
+    }
 )
 PURGE_BLOCKING_STATUSES = frozenset({"queued", "running", "cancel_requested"})
 
@@ -107,8 +113,22 @@ class RuntimeAssetService:
                 expected = self.paths.downloaded_audio(item_id, extension)
             elif role == "cloud_audio":
                 expected = self.paths.cloud_ogg(item_id)
-            else:
+            elif role == "local_audio":
                 expected = self.paths.local_prepared_audio(item_id)
+            else:
+                relative = PurePosixPath(relative_path)
+                if len(relative.parts) != 5 or relative.parts[:4] != (
+                    "items",
+                    item_id,
+                    "audio",
+                    "staging",
+                ):
+                    raise RuntimeAssetError("role_path_mismatch")
+                expected = self.paths.conversion_staging(
+                    item_id,
+                    relative.stem,
+                    extension,
+                )
         except UnsafePathError as error:
             raise RuntimeAssetError("role_path_mismatch") from error
         if candidate != expected:
@@ -243,6 +263,47 @@ class RuntimeAssetService:
                 raise RuntimeAssetError("path_conflict") from None
             row = recovered
         return self._view(row)
+
+    def active_for_role(self, *, item_id: str, role: str) -> RuntimeAssetView | None:
+        """Return the verified active asset for one typed item role, if present."""
+
+        canonical_item_id = _canonical_uuid(item_id, code="invalid_item_id")
+        if role not in RUNTIME_ASSET_ROLES:
+            raise RuntimeAssetError("invalid_role")
+        rows = self.session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.item_id == canonical_item_id,
+                RuntimeAssetRecord.role == role,
+                RuntimeAssetRecord.state == "active",
+            )
+        ).all()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeAssetError("ambiguous_role_assets")
+        self.resolve(rows[0].id)
+        return self._view(rows[0])
+
+    def restore_trashed_for_role(
+        self, *, item_id: str, role: str
+    ) -> RuntimeAssetView | None:
+        """Restore the one retained typed asset for a role, if present."""
+
+        canonical_item_id = _canonical_uuid(item_id, code="invalid_item_id")
+        if role not in RUNTIME_ASSET_ROLES:
+            raise RuntimeAssetError("invalid_role")
+        rows = self.session.scalars(
+            select(RuntimeAssetRecord).where(
+                RuntimeAssetRecord.item_id == canonical_item_id,
+                RuntimeAssetRecord.role == role,
+                RuntimeAssetRecord.state == "trash",
+            )
+        ).all()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeAssetError("ambiguous_role_assets")
+        return self.restore(rows[0].id)
 
     def resolve(self, asset_id: str) -> Path:
         row = self._load(asset_id)

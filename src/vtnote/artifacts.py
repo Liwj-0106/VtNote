@@ -90,7 +90,9 @@ def _ensure_immutable(paths: StoragePaths, destination: Path, data: bytes) -> Pa
         raise
 
 
-def _validate_source_subtitle(extension: str, data: bytes) -> None:
+def validate_source_subtitle(extension: str, data: bytes) -> None:
+    """Validate source bytes without writing a durable artifact."""
+
     normalized = extension.casefold()
     try:
         text = data.decode("utf-8-sig")
@@ -187,7 +189,7 @@ def write_source_original(
     """Persist a validated real source subtitle without ever replacing it."""
 
     destination = paths.source_original(item_id, extension)
-    _validate_source_subtitle(extension, source_bytes)
+    validate_source_subtitle(extension, source_bytes)
     source_directory = destination.parent
     paths.assert_durable_destination(source_directory)
     if source_directory.is_dir() and any(

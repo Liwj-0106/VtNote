@@ -10,7 +10,7 @@ from typing import Any, Callable, Literal, Protocol
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -19,9 +19,19 @@ from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.exports import ExportFormat
+from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.paths import StoragePaths, UnsafePathError
+from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
-from vtnote.tasks import InvalidTaskOperation, TaskService
+from vtnote.tasks import InvalidTaskOperation, LocalSourceValidator, TaskService
+from vtnote.uploads import (
+    LocalSourceFiles,
+    MultipartUploadStager,
+    UploadError,
+    UploadLimits,
+    UploadService,
+    UploadTaskContext,
+)
 from vtnote.url_security import Resolver, SocketResolver, SourceUrlPolicy, UnsafeSourceUrl
 
 
@@ -173,6 +183,22 @@ class TaskCreate(InputModel):
     notes_custom_prompt: str | None = None
 
 
+class UploadTaskMetadata(InputModel):
+    """The first multipart part; the second and final part is always ``file``."""
+
+    kind: Literal["media", "subtitle"]
+    asr_mode: Literal["auto", "cloud", "local"] | None = None
+    cloud_asr_profile_id: str | None = None
+    translation_enabled: bool | None = None
+    translation_profile_id: str | None = None
+    translation_target_language: str | None = Field(default=None, min_length=1)
+    notes_enabled: bool | None = None
+    notes_profile_id: str | None = None
+    notes_template: Literal["summary", "key_points", "custom"] | None = None
+    notes_output_language: str | None = Field(default=None, min_length=1)
+    notes_custom_prompt: str | None = None
+
+
 class ProbeInput(InputModel):
     url: str = Field(min_length=1)
 
@@ -211,12 +237,22 @@ def create_app(
     connection_tester: ConnectionTester | None = None,
     profile_tester: ProfileTester | None = None,
     source_probe: SourceProbe | None = None,
+    local_source_validator: LocalSourceValidator | None = None,
+    upload_limits: UploadLimits | None = None,
 ) -> FastAPI:
     selected_settings = settings or Settings()
     paths = StoragePaths.from_settings(selected_settings)
     selected_engine = engine or initialize_database(paths.database)
     selected_secrets = secret_store or KeyringSecretStore()
     source_policy = SourceUrlPolicy(resolver or SocketResolver())
+    selected_upload_limits = upload_limits or UploadLimits()
+    selected_local_sources = local_source_validator or LocalSourceFiles(
+        FfmpegMediaProcessor(
+            runner=CommandRunner(),
+            binaries=FfmpegBinaries.discover(),
+        ),
+        max_subtitle_bytes=selected_upload_limits.max_subtitle_bytes,
+    )
     sessions = sessionmaker(selected_engine, expire_on_commit=False)
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
@@ -286,7 +322,13 @@ def create_app(
     def services() -> tuple[Session, ConfigurationService, TaskService]:
         session = sessions()
         configuration = ConfigurationService(session, selected_secrets, paths=paths)
-        tasks = TaskService(session, configuration, paths, source_policy)
+        tasks = TaskService(
+            session,
+            configuration,
+            paths,
+            source_policy,
+            local_source_validator=selected_local_sources,
+        )
         return session, configuration, tasks
 
     @app.get("/api/security/csrf")
@@ -504,14 +546,101 @@ def create_app(
             session.close()
 
     @app.post("/api/tasks", status_code=201)
-    def create_task(payload: TaskCreate):
+    async def create_task(request: Request):
         session, _, tasks = services()
         try:
-            sources = [item.model_dump() for item in payload.sources]
-            options = payload.model_dump(
-                exclude={"sources"}, exclude_unset=True, exclude_none=True
+            content_type = request.headers.get("content-type", "")
+            media_type = content_type.split(";", 1)[0].strip().casefold()
+            if media_type == "application/json":
+                try:
+                    raw_payload = await request.json()
+                except ValueError:
+                    return _error(
+                        422,
+                        "validation_error",
+                        "request validation failed",
+                    )
+                try:
+                    payload = TaskCreate.model_validate(raw_payload)
+                except ValidationError as error:
+                    details = [
+                        {
+                            "location": ["body", *item["loc"]],
+                            "type": item["type"],
+                        }
+                        for item in error.errors()
+                    ]
+                    return _error(
+                        422,
+                        "validation_error",
+                        "request validation failed",
+                        details,
+                    )
+                sources = [item.model_dump() for item in payload.sources]
+                options = payload.model_dump(
+                    exclude={"sources"}, exclude_unset=True, exclude_none=True
+                )
+                return _dump(tasks.create_task(sources=sources, options=options))
+            if media_type != "multipart/form-data":
+                return _error(
+                    415,
+                    "unsupported_media_type",
+                    "request must be JSON or multipart form data",
+                )
+
+            raw_length = request.headers.get("content-length")
+            try:
+                content_length = int(raw_length) if raw_length is not None else None
+            except ValueError:
+                return _error(400, "invalid_content_length", "invalid Content-Length")
+            uploads = UploadService(
+                session=session,
+                paths=paths,
+                tasks=tasks,
+                assets=RuntimeAssetService(session, paths),
+                local_sources=selected_local_sources,
             )
-            return _dump(tasks.create_task(sources=sources, options=options))
+
+            def accept_metadata(
+                metadata: dict[str, Any], upload_id: str
+            ) -> UploadTaskContext:
+                payload = UploadTaskMetadata.model_validate(metadata)
+                options = payload.model_dump(
+                    exclude={"kind"}, exclude_unset=True, exclude_none=True
+                )
+                created = tasks.create_upload_task(
+                    upload_kind=payload.kind,
+                    upload_id=upload_id,
+                    options=options,
+                )
+                return UploadTaskContext(
+                    task_id=created.id,
+                    item_id=created.items[0].id,
+                )
+
+            try:
+                state = await MultipartUploadStager(
+                    paths, selected_upload_limits
+                ).consume(
+                    request.stream(),
+                    content_type=content_type,
+                    content_length=content_length,
+                    accept_metadata=accept_metadata,
+                )
+                return _dump(uploads.complete(state))
+            except UploadError as error:
+                uploads.fail(error.state, code=error.code)
+                details = (
+                    {"task_id": error.state.context.task_id}
+                    if error.state.context is not None
+                    else None
+                )
+                return _error(
+                    error.status_code,
+                    error.code,
+                    "upload failed",
+                    details,
+                )
         finally:
             session.close()
 

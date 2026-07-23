@@ -1,5 +1,14 @@
 # VtNote implementation log
 
+## 2026-07-24
+
+### Task 3B: upload/local ingress and media primitives
+
+- Added bounded multipart streaming on the existing task-creation route. The deterministic wire contract is one UTF-8 JSON `metadata` part followed by one file part; browser uploads are written only to typed `D:` runtime paths, receive opaque asset locators, and retain only a bounded sanitized display name.
+- Added upload/local-source validation for subtitles and media, typed disposable runtime assets with recoverable trash handling, shell-free bounded FFmpeg/ffprobe argv execution, cloud Opus conversion (16 kHz mono input contract at 32 kb/s), and dependency-injected subtitle/audio source contracts. No platform adapter, ASR call, or worker loop was added.
+- Hardened conversion recovery: cloud/local outputs are staged under UUID-typed paths and promoted only after FFmpeg succeeds; non-empty failed staging output is registered and moved to 24-hour trash. A retained cloud output can be restored/reused, and upload cleanup failures record a safe lifecycle event.
+- Verified focused Task 3B tests (94 passed) and the full suite (234 passed) using isolated runtime-cache pytest roots; `compileall`, `pip check`, and `git diff --check` passed. No user originals or `D:\Workspace\Project\VtNote-data` content was modified or deleted.
+
 ## 2026-07-18
 
 - Established the original research documents as the Git baseline on `main`.

@@ -9,7 +9,8 @@ from __future__ import annotations
 import copy
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session, selectinload
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.exports import ExportFormat, render_export_from_json
-from vtnote.models import ItemRecord, StageRunRecord, TaskRecord
+from vtnote.models import ItemRecord, RuntimeAssetRecord, StageRunRecord, TaskRecord
 from vtnote.paths import StoragePaths
 from vtnote.pipeline import (
     ACTIVE_STAGE_STATUSES as _ACTIVE,
@@ -35,6 +36,12 @@ from vtnote.url_security import SourceUrlPolicy
 
 class InvalidTaskOperation(ValueError):
     pass
+
+
+class LocalSourceValidator(Protocol):
+    def validate_media(self, path: Path) -> Any: ...
+
+    def validate_subtitle(self, path: Path) -> None: ...
 
 
 class StageView(BaseModel):
@@ -54,6 +61,7 @@ class ItemView(BaseModel):
     position: int
     source_kind: str
     source_locator: str
+    source_display_name: str | None
     status: str
     title: str | None
     stage_runs: tuple[StageView, ...]
@@ -92,11 +100,13 @@ class TaskService:
         configuration: ConfigurationService,
         paths: StoragePaths,
         source_urls: SourceUrlPolicy,
+        local_source_validator: LocalSourceValidator | None = None,
     ) -> None:
         self.session = session
         self.configuration = configuration
         self.paths = paths
         self.source_urls = source_urls
+        self.local_source_validator = local_source_validator
 
     def _stage_view(
         self, row: StageRunRecord, sensitive_values: tuple[str, ...]
@@ -139,6 +149,7 @@ class TaskService:
             position=row.position,
             source_kind=row.source_kind,
             source_locator=source_locator,
+            source_display_name=row.source_display_name,
             status=row.status,
             title=row.title,
             stage_runs=tuple(
@@ -267,25 +278,40 @@ class TaskService:
         if kind not in {"local_media", "local_subtitle"}:
             raise InvalidTaskOperation("unsupported source kind")
         path = Path(locator)
-        if not path.is_absolute() or not path.is_file():
+        if (
+            not path.is_absolute()
+            or str(path).startswith("\\\\")
+            or not path.is_file()
+        ):
             raise InvalidTaskOperation("local source must be an existing absolute file")
+        if self.local_source_validator is not None:
+            try:
+                if kind == "local_media":
+                    self.local_source_validator.validate_media(path)
+                else:
+                    self.local_source_validator.validate_subtitle(path)
+            except (OSError, ValueError):
+                label = "media" if kind == "local_media" else "subtitle"
+                raise InvalidTaskOperation(f"invalid local {label}") from None
         return kind, str(path)
 
-    def create_task(
-        self, *, sources: list[dict[str, str]], options: dict[str, Any] | None = None
+    def _create_validated_task(
+        self,
+        *,
+        validated: list[tuple[str, str, str | None]],
+        selected_options: dict[str, Any],
     ) -> TaskView:
-        if not sources:
-            raise InvalidTaskOperation("at least one source is required")
-        selected_options = dict(options or {})
-        if set(selected_options) - _TASK_OPTION_KEYS:
-            raise InvalidTaskOperation("unsupported task option")
-        validated = [self._validate_source(source) for source in sources]
         snapshot = self._pipeline_snapshot(selected_options)
         task = TaskRecord(options=selected_options, pipeline_snapshot_json=snapshot)
         translation_enabled = snapshot["translation"]["enabled"]
         notes_enabled = snapshot["notes"]["enabled"]
-        for position, (kind, locator) in enumerate(validated):
-            item = ItemRecord(position=position, source_kind=kind, source_locator=locator)
+        for position, (kind, locator, display_name) in enumerate(validated):
+            item = ItemRecord(
+                position=position,
+                source_kind=kind,
+                source_locator=locator,
+                source_display_name=display_name,
+            )
             stages = ["source", "transcribe"]
             if translation_enabled:
                 stages.append("translate")
@@ -299,6 +325,88 @@ class TaskService:
             item.artifact_relpath = f"items/{item.id}"
         self.session.commit()
         return self._view(self._load_task(task.id))
+
+    def create_task(
+        self, *, sources: list[dict[str, str]], options: dict[str, Any] | None = None
+    ) -> TaskView:
+        if not sources:
+            raise InvalidTaskOperation("at least one source is required")
+        selected_options = dict(options or {})
+        if set(selected_options) - _TASK_OPTION_KEYS:
+            raise InvalidTaskOperation("unsupported task option")
+        validated = [(*self._validate_source(source), None) for source in sources]
+        return self._create_validated_task(
+            validated=validated, selected_options=selected_options
+        )
+
+    def create_upload_task(
+        self, *, upload_kind: str, upload_id: str, options: dict[str, Any] | None = None
+    ) -> TaskView:
+        source_kinds = {"media": "uploaded_media", "subtitle": "uploaded_subtitle"}
+        if upload_kind not in source_kinds:
+            raise InvalidTaskOperation("invalid upload kind")
+        try:
+            locator = str(UUID(upload_id))
+        except (ValueError, AttributeError):
+            raise InvalidTaskOperation("invalid upload identifier") from None
+        selected_options = dict(options or {})
+        if set(selected_options) - _TASK_OPTION_KEYS:
+            raise InvalidTaskOperation("unsupported task option")
+        return self._create_validated_task(
+            validated=[(source_kinds[upload_kind], locator, None)],
+            selected_options=selected_options,
+        )
+
+    def bind_uploaded_asset(
+        self, *, item_id: str, asset_id: str, display_name: str
+    ) -> TaskView:
+        item = self.session.get(ItemRecord, item_id)
+        asset = self.session.get(RuntimeAssetRecord, asset_id)
+        if item is None or asset is None:
+            raise InvalidTaskOperation("upload asset is unavailable")
+        if (
+            item.source_kind not in {"uploaded_media", "uploaded_subtitle"}
+            or asset.item_id != item.id
+            or asset.role != "uploaded_source"
+            or asset.state != "active"
+        ):
+            raise InvalidTaskOperation("upload asset does not match its item")
+        if not display_name or len(display_name) > 180:
+            raise InvalidTaskOperation("invalid upload display name")
+        item.source_locator = asset.id
+        item.source_display_name = display_name
+        self.session.commit()
+        return self._view(self._load_task(item.task_id))
+
+    def record_upload_failure(
+        self, *, item_id: str, error_code: str, message: str
+    ) -> TaskView:
+        if _ERROR_CODE.fullmatch(error_code) is None:
+            raise InvalidTaskOperation("invalid stage error code")
+        item = self.session.scalar(
+            select(ItemRecord)
+            .where(ItemRecord.id == item_id)
+            .options(selectinload(ItemRecord.stage_runs), selectinload(ItemRecord.task))
+        )
+        if item is None:
+            raise KeyError(item_id)
+        source_runs = [run for run in item.stage_runs if run.stage == "source"]
+        if not source_runs:
+            raise InvalidTaskOperation("source stage is unavailable")
+        source = max(source_runs, key=lambda run: run.attempt)
+        safe_message = sanitize_diagnostic(
+            message, self.configuration.diagnostic_sensitive_values()
+        )
+        source.status = "failed"
+        source.error_code = error_code
+        source.error_message = safe_message
+        for run in item.stage_runs:
+            if run is not source and run.status == "queued":
+                run.status = "canceled"
+        item.status = "failed"
+        item.task.status = "failed"
+        self.session.commit()
+        return self._view(self._load_task(item.task_id))
 
     def list_tasks(self) -> list[TaskView]:
         ids = self.session.scalars(select(TaskRecord.id).order_by(TaskRecord.created_at.desc())).all()

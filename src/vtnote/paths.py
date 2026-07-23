@@ -187,6 +187,19 @@ class StoragePaths:
     def local_prepared_audio(self, item_id: str | UUID) -> Path:
         return self.runtime("items", _uuid_component(item_id), "audio", "local.wav")
 
+    def conversion_staging(
+        self, item_id: str | UUID, staging_id: str | UUID, extension: str
+    ) -> Path:
+        """Return a disposable, item-owned FFmpeg staging path."""
+
+        return self.runtime(
+            "items",
+            _uuid_component(item_id),
+            "audio",
+            "staging",
+            f"{_uuid_component(staging_id)}.{_extension(extension, _AUDIO_EXTENSIONS)}",
+        )
+
     def trash_asset(self, asset_id: str | UUID, extension: str) -> Path:
         return self.runtime(
             "trash",
