@@ -18,6 +18,9 @@ from vtnote.models import Base
 _BOOTSTRAP_LOCK = threading.Lock()
 _WAL_ATTEMPTS = 5
 _ADDITIVE_COLUMNS = {
+    "tasks": {
+        "terminal_reason_code": "VARCHAR(64)",
+    },
     "items": {
         "source_display_name": "TEXT",
     },
@@ -25,6 +28,9 @@ _ADDITIVE_COLUMNS = {
         "external_request_id": "VARCHAR(128)",
         "external_log_id": "VARCHAR(256)",
         "external_submission_state": "VARCHAR(32)",
+        "progress_json": "JSON",
+        "execution_evidence_json": "JSON",
+        "provider_status_code": "VARCHAR(128)",
         "recovered_count": "INTEGER NOT NULL DEFAULT 0",
     },
 }
@@ -55,8 +61,9 @@ def _initialize_wal(engine: Engine) -> None:
 
 
 def _apply_additive_schema_upgrades(connection: Connection) -> None:
-    """Add Task 3 columns to an existing Task 2 database without rebuilding rows."""
+    """Add new nullable columns to an existing database without rebuilding rows."""
 
+    added_columns: set[tuple[str, str]] = set()
     for table_name, additions in _ADDITIVE_COLUMNS.items():
         columns = {
             str(row[1])
@@ -70,6 +77,13 @@ def _apply_additive_schema_upgrades(connection: Connection) -> None:
                     f'ALTER TABLE "{table_name}" '
                     f'ADD COLUMN "{column_name}" {declaration}'
                 )
+                added_columns.add((table_name, column_name))
+    if ("tasks", "terminal_reason_code") in added_columns:
+        connection.exec_driver_sql(
+            """UPDATE tasks
+            SET terminal_reason_code = 'user_canceled'
+            WHERE status = 'canceled' AND terminal_reason_code IS NULL"""
+        )
 
 
 def _initialize_schema(engine: Engine) -> None:

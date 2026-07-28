@@ -329,6 +329,17 @@ def test_empty_upload_uses_only_typed_zero_byte_cleanup_and_audits_it(tmp_path: 
         engine.dispose()
 
 
+def test_upload_total_request_limit_uses_largest_payload() -> None:
+    limits = UploadLimits(
+        max_media_bytes=11,
+        max_subtitle_bytes=7,
+        max_metadata_bytes=3,
+        max_request_overhead_bytes=5,
+    )
+
+    assert limits.max_request_bytes == 19
+
+
 def test_stream_parser_detects_false_content_length_and_disconnect_after_metadata(
     tmp_path: Path,
 ) -> None:

@@ -29,12 +29,16 @@ _TASK3_TABLES = {
     "worker_heartbeats",
 }
 _TASK3_COLUMNS = {
+    "tasks": {"terminal_reason_code"},
     "items": {"source_display_name"},
     "stage_runs": {
         "external_request_id",
         "external_log_id",
         "external_submission_state",
         "recovered_count",
+        "progress_json",
+        "execution_evidence_json",
+        "provider_status_code",
     },
 }
 
@@ -49,7 +53,8 @@ def create_task2_schema(database_path: Path):
     for table_name, column_names in _TASK3_COLUMNS.items():
         table = metadata.tables[table_name]
         for column_name in column_names:
-            table._columns.remove(table.c[column_name])
+            if column_name in table.c:
+                table._columns.remove(table.c[column_name])
     engine = create_engine(URL.create("sqlite+pysqlite", database=str(database_path)))
     metadata.create_all(engine)
     return engine
@@ -132,6 +137,58 @@ def test_runtime_foundation_fields_round_trip(tmp_path: Path) -> None:
             ) == ("request-1", "log-1", "submitted", 2)
     finally:
         engine.dispose()
+
+
+def test_additive_upgrade_adds_stage_evidence_columns(tmp_path: Path) -> None:
+    database_path = tmp_path / "stage-evidence-upgrade.db"
+    legacy_engine = create_task2_schema(database_path)
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql(
+            """INSERT INTO tasks VALUES (
+            '11111111-1111-4111-8111-111111111111', 'canceled', '{}', '{}',
+            '2026-07-18 00:00:00', '2026-07-18 00:00:00')"""
+        )
+    legacy_engine.dispose()
+
+    engine = initialize_database(database_path)
+    try:
+        inspector = inspect(engine)
+        assert "terminal_reason_code" in {
+            column["name"] for column in inspector.get_columns("tasks")
+        }
+        assert {
+            "progress_json",
+            "execution_evidence_json",
+            "provider_status_code",
+        } <= {column["name"] for column in inspector.get_columns("stage_runs")}
+        with Session(engine) as session:
+            task = session.get(TaskRecord, "11111111-1111-4111-8111-111111111111")
+            assert task is not None
+            assert task.terminal_reason_code == "user_canceled"
+    finally:
+        engine.dispose()
+
+
+def test_terminal_reason_backfill_runs_only_when_legacy_column_is_added(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "current-schema.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        task = TaskRecord(status="canceled", terminal_reason_code=None)
+        session.add(task)
+        session.commit()
+        task_id = task.id
+    engine.dispose()
+
+    reopened = initialize_database(database_path)
+    try:
+        with Session(reopened) as session:
+            stored = session.get(TaskRecord, task_id)
+            assert stored is not None
+            assert stored.terminal_reason_code is None
+    finally:
+        reopened.dispose()
 
 
 def test_additive_upgrade_preserves_task2_rows_and_adds_runtime_schema(

@@ -59,6 +59,7 @@ class TaskRecord(Base):
     pipeline_snapshot_json: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON), nullable=False, default=dict
     )
+    terminal_reason_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
@@ -130,6 +131,13 @@ class StageRunRecord(Base):
     external_request_id: Mapped[str | None] = mapped_column(String(128))
     external_log_id: Mapped[str | None] = mapped_column(String(256))
     external_submission_state: Mapped[str | None] = mapped_column(String(32))
+    progress_json: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
+    execution_evidence_json: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
+    provider_status_code: Mapped[str | None] = mapped_column(String(128))
     recovered_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )

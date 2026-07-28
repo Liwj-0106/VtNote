@@ -2,6 +2,29 @@
 
 ## 2026-07-28
 
+### Task 1 completion: lifecycle and execution-evidence contracts
+
+- Added a task-level terminal-reason code and made repeated cancellation idempotent only for a
+  confirmed user cancellation. Cancellation now uses a status compare-and-swap before atomically
+  updating item/stage states, so a stale request cannot overwrite a concurrently completed task;
+  a successful stage retry clears the old terminal reason.
+- Added bounded stage progress, execution evidence, and provider status persistence plus public
+  views. Progress messages, fallback reasons, compiled provider IDs, and provider statuses use
+  explicit registries; model provenance must match the immutable task snapshot. Both writes and
+  reads reject or hide invalid/sensitive values, including opaque Tencent TaskId, RequestId, LogId,
+  and SecretId-shaped tokens.
+- Made the additive legacy cancellation backfill run only when the old database actually gains the
+  new column, preventing later startups from reclassifying current-schema records.
+- Corrected browser multipart request sizing to
+  `max(media_limit, subtitle_limit) + metadata_limit + overhead_limit`.
+- Added RED/GREEN coverage for cancellation concurrency and idempotency, retry cleanup, migration
+  scope, JSON-safe progress bounds, closed evidence codes, secret-free fail-closed reads, and upload
+  sizing. Independent specification, code/security, and Tencent-boundary reviews found no remaining
+  Critical or Important issues.
+- No external model/API call was made, no dependency was added, and no project or user file was
+  deleted. The isolated final focused suite passed 90 tests, the full suite passed 277 tests, and
+  D-drive `compileall`, `pip check`, and `git diff --check` passed.
+
 ### Domestic-provider V1 decision and plan alignment
 
 - Froze V1 external model calls to domestic services only. Tencent Cloud standard Recording File

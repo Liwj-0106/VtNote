@@ -217,10 +217,15 @@ TaskService.cancel_task(task_id: str) -> TaskView
 2. Run `tests/test_database.py tests/test_tasks.py tests/test_pipeline_contract.py
    tests/test_uploads.py` and confirm the new assertions fail for missing columns/behavior and the
    current upload request-size formula.
-3. Add additive SQLite columns `progress_json`, `execution_evidence_json`, and
-   `provider_status_code`; validate bounded typed values at service boundaries.
-4. Make cancel idempotent only when the terminal reason is user cancellation. Preserve optimistic
-   concurrency and existing retry conflict rules.
+3. Add additive SQLite columns `progress_json`, `execution_evidence_json`,
+   `provider_status_code`, and task-level `terminal_reason_code`; validate bounded typed values at
+   service boundaries. Backfill legacy `canceled` tasks as `user_canceled` because that is the only
+   task-level canceled transition in the accepted pre-worker schema. Progress messages, fallback
+   reasons, providers, and provider statuses use explicit code registries; evidence models must
+   match the immutable task snapshot. Revalidate on public reads and fail closed.
+4. Make cancel idempotent only when `terminal_reason_code=user_canceled`. Use a status compare-and-
+   swap so cancellation cannot overwrite a concurrent terminal transition, and clear the terminal
+   reason on a successful stage retry.
 5. Run focused tests, the shared backend verification, specification review, and code/security
    review.
 6. Commit: `feat: close task lifecycle and stage evidence contracts`.

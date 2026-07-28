@@ -39,7 +39,11 @@ class UploadLimits:
 
     @property
     def max_request_bytes(self) -> int:
-        return max(self.max_media_bytes, self.max_subtitle_bytes) + self.max_request_overhead_bytes
+        return (
+            max(self.max_media_bytes, self.max_subtitle_bytes)
+            + self.max_metadata_bytes
+            + self.max_request_overhead_bytes
+        )
 
 
 @dataclass(frozen=True, slots=True)

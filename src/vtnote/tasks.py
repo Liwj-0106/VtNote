@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -30,6 +30,9 @@ from vtnote.pipeline import (
     STAGE_ORDER as _STAGE_ORDER,
     SUCCESSFUL_STAGE_STATUSES as _SUCCESSFUL_PREREQUISITE,
     TERMINAL_STATUSES as _TERMINAL,
+    validate_execution_evidence,
+    validate_provider_status_code,
+    validate_stage_progress,
 )
 from vtnote.url_security import SourceUrlPolicy
 
@@ -53,6 +56,9 @@ class StageView(BaseModel):
     error_code: str | None
     error_message: str | None
     warning: str | None
+    progress: dict[str, Any] | None
+    execution_evidence: dict[str, Any] | None
+    provider_status_code: str | None
 
 
 class ItemView(BaseModel):
@@ -108,9 +114,77 @@ class TaskService:
         self.source_urls = source_urls
         self.local_source_validator = local_source_validator
 
+    @staticmethod
+    def _allowed_stage_models(row: StageRunRecord) -> tuple[str, ...]:
+        snapshot = row.item.task.pipeline_snapshot_json
+        if not isinstance(snapshot, dict):
+            return ()
+        models: list[str] = []
+        if row.stage == "transcribe":
+            local = snapshot.get("local_whisper")
+            if isinstance(local, dict) and isinstance(local.get("model"), str):
+                models.append(local["model"])
+            asr = snapshot.get("asr")
+            profile = asr.get("profile") if isinstance(asr, dict) else None
+        elif row.stage in {"translate", "notes"}:
+            section = snapshot.get("translation" if row.stage == "translate" else "notes")
+            profile = section.get("profile") if isinstance(section, dict) else None
+        else:
+            profile = None
+        if isinstance(profile, dict) and isinstance(profile.get("model"), str):
+            models.append(profile["model"])
+        return tuple(models)
+
+    @staticmethod
+    def _contains_sensitive_value(
+        values: tuple[str, ...], sensitive_values: tuple[str, ...]
+    ) -> bool:
+        return any(
+            sensitive and sensitive in value
+            for value in values
+            for sensitive in sensitive_values
+        )
+
     def _stage_view(
         self, row: StageRunRecord, sensitive_values: tuple[str, ...]
     ) -> StageView:
+        progress = None
+        if row.progress_json is not None:
+            try:
+                normalized_progress = validate_stage_progress(row.progress_json)
+            except ValueError:
+                pass
+            else:
+                if not self._contains_sensitive_value(
+                    (normalized_progress["message_code"],), sensitive_values
+                ):
+                    progress = dict(normalized_progress)
+        execution_evidence = None
+        if row.execution_evidence_json is not None:
+            try:
+                normalized = validate_execution_evidence(
+                    row.execution_evidence_json,
+                    allowed_models=self._allowed_stage_models(row),
+                )
+            except ValueError:
+                pass
+            else:
+                if not self._contains_sensitive_value(
+                    tuple(normalized.values()), sensitive_values
+                ):
+                    execution_evidence = dict(normalized)
+        provider_status_code = None
+        try:
+            normalized_status = validate_provider_status_code(
+                row.provider_status_code
+            )
+        except ValueError:
+            pass
+        else:
+            if normalized_status is None or not self._contains_sensitive_value(
+                (normalized_status,), sensitive_values
+            ):
+                provider_status_code = normalized_status
         return StageView(
             id=row.id,
             stage=row.stage,
@@ -119,6 +193,9 @@ class TaskService:
             error_code=row.error_code,
             error_message=sanitize_diagnostic(row.error_message, sensitive_values),
             warning=sanitize_diagnostic(row.warning, sensitive_values),
+            progress=progress,
+            execution_evidence=execution_evidence,
+            provider_status_code=provider_status_code,
         )
 
     def _load_task(self, task_id: str) -> TaskRecord:
@@ -441,8 +518,58 @@ class TaskService:
         self.session.commit()
         return self._stage_view(row, sensitive_values)
 
+    def record_stage_progress(
+        self, stage_run_id: str, progress: dict[str, object],
+    ) -> StageView:
+        try:
+            normalized = validate_stage_progress(progress)
+        except ValueError as error:
+            raise InvalidTaskOperation(str(error)) from error
+        row = self.session.get(StageRunRecord, stage_run_id)
+        if row is None:
+            raise KeyError(stage_run_id)
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
+        if self._contains_sensitive_value(
+            (normalized["message_code"],), sensitive_values
+        ):
+            raise InvalidTaskOperation("stage progress contains sensitive value")
+        row.progress_json = dict(normalized)
+        self.session.commit()
+        return self._stage_view(row, sensitive_values)
+
+    def record_stage_evidence(
+        self,
+        stage_run_id: str,
+        evidence: dict[str, object],
+        *,
+        provider_status_code: str | None = None,
+    ) -> StageView:
+        row = self.session.get(StageRunRecord, stage_run_id)
+        if row is None:
+            raise KeyError(stage_run_id)
+        try:
+            normalized = validate_execution_evidence(
+                evidence,
+                allowed_models=self._allowed_stage_models(row),
+            )
+            safe_provider_status = validate_provider_status_code(provider_status_code)
+        except ValueError as error:
+            raise InvalidTaskOperation(str(error)) from error
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
+        evidence_values = tuple(normalized.values())
+        if safe_provider_status is not None:
+            evidence_values += (safe_provider_status,)
+        if self._contains_sensitive_value(evidence_values, sensitive_values):
+            raise InvalidTaskOperation("stage evidence contains sensitive value")
+        row.execution_evidence_json = dict(normalized)
+        row.provider_status_code = safe_provider_status
+        self.session.commit()
+        return self._stage_view(row, sensitive_values)
+
     def cancel_task(self, task_id: str) -> TaskView:
         task = self._load_task(task_id)
+        if task.status == "canceled" and task.terminal_reason_code == "user_canceled":
+            return self._view(task)
         if task.status in _TERMINAL:
             raise InvalidTaskOperation("terminal task cannot be canceled")
         if task.status == "cancel_requested":
@@ -452,16 +579,65 @@ class TaskService:
             for item in task.items
         )
         target = "cancel_requested" if running else "canceled"
-        task.status = target
-        for item in task.items:
-            if item.status not in _TERMINAL:
-                item.status = target
-            for run in item.stage_runs:
-                if run.status == "running":
-                    run.status = "cancel_requested"
-                elif run.status == "queued":
-                    run.status = "canceled" if not running else "canceled"
+        expected_status = task.status
+        task_update = self.session.execute(
+            update(TaskRecord)
+            .where(
+                TaskRecord.id == task_id,
+                TaskRecord.status == expected_status,
+            )
+            .values(
+                status=target,
+                terminal_reason_code="user_canceled",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if task_update.rowcount != 1:
+            self.session.rollback()
+            self.session.expire_all()
+            current = self._load_task(task_id)
+            if (
+                current.status == "canceled"
+                and current.terminal_reason_code == "user_canceled"
+            ):
+                return self._view(current)
+            if current.status in _TERMINAL:
+                raise InvalidTaskOperation("terminal task cannot be canceled")
+            if current.status == "cancel_requested":
+                return self._view(current)
+            raise InvalidTaskOperation(
+                "task cancellation conflicted; refresh and retry"
+            )
+        item_ids = select(ItemRecord.id).where(ItemRecord.task_id == task_id)
+        self.session.execute(
+            update(ItemRecord)
+            .where(
+                ItemRecord.task_id == task_id,
+                ItemRecord.status.not_in(_TERMINAL),
+            )
+            .values(status=target)
+            .execution_options(synchronize_session=False)
+        )
+        self.session.execute(
+            update(StageRunRecord)
+            .where(
+                StageRunRecord.item_id.in_(item_ids),
+                StageRunRecord.status == "running",
+            )
+            .values(status="cancel_requested")
+            .execution_options(synchronize_session=False)
+        )
+        self.session.execute(
+            update(StageRunRecord)
+            .where(
+                StageRunRecord.item_id.in_(item_ids),
+                StageRunRecord.status == "queued",
+            )
+            .values(status="canceled")
+            .execution_options(synchronize_session=False)
+        )
         self.session.commit()
+        self.session.expire_all()
         return self._view(self._load_task(task_id))
 
     def retry_stage(self, item_id: str, stage: str) -> ItemView:
@@ -512,6 +688,7 @@ class TaskService:
         item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
         item.status = "running" if item_has_active_work else "queued"
         item.task.status = "running" if task_has_active_work else "queued"
+        item.task.terminal_reason_code = None
         try:
             self.session.commit()
         except IntegrityError:

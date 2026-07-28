@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
+from typing import Literal, TypedDict, cast
 
 
 TERMINAL_STATUSES = frozenset(
@@ -29,6 +31,179 @@ _KNOWN_STAGE_STATUSES = frozenset(
     {"queued", "running", "cancel_requested", "canceled", "failed", "completed", "skipped"}
 )
 _CORE_STAGES = ("source", "transcribe")
+_PROGRESS_KEYS = frozenset({"current", "total", "unit", "message_code"})
+_PROGRESS_UNITS = frozenset({"bytes", "segments", "cues", "chunks", "items"})
+_MODEL_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_TRACK_ID = re.compile(r"^trk_[0-9a-f]{64}$")
+_MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
+_PROGRESS_MESSAGE_CODES = frozenset(
+    {
+        "downloading_audio",
+        "finalizing_artifacts",
+        "merging_notes",
+        "preparing_audio",
+        "probing_source",
+        "selecting_subtitle",
+        "submitting_cloud_asr",
+        "summarizing_chunks",
+        "transcribing_segments",
+        "translating_cues",
+        "uploading_audio",
+        "waiting_cloud_asr",
+    }
+)
+_FALLBACK_REASON_CODES = frozenset(
+    {
+        "cloud_duration_exceeded",
+        "cloud_language_unsupported",
+        "cloud_network_error",
+        "cloud_payload_exceeded",
+        "cloud_profile_unavailable",
+        "cloud_rate_limited",
+        "cloud_result_invalid",
+        "cloud_server_error",
+        "cloud_submission_unknown",
+        "platform_subtitle_invalid",
+        "platform_subtitle_unavailable",
+    }
+)
+_PROVIDER_IDS = frozenset(
+    {
+        "aliyun_bailian",
+        "bilibili",
+        "faster_whisper",
+        "tencent_recording_asr",
+        "youtube",
+    }
+)
+_PROVIDER_STATUS_CODES = frozenset({"waiting", "doing", "success", "failed"})
+_EVIDENCE_KEYS = (
+    "source_method",
+    "selected_track_id",
+    "asr_route",
+    "provider",
+    "model",
+    "fallback_reason",
+)
+_SOURCE_METHODS = frozenset(
+    {
+        "platform_subtitle",
+        "uploaded_subtitle",
+        "local_subtitle",
+        "cloud_asr",
+        "local_asr",
+    }
+)
+_ASR_ROUTES = frozenset({"platform_subtitle", "cloud", "local", "cloud_to_local"})
+ProgressUnit = Literal["bytes", "segments", "cues", "chunks", "items"]
+
+
+class StageProgress(TypedDict):
+    current: int | None
+    total: int | None
+    unit: ProgressUnit | None
+    message_code: str
+
+
+class ExecutionEvidence(TypedDict, total=False):
+    source_method: str
+    selected_track_id: str
+    asr_route: str
+    provider: str
+    model: str
+    fallback_reason: str
+
+
+def _bounded_nonnegative_integer(value: object, *, field: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0 or value > _MAX_SAFE_JSON_INTEGER:
+        raise ValueError(f"invalid stage progress {field}")
+    return value
+
+
+def validate_stage_progress(progress: object) -> StageProgress:
+    """Return a storage-safe progress object with an exact public shape."""
+
+    if not isinstance(progress, Mapping):
+        raise ValueError("invalid stage progress")
+    if set(progress) != _PROGRESS_KEYS:
+        raise ValueError("invalid stage progress fields")
+    current = _bounded_nonnegative_integer(progress["current"], field="current")
+    total = _bounded_nonnegative_integer(progress["total"], field="total")
+    if total == 0:
+        raise ValueError("stage progress total must be positive")
+    if current is not None and total is not None and current > total:
+        raise ValueError("stage progress current exceeds total")
+    unit = progress["unit"]
+    if unit is not None and (
+        not isinstance(unit, str) or unit not in _PROGRESS_UNITS
+    ):
+        raise ValueError("invalid stage progress unit")
+    if (current is not None or total is not None) and unit is None:
+        raise ValueError("stage progress values require a unit")
+    if current is None and total is None and unit is not None:
+        raise ValueError("stage progress unit requires a value")
+    message_code = progress["message_code"]
+    if (
+        not isinstance(message_code, str)
+        or message_code not in _PROGRESS_MESSAGE_CODES
+    ):
+        raise ValueError("invalid stage progress message code")
+    return {
+        "current": current,
+        "total": total,
+        "unit": cast(ProgressUnit | None, unit),
+        "message_code": message_code,
+    }
+
+
+def validate_execution_evidence(
+    evidence: object,
+    *,
+    allowed_models: Iterable[str] = (),
+) -> ExecutionEvidence:
+    """Accept only bounded provider-neutral codes, never provider free text."""
+
+    if not isinstance(evidence, Mapping):
+        raise ValueError("invalid execution evidence")
+    unknown = set(evidence) - set(_EVIDENCE_KEYS)
+    if unknown or not evidence:
+        raise ValueError("invalid execution evidence fields")
+    safe_models = frozenset(
+        model
+        for model in allowed_models
+        if isinstance(model, str) and _MODEL_CODE.fullmatch(model) is not None
+    )
+    normalized: ExecutionEvidence = {}
+    for field in _EVIDENCE_KEYS:
+        if field not in evidence:
+            continue
+        value = evidence[field]
+        if not isinstance(value, str):
+            raise ValueError(f"invalid execution evidence {field}")
+        if field == "source_method" and value not in _SOURCE_METHODS:
+            raise ValueError("invalid execution evidence source method")
+        if field == "selected_track_id" and _TRACK_ID.fullmatch(value) is None:
+            raise ValueError("invalid execution evidence track id")
+        if field == "asr_route" and value not in _ASR_ROUTES:
+            raise ValueError("invalid execution evidence ASR route")
+        if field == "provider" and value not in _PROVIDER_IDS:
+            raise ValueError("invalid execution evidence provider")
+        if field == "model" and value not in safe_models:
+            raise ValueError("invalid execution evidence model")
+        if field == "fallback_reason" and value not in _FALLBACK_REASON_CODES:
+            raise ValueError("invalid execution evidence fallback reason")
+        normalized[field] = value
+    return normalized
+
+
+def validate_provider_status_code(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _PROVIDER_STATUS_CODES:
+        raise ValueError("invalid provider status code")
+    return value
 
 
 def aggregate_item_status(

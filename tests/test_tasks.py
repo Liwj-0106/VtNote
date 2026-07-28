@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from sqlalchemy import event
@@ -188,6 +189,130 @@ def test_cancel_queued_task_cancels_items_and_stages(tmp_path: Path) -> None:
         session.close()
 
 
+def test_cancel_already_user_canceled_task_returns_current_view(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        first = tasks.cancel_task(created.id)
+        repeated = tasks.cancel_task(created.id)
+
+        assert repeated == first
+        assert repeated.status == "canceled"
+        assert len(repeated.items[0].stage_runs) == len(created.items[0].stage_runs)
+        assert {run.status for run in repeated.items[0].stage_runs} == {"canceled"}
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_cancel_rejects_canceled_task_without_user_reason(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        task = session.get(TaskRecord, created.id)
+        assert task is not None
+        task.status = "canceled"
+        task.terminal_reason_code = None
+        session.commit()
+
+        with pytest.raises(InvalidTaskOperation, match="terminal"):
+            tasks.cancel_task(created.id)
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_cancel_does_not_overwrite_concurrently_completed_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    other_session = Session(session.bind)
+    task_loaded = Event()
+    allow_cancel = Event()
+    outcomes: list[tuple[str, str]] = []
+    cancel_thread: Thread | None = None
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        original_load = tasks._load_task
+
+        def pausing_load(task_id: str) -> TaskRecord:
+            task = original_load(task_id)
+            if not task_loaded.is_set():
+                task_loaded.set()
+                if not allow_cancel.wait(timeout=5):
+                    raise RuntimeError("test timed out waiting to resume cancellation")
+            return task
+
+        monkeypatch.setattr(tasks, "_load_task", pausing_load)
+
+        def cancel_in_thread() -> None:
+            try:
+                view = tasks.cancel_task(created.id)
+                outcomes.append(("returned", view.status))
+            except InvalidTaskOperation as error:
+                outcomes.append(("rejected", str(error)))
+            except Exception as error:  # pragma: no cover - surfaced by the assertion below
+                outcomes.append(("unexpected", repr(error)))
+
+        cancel_thread = Thread(target=cancel_in_thread)
+        cancel_thread.start()
+        assert task_loaded.wait(timeout=5)
+
+        completed = other_session.get(TaskRecord, created.id)
+        assert completed is not None
+        completed.status = "completed"
+        for item in completed.items:
+            item.status = "completed"
+            for stage in item.stage_runs:
+                stage.status = "completed"
+        other_session.commit()
+
+        allow_cancel.set()
+        cancel_thread.join(timeout=5)
+        assert not cancel_thread.is_alive()
+        assert outcomes == [("rejected", "terminal task cannot be canceled")]
+
+        session.expire_all()
+        stored = session.get(TaskRecord, created.id)
+        assert stored is not None
+        assert stored.status == "completed"
+        assert stored.terminal_reason_code is None
+    finally:
+        allow_cancel.set()
+        if cancel_thread is not None:
+            cancel_thread.join(timeout=5)
+        other_session.close()
+        session.bind.dispose()
+        session.close()
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "completed_with_warnings", "failed"])
+def test_cancel_rejects_non_cancel_terminal_tasks(
+    tmp_path: Path, terminal_status: str,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        task = session.get(TaskRecord, created.id)
+        assert task is not None
+        task.status = terminal_status
+        session.commit()
+
+        with pytest.raises(InvalidTaskOperation, match="terminal"):
+            tasks.cancel_task(created.id)
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
 def test_cancel_running_task_requests_cooperative_cancel(tmp_path: Path) -> None:
     tasks, _, session, _ = make_services(tmp_path)
     try:
@@ -232,6 +357,27 @@ def test_retry_is_stage_only_and_increments_attempt(tmp_path: Path) -> None:
 
         with pytest.raises(InvalidTaskOperation):
             tasks.retry_stage(item.id, "source")
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_after_user_cancel_clears_terminal_reason(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        canceled = tasks.cancel_task(created.id)
+        assert canceled.status == "canceled"
+
+        retried = tasks.retry_stage(canceled.items[0].id, "source")
+        assert retried.status == "queued"
+        session.expire_all()
+        stored = session.get(TaskRecord, created.id)
+        assert stored is not None
+        assert stored.status == "queued"
+        assert stored.terminal_reason_code is None
     finally:
         session.bind.dispose()
         session.close()
@@ -359,6 +505,170 @@ def test_stage_diagnostic_write_boundary_sanitizes_before_database_commit(
         assert stored_connection.credential_ref not in persisted
         assert stored.status == "failed"
         assert stored.error_code == "source_failed"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_stage_progress_and_execution_evidence_round_trip(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        stage_id = next(
+            run.id
+            for run in created.items[0].stage_runs
+            if run.stage == "transcribe"
+        )
+
+        progress_view = tasks.record_stage_progress(
+            stage_id,
+            {
+                "current": 3,
+                "total": 10,
+                "unit": "segments",
+                "message_code": "transcribing_segments",
+            },
+        )
+        evidence_view = tasks.record_stage_evidence(
+            stage_id,
+            {
+                "source_method": "local_asr",
+                "asr_route": "local",
+                "provider": "faster_whisper",
+                "model": "large-v3-turbo",
+            },
+            provider_status_code="waiting",
+        )
+
+        assert progress_view.progress == {
+            "current": 3,
+            "total": 10,
+            "unit": "segments",
+            "message_code": "transcribing_segments",
+        }
+        assert evidence_view.execution_evidence == {
+            "source_method": "local_asr",
+            "asr_route": "local",
+            "provider": "faster_whisper",
+            "model": "large-v3-turbo",
+        }
+        assert evidence_view.provider_status_code == "waiting"
+
+        session.expire_all()
+        stored = next(
+            run
+            for run in tasks.get_task(created.id).items[0].stage_runs
+            if run.stage == "transcribe"
+        )
+        assert stored.progress == progress_view.progress
+        assert stored.execution_evidence == evidence_view.execution_evidence
+        assert stored.provider_status_code == "waiting"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_stage_evidence_rejects_unbounded_or_sensitive_values(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        configuration.create_connection(
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example/v1",
+            parameters={},
+            secret="transcribing_segments",
+        )
+        configuration.create_connection(
+            name="Fallback",
+            protocol="openai_compatible",
+            base_url="http://127.0.0.1:8001/v1",
+            parameters={},
+            secret="cloud_rate_limited",
+        )
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        stage_id = next(
+            run.id
+            for run in created.items[0].stage_runs
+            if run.stage == "transcribe"
+        )
+
+        with pytest.raises(InvalidTaskOperation, match="sensitive"):
+            tasks.record_stage_progress(
+                stage_id,
+                {
+                    "current": 1,
+                    "total": 2,
+                    "unit": "items",
+                    "message_code": "transcribing_segments",
+                },
+            )
+        with pytest.raises(InvalidTaskOperation, match="sensitive"):
+            tasks.record_stage_evidence(
+                stage_id,
+                {
+                    "provider": "faster_whisper",
+                    "model": "large-v3-turbo",
+                    "fallback_reason": "cloud_rate_limited",
+                },
+                provider_status_code="waiting",
+            )
+        with pytest.raises(InvalidTaskOperation, match="provider status"):
+            tasks.record_stage_evidence(
+                stage_id,
+                {"provider": "tencent_recording_asr"},
+                provider_status_code="x" * 129,
+            )
+
+        session.expire_all()
+        stored = session.get(StageRunRecord, stage_id)
+        assert stored is not None
+        assert stored.progress_json is None
+        assert stored.execution_evidence_json is None
+        assert stored.provider_status_code is None
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_stage_view_fails_closed_for_invalid_persisted_runtime_fields(
+    tmp_path: Path,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        configuration.create_connection(
+            name="Local test",
+            protocol="openai_compatible",
+            base_url="http://127.0.0.1:8000/v1",
+            parameters={},
+            secret="transcribing_segments",
+        )
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+        stage_id = created.items[0].stage_runs[0].id
+        stored = session.get(StageRunRecord, stage_id)
+        assert stored is not None
+        stored.progress_json = {
+            "current": 1,
+            "total": 2,
+            "unit": "items",
+            "message_code": "transcribing_segments",
+        }
+        stored.execution_evidence_json = {
+            "provider_message": "raw provider response with sensitive-token"
+        }
+        stored.provider_status_code = "AKIDEXAMPLE1234567890"
+        session.commit()
+
+        public_stage = tasks.get_task(created.id).items[0].stage_runs[0]
+        assert public_stage.progress is None
+        assert public_stage.execution_evidence is None
+        assert public_stage.provider_status_code is None
+        assert "sensitive-token" not in public_stage.model_dump_json()
     finally:
         session.bind.dispose()
         session.close()
