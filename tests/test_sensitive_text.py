@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session
 
@@ -608,3 +608,206 @@ def test_malformed_envelopes_raise_bounded_safe_error(
         protector.unprotect("task:marker-test:notes_custom_prompt", malformed_envelope)
     assert str(raised.value) == "protected sensitive text is invalid"
     assert "LEAK-MARKER" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("template", "options", "snapshot_prompt", "expected_prompt"),
+    [
+        ("summary", {}, None, None),
+        ("key_points", {}, None, None),
+        (
+            "custom",
+            {"notes_custom_prompt": PROMPT},
+            None,
+            PROMPT,
+        ),
+        (
+            "custom",
+            {"notes_custom_prompt": PROMPT},
+            PROMPT,
+            PROMPT,
+        ),
+    ],
+)
+def test_legacy_null_prompt_placeholder_matrix(
+    tmp_path: Path,
+    template: str,
+    options: dict[str, Any],
+    snapshot_prompt: str | None,
+    expected_prompt: str | None,
+) -> None:
+    sensitive_text = _sensitive_types()
+    engine = initialize_database(tmp_path / "vtnote.db")
+    task_id = "55555555-5555-4555-8555-555555555555"
+    with Session(engine) as session:
+        session.add(
+            TaskRecord(
+                id=task_id,
+                options=options,
+                pipeline_snapshot_json={
+                    "schema_version": 1,
+                    "notes": {
+                        "template": template,
+                        "custom_prompt": snapshot_prompt,
+                    },
+                },
+            )
+        )
+        session.commit()
+
+    class CountingProtector(sensitive_text.MemorySensitiveTextProtector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.protect_calls = 0
+
+        def protect(self, purpose: str, plaintext: str) -> Any:
+            self.protect_calls += 1
+            return super().protect(purpose, plaintext)
+
+    protector = CountingProtector()
+    assert sensitive_text.migrate_sensitive_text(engine, protector) == "complete"
+    assert protector.protect_calls == (1 if expected_prompt is not None else 0)
+    with Session(engine) as session:
+        row = session.get(TaskRecord, task_id)
+        assert row is not None
+        assert "notes_custom_prompt" not in row.options
+        notes = row.pipeline_snapshot_json["notes"]
+        assert "custom_prompt" not in notes
+        if expected_prompt is None:
+            assert "custom_prompt_envelope" not in notes
+        else:
+            envelope = sensitive_text.validate_protected_text_envelope(
+                notes["custom_prompt_envelope"]
+            )
+            assert (
+                protector.unprotect(
+                    f"task:{task_id}:notes_custom_prompt", envelope
+                )
+                == expected_prompt
+            )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("option_prompt", "snapshot_prompt"),
+    [
+        ("option value", "conflicting snapshot value"),
+        (123, None),
+        (None, {"invalid": "object"}),
+    ],
+)
+def test_conflicting_or_invalid_non_null_legacy_prompts_roll_back(
+    tmp_path: Path,
+    option_prompt: Any,
+    snapshot_prompt: Any,
+) -> None:
+    sensitive_text = _sensitive_types()
+    engine = initialize_database(tmp_path / "vtnote.db")
+    task_id = "66666666-6666-4666-8666-666666666666"
+    options = {"notes_custom_prompt": option_prompt}
+    snapshot = {
+        "schema_version": 1,
+        "notes": {
+            "template": "custom",
+            "custom_prompt": snapshot_prompt,
+        },
+    }
+    with Session(engine) as session:
+        session.add(
+            TaskRecord(
+                id=task_id,
+                options=options,
+                pipeline_snapshot_json=snapshot,
+            )
+        )
+        session.commit()
+
+    assert (
+        sensitive_text.migrate_sensitive_text(
+            engine, sensitive_text.MemorySensitiveTextProtector()
+        )
+        == "sensitive_snapshot_migration_required"
+    )
+    with Session(engine) as session:
+        row = session.get(TaskRecord, task_id)
+        assert row is not None
+        assert row.options == options
+        assert row.pipeline_snapshot_json == snapshot
+    engine.dispose()
+
+
+def test_failed_migrator_does_not_publish_stale_required_after_peer_completes(
+    tmp_path: Path,
+) -> None:
+    sensitive_text = _sensitive_types()
+    database_path = tmp_path / "vtnote.db"
+    initial_engine = initialize_database(database_path)
+    with Session(initial_engine) as session:
+        session.add(
+            DefaultSettingsRecord(
+                id=1,
+                notes_template="custom",
+                notes_custom_prompt=PROMPT,
+            )
+        )
+        session.commit()
+    initial_engine.dispose()
+
+    def new_engine() -> Any:
+        return create_engine(
+            URL.create("sqlite+pysqlite", database=str(database_path)),
+            connect_args={"check_same_thread": False, "timeout": 5},
+        )
+
+    failing_engine = new_engine()
+    peer_engine = new_engine()
+    primary_rolled_back = Event()
+    allow_failure_publication = Event()
+    paused_once = Event()
+
+    def pause_after_primary_connection_returns(*_: Any) -> None:
+        if paused_once.is_set():
+            return
+        paused_once.set()
+        primary_rolled_back.set()
+        assert allow_failure_publication.wait(5)
+
+    event.listen(
+        failing_engine.pool,
+        "checkin",
+        pause_after_primary_connection_returns,
+    )
+
+    class FailingProtector(sensitive_text.MemorySensitiveTextProtector):
+        def protect(self, purpose: str, plaintext: str) -> Any:
+            raise sensitive_text.SensitiveTextProtectionError(
+                "safe injected failure"
+            )
+
+    failing_results: list[str] = []
+    failure = Thread(
+        target=lambda: failing_results.append(
+            sensitive_text.migrate_sensitive_text(
+                failing_engine, FailingProtector()
+            )
+        )
+    )
+    failure.start()
+    assert primary_rolled_back.wait(5)
+
+    peer_result = sensitive_text.migrate_sensitive_text(
+        peer_engine, sensitive_text.MemorySensitiveTextProtector()
+    )
+    assert peer_result == "complete"
+    allow_failure_publication.set()
+    failure.join(10)
+
+    assert not failure.is_alive()
+    assert failing_results == ["complete"]
+    with Session(peer_engine) as session:
+        assert sensitive_text.sensitive_text_migration_status(session) == "complete"
+        row = session.get(DefaultSettingsRecord, 1)
+        assert row is not None
+        assert row.notes_custom_prompt is None
+    failing_engine.dispose()
+    peer_engine.dispose()

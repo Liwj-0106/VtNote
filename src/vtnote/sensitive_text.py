@@ -30,6 +30,7 @@ DEFAULT_PROMPT_PURPOSE = "defaults:notes_custom_prompt"
 MIGRATION_COMPLETE = "complete"
 MIGRATION_REQUIRED = "sensitive_snapshot_migration_required"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
+_MISSING = object()
 
 
 class SensitiveTextProtectionError(RuntimeError):
@@ -301,36 +302,36 @@ def _protect_legacy_rows(
         snapshot = dict(row.pipeline_snapshot_json)
         notes_value = snapshot.get("notes")
         notes = dict(notes_value) if isinstance(notes_value, dict) else None
-        has_option_prompt = "notes_custom_prompt" in options
-        has_snapshot_prompt = (
-            notes is not None and "custom_prompt" in notes
+        option_prompt = options.get("notes_custom_prompt", _MISSING)
+        snapshot_prompt = (
+            notes.get("custom_prompt", _MISSING)
+            if notes is not None
+            else _MISSING
         )
-        if has_option_prompt or has_snapshot_prompt:
-            if notes is None or "custom_prompt_envelope" in notes:
-                raise SensitiveTextProtectionError(
-                    "legacy sensitive text migration failed"
-                )
-            option_prompt = options.get("notes_custom_prompt")
-            snapshot_prompt = notes.get("custom_prompt")
-            prompts = [
-                prompt
-                for present, prompt in (
-                    (has_option_prompt, option_prompt),
-                    (has_snapshot_prompt, snapshot_prompt),
-                )
-                if present
-            ]
+        prompt_values = [
+            value
+            for value in (option_prompt, snapshot_prompt)
+            if value is not _MISSING and value is not None
+        ]
+        if prompt_values:
             if (
-                not all(isinstance(prompt, str) for prompt in prompts)
-                or len(set(prompts)) != 1
+                notes is None
+                or "custom_prompt_envelope" in notes
+                or not all(
+                    isinstance(prompt, str) for prompt in prompt_values
+                )
+                or len(set(prompt_values)) != 1
             ):
                 raise SensitiveTextProtectionError(
                     "legacy sensitive text migration failed"
                 )
             notes["custom_prompt_envelope"] = protector.protect(
-                task_prompt_purpose(row.id), prompts[0]
+                task_prompt_purpose(row.id), prompt_values[0]
             ).model_dump(mode="json")
+            snapshot["notes"] = notes
+        if option_prompt is not _MISSING:
             options.pop("notes_custom_prompt", None)
+        if snapshot_prompt is not _MISSING and notes is not None:
             notes.pop("custom_prompt", None)
             snapshot["notes"] = notes
         row.options = options
@@ -344,11 +345,14 @@ def _legacy_plaintext_exists(session: Session) -> bool:
     ):
         return True
     for row in session.scalars(select(TaskRecord)).all():
-        if "notes_custom_prompt" in row.options:
+        if row.options.get("notes_custom_prompt") is not None:
             return True
         snapshot = row.pipeline_snapshot_json
         notes = snapshot.get("notes") if isinstance(snapshot, dict) else None
-        if isinstance(notes, dict) and "custom_prompt" in notes:
+        if (
+            isinstance(notes, dict)
+            and notes.get("custom_prompt") is not None
+        ):
             return True
     return False
 
