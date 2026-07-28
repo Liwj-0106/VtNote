@@ -9,7 +9,13 @@ import os
 import sys
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
@@ -35,13 +41,39 @@ class SensitiveTextMigrationRequired(RuntimeError):
 
 
 class ProtectedTextEnvelope(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+    )
 
     schema_version: Literal[1] = 1
     protection: Literal["windows_dpapi_current_user"] = (
         "windows_dpapi_current_user"
     )
     ciphertext_b64: str = Field(min_length=1)
+
+    @field_validator("ciphertext_b64")
+    @classmethod
+    def validate_ciphertext_b64(cls, value: str) -> str:
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError("invalid protected text encoding") from None
+        if not decoded:
+            raise ValueError("invalid protected text encoding")
+        return value
+
+
+def validate_protected_text_envelope(
+    value: object,
+) -> ProtectedTextEnvelope:
+    try:
+        return ProtectedTextEnvelope.model_validate(value)
+    except (ValidationError, TypeError, ValueError):
+        raise SensitiveTextProtectionError(
+            "protected sensitive text is invalid"
+        ) from None
 
 
 class SensitiveTextProtector(Protocol):
@@ -163,7 +195,7 @@ class WindowsDpapiSensitiveTextProtector:
     def unprotect(
         self, purpose: str, envelope: ProtectedTextEnvelope
     ) -> str:
-        validated = ProtectedTextEnvelope.model_validate(envelope)
+        validated = validate_protected_text_envelope(envelope)
         try:
             ciphertext = base64.b64decode(
                 validated.ciphertext_b64, validate=True
@@ -230,7 +262,7 @@ class MemorySensitiveTextProtector:
         self, purpose: str, envelope: ProtectedTextEnvelope
     ) -> str:
         _purpose_bytes(purpose)
-        validated = ProtectedTextEnvelope.model_validate(envelope)
+        validated = validate_protected_text_envelope(envelope)
         try:
             return self._values[(purpose, validated.ciphertext_b64)]
         except KeyError:
@@ -241,7 +273,7 @@ class MemorySensitiveTextProtector:
 
 def sensitive_text_migration_status(session: Session) -> str:
     row = session.get(SensitiveTextMigrationRecord, 1)
-    return row.status if row is not None else MIGRATION_COMPLETE
+    return row.status if row is not None else MIGRATION_REQUIRED
 
 
 def require_sensitive_text_migration(session: Session) -> None:
@@ -266,20 +298,59 @@ def _protect_legacy_rows(
     tasks = session.scalars(select(TaskRecord)).all()
     for row in tasks:
         options = dict(row.options)
-        option_prompt = options.pop("notes_custom_prompt", None)
         snapshot = dict(row.pipeline_snapshot_json)
         notes_value = snapshot.get("notes")
         notes = dict(notes_value) if isinstance(notes_value, dict) else None
-        if notes is not None:
-            snapshot_prompt = notes.pop("custom_prompt", None)
-            prompt = snapshot_prompt if isinstance(snapshot_prompt, str) else option_prompt
-            if prompt and notes.get("custom_prompt_envelope") is None:
-                notes["custom_prompt_envelope"] = protector.protect(
-                    task_prompt_purpose(row.id), prompt
-                ).model_dump(mode="json")
+        has_option_prompt = "notes_custom_prompt" in options
+        has_snapshot_prompt = (
+            notes is not None and "custom_prompt" in notes
+        )
+        if has_option_prompt or has_snapshot_prompt:
+            if notes is None or "custom_prompt_envelope" in notes:
+                raise SensitiveTextProtectionError(
+                    "legacy sensitive text migration failed"
+                )
+            option_prompt = options.get("notes_custom_prompt")
+            snapshot_prompt = notes.get("custom_prompt")
+            prompts = [
+                prompt
+                for present, prompt in (
+                    (has_option_prompt, option_prompt),
+                    (has_snapshot_prompt, snapshot_prompt),
+                )
+                if present
+            ]
+            if (
+                not all(isinstance(prompt, str) for prompt in prompts)
+                or len(set(prompts)) != 1
+            ):
+                raise SensitiveTextProtectionError(
+                    "legacy sensitive text migration failed"
+                )
+            notes["custom_prompt_envelope"] = protector.protect(
+                task_prompt_purpose(row.id), prompts[0]
+            ).model_dump(mode="json")
+            options.pop("notes_custom_prompt", None)
+            notes.pop("custom_prompt", None)
             snapshot["notes"] = notes
         row.options = options
         row.pipeline_snapshot_json = snapshot
+
+
+def _legacy_plaintext_exists(session: Session) -> bool:
+    if any(
+        row.notes_custom_prompt is not None
+        for row in session.scalars(select(DefaultSettingsRecord)).all()
+    ):
+        return True
+    for row in session.scalars(select(TaskRecord)).all():
+        if "notes_custom_prompt" in row.options:
+            return True
+        snapshot = row.pipeline_snapshot_json
+        notes = snapshot.get("notes") if isinstance(snapshot, dict) else None
+        if isinstance(notes, dict) and "custom_prompt" in notes:
+            return True
+    return False
 
 
 def migrate_sensitive_text(
@@ -289,8 +360,10 @@ def migrate_sensitive_text(
     """Atomically protect all legacy prompt rows and publish only safe state."""
 
     selected = protector or WindowsDpapiSensitiveTextProtector()
-    session = Session(engine)
+    connection = engine.connect()
+    session = Session(bind=connection)
     try:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
         _protect_legacy_rows(session, selected)
         state = session.get(SensitiveTextMigrationRecord, 1)
         if state is None:
@@ -298,20 +371,37 @@ def migrate_sensitive_text(
             session.add(state)
         else:
             state.status = MIGRATION_COMPLETE
-        session.commit()
+        session.flush()
+        connection.commit()
         return MIGRATION_COMPLETE
     except Exception:
-        session.rollback()
+        connection.rollback()
     finally:
         session.close()
+        connection.close()
 
-    with Session(engine) as failure_session:
+    failure_connection = engine.connect()
+    failure_session = Session(bind=failure_connection)
+    try:
+        failure_connection.exec_driver_sql("BEGIN IMMEDIATE")
+        status = (
+            MIGRATION_REQUIRED
+            if _legacy_plaintext_exists(failure_session)
+            else MIGRATION_COMPLETE
+        )
         state = failure_session.get(SensitiveTextMigrationRecord, 1)
         if state is None:
             failure_session.add(
-                SensitiveTextMigrationRecord(id=1, status=MIGRATION_REQUIRED)
+                SensitiveTextMigrationRecord(id=1, status=status)
             )
         else:
-            state.status = MIGRATION_REQUIRED
-        failure_session.commit()
-    return MIGRATION_REQUIRED
+            state.status = status
+        failure_session.flush()
+        failure_connection.commit()
+        return status
+    except Exception:
+        failure_connection.rollback()
+        raise
+    finally:
+        failure_session.close()
+        failure_connection.close()

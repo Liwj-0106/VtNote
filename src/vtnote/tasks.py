@@ -36,9 +36,9 @@ from vtnote.pipeline import (
 )
 from vtnote.url_security import SourceUrlPolicy
 from vtnote.sensitive_text import (
-    ProtectedTextEnvelope,
     require_sensitive_text_migration,
     task_prompt_purpose,
+    validate_protected_text_envelope,
 )
 
 
@@ -762,7 +762,7 @@ class TaskService:
         raw_envelope = notes.get("custom_prompt_envelope")
         if raw_envelope is None:
             return None
-        envelope = ProtectedTextEnvelope.model_validate(raw_envelope)
+        envelope = validate_protected_text_envelope(raw_envelope)
         return self.configuration.sensitive_text_protector.unprotect(
             task_prompt_purpose(item.task_id), envelope
         )

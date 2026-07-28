@@ -27,10 +27,10 @@ from vtnote.secrets import SecretStore
 from vtnote.paths import StoragePaths
 from vtnote.sensitive_text import (
     DEFAULT_PROMPT_PURPOSE,
-    ProtectedTextEnvelope,
     SensitiveTextProtector,
     WindowsDpapiSensitiveTextProtector,
     require_sensitive_text_migration,
+    validate_protected_text_envelope,
 )
 
 
@@ -875,7 +875,7 @@ class ConfigurationService:
         row = self._defaults_row()
         if row.notes_custom_prompt_envelope_json is None:
             return None
-        envelope = ProtectedTextEnvelope.model_validate(
+        envelope = validate_protected_text_envelope(
             row.notes_custom_prompt_envelope_json
         )
         return self.sensitive_text_protector.unprotect(

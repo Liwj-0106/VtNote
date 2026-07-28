@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session
 
 from vtnote.api import create_app
@@ -393,3 +396,215 @@ def test_prompt_never_enters_log_error_export_url_or_browser_storage(
         assert PROMPT not in caplog.text
     finally:
         engine.dispose()
+
+
+def test_concurrent_startups_serialize_migration_and_second_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    sensitive_text = _sensitive_types()
+    paths = _paths(tmp_path)
+    initial_engine = initialize_database(paths.database)
+    with Session(initial_engine) as session:
+        session.add(
+            DefaultSettingsRecord(
+                id=1,
+                notes_template="custom",
+                notes_custom_prompt=PROMPT,
+            )
+        )
+        session.commit()
+    initial_engine.dispose()
+
+    class BlockingProtector(sensitive_text.MemorySensitiveTextProtector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = Lock()
+            self.calls = 0
+            self.first_entered = Event()
+            self.second_entered = Event()
+            self.release_first = Event()
+
+        def protect(self, purpose: str, plaintext: str) -> Any:
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+            if call == 1:
+                self.first_entered.set()
+                assert self.release_first.wait(5)
+            else:
+                self.second_entered.set()
+            return super().protect(purpose, plaintext)
+
+    protector = BlockingProtector()
+
+    def new_engine() -> Any:
+        return create_engine(
+            URL.create("sqlite+pysqlite", database=str(paths.database)),
+            connect_args={"check_same_thread": False, "timeout": 5},
+        )
+
+    engines = [new_engine(), new_engine()]
+    errors: list[BaseException] = []
+
+    def start_with_engine(engine: Any) -> None:
+        try:
+            create_app(
+                settings=Settings(
+                    data_root=paths.data_root,
+                    runtime_cache_root=paths.runtime_cache_root,
+                ),
+                engine=engine,
+                secret_store=MemorySecretStore(),
+                sensitive_text_protector=protector,
+                resolver=PublicResolver(),
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    first = Thread(target=start_with_engine, args=(engines[0],))
+    second = Thread(target=start_with_engine, args=(engines[1],))
+    first.start()
+    assert protector.first_entered.wait(5)
+    second.start()
+    overlapped = protector.second_entered.wait(1)
+    protector.release_first.set()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert overlapped is False
+    assert protector.calls == 1
+
+    third_engine = new_engine()
+    sensitive_text.migrate_sensitive_text(third_engine, protector)
+    assert protector.calls == 1
+    with Session(third_engine) as session:
+        assert sensitive_text.sensitive_text_migration_status(session) == "complete"
+        row = session.get(DefaultSettingsRecord, 1)
+        assert row is not None
+        assert row.notes_custom_prompt is None
+    for engine in [*engines, third_engine]:
+        engine.dispose()
+
+
+def test_missing_sensitive_text_migration_state_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    sensitive_text = _sensitive_types()
+    engine = initialize_database(tmp_path / "vtnote.db")
+    with Session(engine) as session:
+        state = session.get(sensitive_text.SensitiveTextMigrationRecord, 1)
+        assert state is not None
+        session.delete(state)
+        session.commit()
+
+        assert (
+            sensitive_text.sensitive_text_migration_status(session)
+            == "sensitive_snapshot_migration_required"
+        )
+        with pytest.raises(
+            sensitive_text.SensitiveTextMigrationRequired,
+            match="sensitive_snapshot_migration_required",
+        ):
+            sensitive_text.require_sensitive_text_migration(session)
+    engine.dispose()
+
+
+def test_options_only_prompt_with_missing_notes_rolls_back_without_loss(
+    tmp_path: Path,
+) -> None:
+    sensitive_text = _sensitive_types()
+    engine = initialize_database(tmp_path / "vtnote.db")
+    task_id = "33333333-3333-4333-8333-333333333333"
+    with Session(engine) as session:
+        session.add(
+            TaskRecord(
+                id=task_id,
+                options={"notes_custom_prompt": PROMPT},
+                pipeline_snapshot_json={"schema_version": 1},
+            )
+        )
+        session.commit()
+
+    result = sensitive_text.migrate_sensitive_text(
+        engine, sensitive_text.MemorySensitiveTextProtector()
+    )
+    assert result == "sensitive_snapshot_migration_required"
+    with Session(engine) as session:
+        row = session.get(TaskRecord, task_id)
+        assert row is not None
+        assert row.options["notes_custom_prompt"] == PROMPT
+        assert row.pipeline_snapshot_json == {"schema_version": 1}
+    engine.dispose()
+
+
+@pytest.mark.parametrize("malformed_notes", [None, "not-a-notes-object", []])
+def test_options_prompt_with_malformed_notes_rolls_back_without_loss(
+    tmp_path: Path, malformed_notes: Any,
+) -> None:
+    sensitive_text = _sensitive_types()
+    engine = initialize_database(tmp_path / "vtnote.db")
+    task_id = "44444444-4444-4444-8444-444444444444"
+    snapshot = {"schema_version": 1, "notes": malformed_notes}
+    with Session(engine) as session:
+        session.add(
+            TaskRecord(
+                id=task_id,
+                options={"notes_custom_prompt": PROMPT},
+                pipeline_snapshot_json=snapshot,
+            )
+        )
+        session.commit()
+
+    result = sensitive_text.migrate_sensitive_text(
+        engine, sensitive_text.MemorySensitiveTextProtector()
+    )
+    assert result == "sensitive_snapshot_migration_required"
+    with Session(engine) as session:
+        row = session.get(TaskRecord, task_id)
+        assert row is not None
+        assert row.options["notes_custom_prompt"] == PROMPT
+        assert row.pipeline_snapshot_json == snapshot
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "protector_factory",
+    [
+        lambda sensitive_text: sensitive_text.MemorySensitiveTextProtector(),
+        lambda sensitive_text: sensitive_text.WindowsDpapiSensitiveTextProtector(),
+    ],
+)
+@pytest.mark.parametrize(
+    "malformed_envelope",
+    [
+        {
+            "schema_version": 2,
+            "protection": "windows_dpapi_current_user",
+            "ciphertext_b64": "LEAK-MARKER-wrong-version",
+        },
+        {
+            "schema_version": 1,
+            "protection": "windows_dpapi_current_user",
+            "ciphertext_b64": "LEAK-MARKER-invalid-base64!",
+        },
+        {
+            "schema_version": 1,
+            "protection": "windows_dpapi_current_user",
+            "ciphertext_b64": "QUJDRA==",
+            "LEAK-MARKER-extra-field": True,
+        },
+    ],
+)
+def test_malformed_envelopes_raise_bounded_safe_error(
+    protector_factory: Any,
+    malformed_envelope: dict[str, Any],
+) -> None:
+    sensitive_text = _sensitive_types()
+    protector = protector_factory(sensitive_text)
+    with pytest.raises(sensitive_text.SensitiveTextProtectionError) as raised:
+        protector.unprotect("task:marker-test:notes_custom_prompt", malformed_envelope)
+    assert str(raised.value) == "protected sensitive text is invalid"
+    assert "LEAK-MARKER" not in str(raised.value)
