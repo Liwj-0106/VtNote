@@ -35,6 +35,7 @@ _ADDITIVE_COLUMNS = {
         "progress_json": "JSON",
         "execution_evidence_json": "JSON",
         "provider_status_code": "VARCHAR(128)",
+        "retry_override_json": "JSON",
         "recovered_count": "INTEGER NOT NULL DEFAULT 0",
     },
     "default_settings": {

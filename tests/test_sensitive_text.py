@@ -207,7 +207,12 @@ def test_retry_decrypts_the_same_immutable_prompt(tmp_path: Path) -> None:
                 run.status = "failed"
         session.commit()
 
-        retried = tasks.retry_stage(item.id, "notes")
+        retried = tasks.retry_stage(
+            item.id,
+            "notes",
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
         assert [run.attempt for run in retried.stage_runs if run.stage == "notes"] == [
             1,
             2,

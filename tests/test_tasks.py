@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 
 import pytest
 from sqlalchemy import event
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from vtnote.artifacts import write_transcript_json, write_translation_json
@@ -356,13 +357,23 @@ def test_retry_is_stage_only_and_increments_attempt(tmp_path: Path) -> None:
         next(run for run in item_row.stage_runs if run.stage == "source").status = "completed"
         next(run for run in item_row.stage_runs if run.stage == "transcribe").status = "failed"
         session.commit()
-        retried = tasks.retry_stage(item.id, "transcribe")
+        retried = tasks.retry_stage(
+            item.id,
+            "transcribe",
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
         attempts = [run for run in retried.stage_runs if run.stage == "transcribe"]
         assert [(run.attempt, run.status) for run in attempts] == [(1, "failed"), (2, "queued")]
         assert all(run.attempt == 1 for run in retried.stage_runs if run.stage != "transcribe")
 
         with pytest.raises(InvalidTaskOperation):
-            tasks.retry_stage(item.id, "source")
+            tasks.retry_stage(
+                item.id,
+                "source",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
     finally:
         session.bind.dispose()
         session.close()
@@ -377,7 +388,12 @@ def test_retry_after_user_cancel_clears_terminal_reason(tmp_path: Path) -> None:
         canceled = tasks.cancel_task(created.id)
         assert canceled.status == "canceled"
 
-        retried = tasks.retry_stage(canceled.items[0].id, "source")
+        retried = tasks.retry_stage(
+            canceled.items[0].id,
+            "source",
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
         assert retried.status == "queued"
         session.expire_all()
         stored = session.get(TaskRecord, created.id)
@@ -403,12 +419,22 @@ def test_retry_rejects_active_work_and_incomplete_prerequisites(tmp_path: Path) 
         transcribe.status = "failed"
         session.commit()
         with pytest.raises(InvalidTaskOperation, match="prerequisite"):
-            tasks.retry_stage(item.id, "transcribe")
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
 
         source.status = "running"
         session.commit()
         with pytest.raises(InvalidTaskOperation, match="active"):
-            tasks.retry_stage(item.id, "transcribe")
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
     finally:
         session.bind.dispose()
         session.close()
@@ -431,7 +457,396 @@ def test_retry_maps_duplicate_attempt_race_to_invalid_operation(tmp_path: Path) 
 
         event.listen(session, "before_commit", conflict, once=True)
         with pytest.raises(InvalidTaskOperation, match="conflicted"):
-            tasks.retry_stage(item.id, "transcribe")
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_maps_sqlite_busy_race_to_refresh_conflict(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+
+        def locked(_: Session) -> None:
+            raise OperationalError(
+                "insert retry",
+                {},
+                sqlite3.OperationalError("database is locked"),
+            )
+
+        event.listen(session, "before_commit", locked, once=True)
+        with pytest.raises(InvalidTaskOperation, match="conflicted"):
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_real_two_session_cas_creates_only_one_attempt(
+    tmp_path: Path,
+) -> None:
+    tasks, _, first_session, paths = make_services(tmp_path)
+    engine = first_session.bind
+    assert engine is not None
+    second_session = Session(engine)
+    second_configuration = ConfigurationService(
+        second_session, MemorySecretStore(), paths=paths
+    )
+    second_tasks = TaskService(
+        second_session,
+        second_configuration,
+        paths,
+        SourceUrlPolicy(PublicResolver()),
+    )
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, first_session)
+        barrier = Barrier(2)
+        event.listen(
+            first_session,
+            "before_flush",
+            lambda *_: barrier.wait(timeout=5),
+            once=True,
+        )
+        event.listen(
+            second_session,
+            "before_flush",
+            lambda *_: barrier.wait(timeout=5),
+            once=True,
+        )
+        outcomes: list[str] = []
+        unexpected: list[BaseException] = []
+
+        def retry(service: TaskService) -> None:
+            try:
+                service.retry_stage(
+                    item.id,
+                    "transcribe",
+                    expected_attempt=1,
+                    override={"schema_version": 1, "strategy": "same"},
+                )
+            except InvalidTaskOperation as error:
+                assert "refresh" in str(error)
+                outcomes.append("conflict")
+            except BaseException as error:
+                unexpected.append(error)
+            else:
+                outcomes.append("created")
+
+        threads = [Thread(target=retry, args=(service,)) for service in (tasks, second_tasks)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert unexpected == []
+        assert sorted(outcomes) == ["conflict", "created"]
+        first_session.expire_all()
+        stored = first_session.get(ItemRecord, item.id)
+        assert stored is not None
+        assert [
+            run.attempt for run in stored.stage_runs if run.stage == "transcribe"
+        ] == [1, 2]
+    finally:
+        second_session.close()
+        first_session.close()
+        engine.dispose()
+
+
+def _prepare_failed_transcribe(
+    tasks: TaskService,
+    session: Session,
+    *,
+    unknown: bool = False,
+) -> tuple[TaskRecord, ItemRecord, StageRunRecord]:
+    created = tasks.create_task(
+        sources=[{"kind": "url", "locator": "https://youtu.be/retry"}]
+    )
+    task = session.get(TaskRecord, created.id)
+    assert task is not None
+    item = task.items[0]
+    source = next(run for run in item.stage_runs if run.stage == "source")
+    transcribe = next(run for run in item.stage_runs if run.stage == "transcribe")
+    source.status = "completed"
+    transcribe.status = "failed"
+    if unknown:
+        transcribe.external_submission_state = "submission_unknown"
+    session.commit()
+    return task, item, transcribe
+
+
+def test_retry_rejects_stale_expected_attempt(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+
+        with pytest.raises(InvalidTaskOperation, match="refresh"):
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=2,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+
+        session.expire_all()
+        stored = session.get(ItemRecord, item.id)
+        assert stored is not None
+        assert [
+            run.attempt for run in stored.stage_runs if run.stage == "transcribe"
+        ] == [1]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_unknown_cloud_rejects_same_retry(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, unknown = _prepare_failed_transcribe(
+            tasks, session, unknown=True
+        )
+
+        with pytest.raises(InvalidTaskOperation, match="submission_unknown"):
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+
+        session.refresh(unknown)
+        assert unknown.status == "failed"
+        assert unknown.external_submission_state == "submission_unknown"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_unknown_cloud_local_retry_snapshots_local_override(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        task, item, unknown = _prepare_failed_transcribe(
+            tasks, session, unknown=True
+        )
+        original_snapshot = json.loads(json.dumps(task.pipeline_snapshot_json))
+        override = tasks.build_retry_override(strategy="local")
+
+        retried = tasks.retry_stage(
+            item.id,
+            "transcribe",
+            expected_attempt=1,
+            override=override,
+        )
+
+        session.expire_all()
+        stored = session.get(ItemRecord, item.id)
+        assert stored is not None
+        attempts = [
+            run for run in stored.stage_runs if run.stage == "transcribe"
+        ]
+        assert attempts[0].id == unknown.id
+        assert attempts[0].external_submission_state == "submission_unknown"
+        assert attempts[1].retry_override_json == {
+            "schema_version": 1,
+            "strategy": "local",
+            "asr": {"mode": "local", "profile": None},
+        }
+        assert stored.task.pipeline_snapshot_json == original_snapshot
+        assert "retry_override" not in retried.stage_runs[-1].model_dump()
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_unknown_cloud_requires_charge_ack_for_cloud_retry(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        cloud_id, _, _ = configure_profiles(configuration)
+        _, item, _ = _prepare_failed_transcribe(tasks, session, unknown=True)
+        profile = configuration.snapshot_profile(cloud_id)
+
+        with pytest.raises(InvalidTaskOperation, match="possible charge"):
+            tasks.build_retry_override(
+                strategy="cloud_confirmed",
+                cloud_profile_id=cloud_id,
+                connection_revision=profile["connection_revision"],
+                profile_revision=profile["profile_revision"],
+                acknowledge_possible_charge=False,
+            )
+
+        confirmed = tasks.build_retry_override(
+            strategy="cloud_confirmed",
+            cloud_profile_id=cloud_id,
+            connection_revision=profile["connection_revision"],
+            profile_revision=profile["profile_revision"],
+            acknowledge_possible_charge=True,
+        )
+        with pytest.raises(InvalidTaskOperation, match="possible charge"):
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override=confirmed,
+            )
+
+        assert [
+            run.attempt for run in item.stage_runs if run.stage == "transcribe"
+        ] == [1]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_cloud_confirmed_requires_current_tested_authorized_revisions(
+    tmp_path: Path,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        cloud_id, _, _ = configure_profiles(configuration)
+        _, item, _ = _prepare_failed_transcribe(tasks, session, unknown=True)
+        original = configuration.snapshot_profile(cloud_id)
+
+        with pytest.raises(InvalidTaskOperation, match="revision"):
+            tasks.build_retry_override(
+                strategy="cloud_confirmed",
+                cloud_profile_id=cloud_id,
+                connection_revision=original["connection_revision"] + 1,
+                profile_revision=original["profile_revision"],
+                acknowledge_possible_charge=True,
+            )
+        with pytest.raises(InvalidTaskOperation, match="revision"):
+            tasks.build_retry_override(
+                strategy="cloud_confirmed",
+                cloud_profile_id=cloud_id,
+                connection_revision=original["connection_revision"],
+                profile_revision=original["profile_revision"] + 1,
+                acknowledge_possible_charge=True,
+            )
+
+        configuration.update_profile(cloud_id, model="retry-model")
+        changed = configuration.snapshot_profile(cloud_id)
+        with pytest.raises(InvalidTaskOperation, match="successful test"):
+            tasks.build_retry_override(
+                strategy="cloud_confirmed",
+                cloud_profile_id=cloud_id,
+                connection_revision=changed["connection_revision"],
+                profile_revision=changed["profile_revision"],
+                acknowledge_possible_charge=True,
+            )
+
+        configuration.record_profile_test(cloud_id, ok=True, message="ok")
+        with pytest.raises(InvalidTaskOperation, match="upload authorization"):
+            tasks.build_retry_override(
+                strategy="cloud_confirmed",
+                cloud_profile_id=cloud_id,
+                connection_revision=changed["connection_revision"],
+                profile_revision=changed["profile_revision"],
+                acknowledge_possible_charge=True,
+            )
+
+        configuration.authorize_cloud_upload(cloud_id)
+        override = tasks.build_retry_override(
+            strategy="cloud_confirmed",
+            cloud_profile_id=cloud_id,
+            connection_revision=changed["connection_revision"],
+            profile_revision=changed["profile_revision"],
+            acknowledge_possible_charge=True,
+        )
+        retried = tasks.retry_stage(
+            item.id,
+            "transcribe",
+            expected_attempt=1,
+            override=override,
+            acknowledge_possible_charge=True,
+        )
+        new_attempt = next(
+            run for run in retried.stage_runs
+            if run.stage == "transcribe" and run.attempt == 2
+        )
+        evidence = tasks.record_stage_evidence(
+            new_attempt.id, {"model": "retry-model"}
+        )
+        assert evidence.execution_evidence == {"model": "retry-model"}
+        stored_item = session.get(ItemRecord, item.id)
+        assert stored_item is not None
+        for stale_model in (
+            original["model"],
+            stored_item.task.pipeline_snapshot_json["local_whisper"]["model"],
+        ):
+            assert stale_model != "retry-model"
+            with pytest.raises(InvalidTaskOperation, match="model"):
+                tasks.record_stage_evidence(
+                    new_attempt.id, {"model": stale_model}
+                )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_override_never_reads_current_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        original_cloud_id, _, _ = configure_profiles(configuration)
+        task, item, _ = _prepare_failed_transcribe(tasks, session, unknown=True)
+        connection_id = configuration.get_profile(original_cloud_id).connection_id
+        selected = configuration.create_profile(
+            name="Explicit retry profile",
+            purpose="cloud_asr",
+            connection_id=connection_id,
+            model="explicit-retry-model",
+        )
+        configuration.record_profile_test(selected.id, ok=True, message="ok")
+        configuration.authorize_cloud_upload(selected.id)
+        configuration.update_defaults(cloud_asr_profile_id=original_cloud_id)
+        selected_snapshot = configuration.snapshot_profile(selected.id)
+        original_task_snapshot = json.loads(
+            json.dumps(task.pipeline_snapshot_json)
+        )
+
+        def fail_if_defaults_are_read():
+            raise AssertionError("retry must not read current defaults")
+
+        monkeypatch.setattr(configuration, "get_defaults", fail_if_defaults_are_read)
+        override = tasks.build_retry_override(
+            strategy="cloud_confirmed",
+            cloud_profile_id=selected.id,
+            connection_revision=selected_snapshot["connection_revision"],
+            profile_revision=selected_snapshot["profile_revision"],
+            acknowledge_possible_charge=True,
+        )
+        tasks.retry_stage(
+            item.id,
+            "transcribe",
+            expected_attempt=1,
+            override=override,
+            acknowledge_possible_charge=True,
+        )
+
+        session.expire_all()
+        stored = session.get(ItemRecord, item.id)
+        assert stored is not None
+        retry = max(
+            (run for run in stored.stage_runs if run.stage == "transcribe"),
+            key=lambda run: run.attempt,
+        )
+        assert retry.retry_override_json["asr"]["profile"]["id"] == selected.id
+        assert retry.retry_override_json["asr"]["profile"]["model"] == (
+            "explicit-retry-model"
+        )
+        assert stored.task.pipeline_snapshot_json == original_task_snapshot
     finally:
         session.bind.dispose()
         session.close()
@@ -718,7 +1133,12 @@ def test_notes_retry_depends_on_transcription_not_translation(
             run.status = statuses[run.stage]
         session.commit()
 
-        retried = tasks.retry_stage(item.id, "notes")
+        retried = tasks.retry_stage(
+            item.id,
+            "notes",
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
         attempts = [run for run in retried.stage_runs if run.stage == "notes"]
         assert [(run.attempt, run.status) for run in attempts] == [
             (1, "failed"), (2, "queued")
@@ -780,7 +1200,12 @@ def test_translate_and_notes_retry_in_parallel_without_downgrading_running_state
         task_row.status = "running"
         session.commit()
 
-        retried = tasks.retry_stage(item.id, retry_stage)
+        retried = tasks.retry_stage(
+            item.id,
+            retry_stage,
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
         assert retried.status == "running"
         assert [
             (run.attempt, run.status)
@@ -844,7 +1269,12 @@ def test_upstream_retry_conflicts_with_active_dependent_stage(
         session.commit()
 
         with pytest.raises(InvalidTaskOperation, match="active"):
-            tasks.retry_stage(item.id, retry_stage)
+            tasks.retry_stage(
+                item.id,
+                retry_stage,
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
     finally:
         session.close()
         session.bind.dispose()
@@ -881,7 +1311,12 @@ def test_same_stage_active_attempt_blocks_duplicate_retry(tmp_path: Path) -> Non
         session.commit()
 
         with pytest.raises(InvalidTaskOperation, match="active"):
-            tasks.retry_stage(item.id, "notes")
+            tasks.retry_stage(
+                item.id,
+                "notes",
+                expected_attempt=2,
+                override={"schema_version": 1, "strategy": "same"},
+            )
     finally:
         session.close()
         session.bind.dispose()

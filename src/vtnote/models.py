@@ -138,6 +138,9 @@ class StageRunRecord(Base):
         MutableDict.as_mutable(JSON)
     )
     provider_status_code: Mapped[str | None] = mapped_column(String(128))
+    retry_override_json: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
     recovered_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )

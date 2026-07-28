@@ -6,13 +6,14 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from vtnote.api import ConnectivityResult, ProbeResult, create_app
 from vtnote.artifacts import write_transcript_json
 from vtnote.config import Settings
 from vtnote.database import initialize_database
-from vtnote.models import ItemRecord
+from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
 from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
 from vtnote.secrets import MemorySecretStore
@@ -509,7 +510,11 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
             session.commit()
         retried = client.post(
             f"/api/tasks/{task['id']}/retry", headers=headers,
-            json={"item_id": item_id, "stage": "transcribe"},
+            json={
+                "item_id": item_id,
+                "stage": "transcribe",
+                "expected_attempt": 1,
+            },
         )
         assert retried.status_code == 201
         assert client.post(
@@ -525,7 +530,11 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
         task_retry = client.post(
             f"/api/tasks/{task['id']}/retry",
             headers=headers,
-            json={"item_id": item_id, "stage": "transcribe"},
+            json={
+                "item_id": item_id,
+                "stage": "transcribe",
+                "expected_attempt": 2,
+            },
         )
         assert task_retry.status_code == 201
 
@@ -542,6 +551,210 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
 
         canceled = client.post(f"/api/tasks/{task['id']}/cancel", headers=headers)
         assert canceled.status_code == 200
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"item_id": "item", "stage": "transcribe"},
+        {"item_id": "item", "stage": "transcribe", "expected_attempt": 0},
+        {"item_id": "item", "stage": "transcribe", "expected_attempt": True},
+        {
+            "item_id": "item",
+            "stage": "transcribe",
+            "expected_attempt": 1,
+            "strategy": "same",
+            "acknowledge_possible_charge": True,
+        },
+        {
+            "item_id": "item",
+            "stage": "transcribe",
+            "expected_attempt": 1,
+            "strategy": "local",
+            "cloud_profile_id": "profile",
+        },
+        {
+            "item_id": "item",
+            "stage": "transcribe",
+            "expected_attempt": 1,
+            "strategy": "cloud_confirmed",
+        },
+        {
+            "item_id": "item",
+            "stage": "transcribe",
+            "expected_attempt": 1,
+            "strategy": "cloud_confirmed",
+            "cloud_profile_id": "profile",
+            "connection_revision": 1,
+            "profile_revision": 1,
+            "acknowledge_possible_charge": False,
+        },
+    ],
+)
+def test_retry_api_validates_attempt_strategy_and_charge_fields(
+    tmp_path: Path, payload: dict[str, object],
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.post(
+            "/api/tasks/11111111-1111-4111-8111-111111111111/retry",
+            headers=csrf(client),
+            json=payload,
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_error"
+    finally:
+        engine.dispose()
+
+
+def test_retry_api_accepts_explicit_local_and_cloud_confirmed_success(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        local_task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={"sources": [{"kind": "url", "locator": "https://youtu.be/local"}]},
+        ).json()
+        local_item_id = local_task["items"][0]["id"]
+        with Session(engine) as session:
+            item = session.get(ItemRecord, local_item_id)
+            assert item is not None
+            next(run for run in item.stage_runs if run.stage == "source").status = (
+                "completed"
+            )
+            transcribe = next(
+                run for run in item.stage_runs if run.stage == "transcribe"
+            )
+            transcribe.status = "failed"
+            transcribe.external_submission_state = "submission_unknown"
+            session.commit()
+
+        local_retry = client.post(
+            f"/api/tasks/{local_task['id']}/retry",
+            headers=headers,
+            json={
+                "item_id": local_item_id,
+                "stage": "transcribe",
+                "expected_attempt": 1,
+                "strategy": "local",
+            },
+        )
+        assert local_retry.status_code == 201
+        assert all(
+            "retry_override" not in stage
+            for stage in local_retry.json()["stage_runs"]
+        )
+        with Session(engine) as session:
+            local_attempt = session.scalar(
+                select(StageRunRecord).where(
+                    StageRunRecord.item_id == local_item_id,
+                    StageRunRecord.stage == "transcribe",
+                    StageRunRecord.attempt == 2,
+                )
+            )
+            assert local_attempt is not None
+            assert local_attempt.retry_override_json == {
+                "schema_version": 1,
+                "strategy": "local",
+                "asr": {"mode": "local", "profile": None},
+            }
+
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Retry cloud",
+                "protocol": "volc_bigasr_flash",
+                "base_url": "https://openspeech.bytedance.com",
+                "parameters": {},
+                "secret": "retry-secret",
+            },
+        ).json()
+        profile = client.post(
+            "/api/profiles",
+            headers=headers,
+            json={
+                "name": "Explicit cloud retry",
+                "purpose": "cloud_asr",
+                "connection_id": connection["id"],
+                "model": "retry-cloud-model",
+            },
+        ).json()
+        with Session(engine) as session:
+            row = session.get(ProcessorProfileRecord, profile["id"])
+            assert row is not None
+            row.test_ok = True
+            row.tested_revision = row.revision
+            row.tested_connection_revision = row.connection.revision
+            row.upload_authorized_revision = row.revision
+            row.upload_authorized_connection_revision = row.connection.revision
+            session.commit()
+            profile_revision = row.revision
+            connection_revision = row.connection.revision
+
+        cloud_task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/cloud"}
+                ],
+                "asr_mode": "local",
+            },
+        ).json()
+        cloud_item_id = cloud_task["items"][0]["id"]
+        with Session(engine) as session:
+            item = session.get(ItemRecord, cloud_item_id)
+            assert item is not None
+            next(run for run in item.stage_runs if run.stage == "source").status = (
+                "completed"
+            )
+            transcribe = next(
+                run for run in item.stage_runs if run.stage == "transcribe"
+            )
+            transcribe.status = "failed"
+            transcribe.external_submission_state = "submission_unknown"
+            session.commit()
+
+        cloud_retry = client.post(
+            f"/api/tasks/{cloud_task['id']}/retry",
+            headers=headers,
+            json={
+                "item_id": cloud_item_id,
+                "stage": "transcribe",
+                "expected_attempt": 1,
+                "strategy": "cloud_confirmed",
+                "cloud_profile_id": profile["id"],
+                "connection_revision": connection_revision,
+                "profile_revision": profile_revision,
+                "acknowledge_possible_charge": True,
+            },
+        )
+        assert cloud_retry.status_code == 201
+        with Session(engine) as session:
+            cloud_attempt = session.scalar(
+                select(StageRunRecord).where(
+                    StageRunRecord.item_id == cloud_item_id,
+                    StageRunRecord.stage == "transcribe",
+                    StageRunRecord.attempt == 2,
+                )
+            )
+            assert cloud_attempt is not None
+            assert cloud_attempt.retry_override_json["strategy"] == (
+                "cloud_confirmed"
+            )
+            assert cloud_attempt.retry_override_json["asr"]["profile"]["id"] == (
+                profile["id"]
+            )
+            assert (
+                "acknowledge_possible_charge"
+                not in cloud_attempt.retry_override_json
+            )
     finally:
         engine.dispose()
 

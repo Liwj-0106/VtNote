@@ -317,6 +317,21 @@ class ConfigurationService:
                     profile_ids.add(profile_id)
                 if isinstance(connection_id, str):
                     connection_ids.add(connection_id)
+            for item in task.items:
+                for run in item.stage_runs:
+                    override = run.retry_override_json
+                    if not isinstance(override, dict):
+                        continue
+                    asr = override.get("asr")
+                    profile = asr.get("profile") if isinstance(asr, dict) else None
+                    if not isinstance(profile, dict):
+                        continue
+                    profile_id = profile.get("id")
+                    connection_id = profile.get("connection_id")
+                    if isinstance(profile_id, str):
+                        profile_ids.add(profile_id)
+                    if isinstance(connection_id, str):
+                        connection_ids.add(connection_id)
         return profile_ids, connection_ids
 
     def _queue_credential_cleanup(
@@ -1059,6 +1074,48 @@ class ConfigurationService:
         if connection.protocol == "volc_bigasr_flash":
             snapshot["resource"] = "volc.bigasr.auc_turbo"
         return snapshot
+
+    def snapshot_current_cloud_asr_retry_profile(
+        self,
+        profile_id: str,
+        *,
+        connection_revision: int,
+        profile_revision: int,
+    ) -> dict[str, Any]:
+        """Snapshot one explicitly selected, currently usable ASR profile."""
+
+        if (
+            type(connection_revision) is not int
+            or connection_revision <= 0
+            or type(profile_revision) is not int
+            or profile_revision <= 0
+        ):
+            raise InvalidConfiguration("cloud ASR retry revisions must be positive")
+        try:
+            row = self._profile(profile_id)
+        except KeyError:
+            raise InvalidConfiguration(
+                "cloud ASR retry profile is unavailable"
+            ) from None
+        if row.purpose != "cloud_asr":
+            raise InvalidConfiguration("cloud ASR retry profile has the wrong purpose")
+        if (
+            row.connection.revision != connection_revision
+            or row.revision != profile_revision
+        ):
+            raise InvalidConfiguration(
+                "cloud ASR retry profile revision is stale; refresh and retry"
+            )
+        view = self._profile_view(row)
+        if not view.tested or view.test_ok is not True:
+            raise InvalidConfiguration(
+                "cloud ASR retry requires a current successful test"
+            )
+        if not view.upload_authorized:
+            raise InvalidConfiguration(
+                "cloud ASR retry requires current upload authorization"
+            )
+        return self.snapshot_profile(profile_id)
 
     def resolve_profile_for_execution(self, profile_id: str) -> dict[str, Any]:
         """Resolve an immutable task reference even after its profile is archived."""

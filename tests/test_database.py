@@ -39,6 +39,7 @@ _TASK3_COLUMNS = {
         "progress_json",
         "execution_evidence_json",
         "provider_status_code",
+        "retry_override_json",
     },
 }
 
@@ -165,6 +166,59 @@ def test_additive_upgrade_adds_stage_evidence_columns(tmp_path: Path) -> None:
             task = session.get(TaskRecord, "11111111-1111-4111-8111-111111111111")
             assert task is not None
             assert task.terminal_reason_code == "user_canceled"
+    finally:
+        engine.dispose()
+
+
+def test_additive_upgrade_keeps_legacy_retry_override_nullable(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "retry-override-upgrade.db"
+    legacy_engine = create_task2_schema(database_path)
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql(
+            """INSERT INTO tasks (
+                id, status, options, pipeline_snapshot_json, created_at, updated_at
+            ) VALUES (
+                '11111111-1111-4111-8111-111111111111', 'queued', '{}', '{}',
+                '2026-07-18 00:00:00', '2026-07-18 00:00:00'
+            )"""
+        )
+        connection.exec_driver_sql(
+            """INSERT INTO items (
+                id, task_id, position, source_kind, source_locator, status,
+                created_at, updated_at
+            ) VALUES (
+                '22222222-2222-4222-8222-222222222222',
+                '11111111-1111-4111-8111-111111111111', 0, 'url',
+                'https://youtu.be/legacy', 'queued',
+                '2026-07-18 00:00:00', '2026-07-18 00:00:00'
+            )"""
+        )
+        connection.exec_driver_sql(
+            """INSERT INTO stage_runs (
+                id, item_id, stage, attempt, status, created_at, updated_at
+            ) VALUES (
+                '33333333-3333-4333-8333-333333333333',
+                '22222222-2222-4222-8222-222222222222',
+                'transcribe', 1, 'failed',
+                '2026-07-18 00:00:00', '2026-07-18 00:00:00'
+            )"""
+        )
+    legacy_engine.dispose()
+
+    engine = initialize_database(database_path)
+    try:
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("stage_runs")
+        }
+        assert "retry_override_json" in columns
+        with Session(engine) as session:
+            stage = session.get(
+                StageRunRecord, "33333333-3333-4333-8333-333333333333"
+            )
+            assert stage is not None
+            assert stage.retry_override_json is None
     finally:
         engine.dispose()
 

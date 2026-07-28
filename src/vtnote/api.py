@@ -213,6 +213,37 @@ class ProbeInput(InputModel):
 class RetryInput(InputModel):
     item_id: str
     stage: str
+    expected_attempt: int = Field(gt=0, strict=True)
+    strategy: Literal["same", "local", "cloud_confirmed"] = "same"
+    cloud_profile_id: str | None = Field(default=None, min_length=1, max_length=128)
+    connection_revision: int | None = Field(default=None, gt=0, strict=True)
+    profile_revision: int | None = Field(default=None, gt=0, strict=True)
+    acknowledge_possible_charge: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def validate_strategy_fields(self) -> RetryInput:
+        cloud_fields = {
+            "cloud_profile_id",
+            "connection_revision",
+            "profile_revision",
+            "acknowledge_possible_charge",
+        }
+        if self.strategy == "cloud_confirmed":
+            if (
+                self.cloud_profile_id is None
+                or self.connection_revision is None
+                or self.profile_revision is None
+                or self.acknowledge_possible_charge is not True
+            ):
+                raise ValueError(
+                    "cloud_confirmed requires a current profile, revisions, "
+                    "and possible-charge acknowledgement"
+                )
+        elif self.model_fields_set & cloud_fields:
+            raise ValueError(
+                "cloud retry fields are valid only for cloud_confirmed"
+            )
+        return self
 
 
 def _error(status: int, code: str, message: str, details: Any = None) -> JSONResponse:
@@ -705,7 +736,24 @@ def create_app(
             task = tasks.get_task(task_id)
             if payload.item_id not in {item.id for item in task.items}:
                 raise KeyError(payload.item_id)
-            return _dump(tasks.retry_stage(payload.item_id, payload.stage))
+            override = tasks.build_retry_override(
+                strategy=payload.strategy,
+                cloud_profile_id=payload.cloud_profile_id,
+                connection_revision=payload.connection_revision,
+                profile_revision=payload.profile_revision,
+                acknowledge_possible_charge=payload.acknowledge_possible_charge,
+            )
+            return _dump(
+                tasks.retry_stage(
+                    payload.item_id,
+                    payload.stage,
+                    expected_attempt=payload.expected_attempt,
+                    override=override,
+                    acknowledge_possible_charge=(
+                        payload.acknowledge_possible_charge
+                    ),
+                )
+            )
         finally:
             session.close()
 

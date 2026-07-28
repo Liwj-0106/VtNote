@@ -275,7 +275,12 @@ def test_retryable_terminal_task_pins_archives_until_latest_attempt_succeeds(
     assert configuration.resolve_profile_for_execution(profile.id)["id"] == profile.id
     assert configuration.secret_for_connection(connection.id) == "retry-secret"
 
-    retried = tasks.retry_stage(item.id, "notes")
+    retried = tasks.retry_stage(
+        item.id,
+        "notes",
+        expected_attempt=1,
+        override={"schema_version": 1, "strategy": "same"},
+    )
     assert [
         (run.attempt, run.status)
         for run in retried.stage_runs

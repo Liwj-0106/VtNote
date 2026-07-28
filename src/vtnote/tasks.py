@@ -7,14 +7,17 @@ writes. Direct mutation of diagnostic ORM fields is internal and unsupported.
 from __future__ import annotations
 
 import copy
+import json
 import re
+import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
@@ -44,6 +47,12 @@ from vtnote.sensitive_text import (
 
 class InvalidTaskOperation(ValueError):
     pass
+
+
+class RetryOverrideSnapshot(TypedDict, total=False):
+    schema_version: Literal[1]
+    strategy: Literal["same", "local", "cloud_confirmed"]
+    asr: dict[str, Any]
 
 
 class LocalSourceValidator(Protocol):
@@ -102,6 +111,7 @@ _TASK_OPTION_KEYS = frozenset(
         "notes_custom_prompt",
     }
 )
+_MAX_RETRY_OVERRIDE_BYTES = 16 * 1024
 
 
 class TaskService:
@@ -120,12 +130,215 @@ class TaskService:
         self.local_source_validator = local_source_validator
 
     @staticmethod
+    def _bounded_retry_override(
+        override: dict[str, Any],
+    ) -> RetryOverrideSnapshot:
+        try:
+            encoded = json.dumps(
+                override,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise InvalidTaskOperation("invalid retry override") from None
+        if len(encoded) > _MAX_RETRY_OVERRIDE_BYTES:
+            raise InvalidTaskOperation("retry override exceeds the storage limit")
+        return cast(RetryOverrideSnapshot, copy.deepcopy(override))
+
+    @staticmethod
+    def _is_sqlite_retry_conflict(error: OperationalError) -> bool:
+        original = error.orig
+        if not isinstance(original, sqlite3.OperationalError):
+            return False
+        code = getattr(original, "sqlite_errorcode", None)
+        busy_codes = {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+            getattr(sqlite3, "SQLITE_BUSY_SNAPSHOT", 517),
+        }
+        if code in busy_codes:
+            return True
+        return str(original).casefold() in {
+            "database is busy",
+            "database is locked",
+            "database table is locked",
+        }
+
+    def build_retry_override(
+        self,
+        *,
+        strategy: Literal["same", "local", "cloud_confirmed"] = "same",
+        cloud_profile_id: str | None = None,
+        connection_revision: int | None = None,
+        profile_revision: int | None = None,
+        acknowledge_possible_charge: bool = False,
+    ) -> RetryOverrideSnapshot:
+        """Build one exact internal retry snapshot without consulting defaults."""
+
+        if type(acknowledge_possible_charge) is not bool:
+            raise InvalidTaskOperation("invalid possible-charge acknowledgement")
+        if strategy not in {"same", "local", "cloud_confirmed"}:
+            raise InvalidTaskOperation("invalid retry strategy")
+        if strategy != "cloud_confirmed":
+            if (
+                cloud_profile_id is not None
+                or connection_revision is not None
+                or profile_revision is not None
+                or acknowledge_possible_charge
+            ):
+                raise InvalidTaskOperation(
+                    "cloud retry fields are valid only for cloud_confirmed"
+                )
+            if strategy == "same":
+                return self._bounded_retry_override(
+                    {"schema_version": 1, "strategy": "same"}
+                )
+            return self._bounded_retry_override(
+                {
+                    "schema_version": 1,
+                    "strategy": "local",
+                    "asr": {"mode": "local", "profile": None},
+                }
+            )
+        if acknowledge_possible_charge is not True:
+            raise InvalidTaskOperation(
+                "cloud retry requires acknowledging the possible charge"
+            )
+        if (
+            not isinstance(cloud_profile_id, str)
+            or not cloud_profile_id
+            or type(connection_revision) is not int
+            or connection_revision <= 0
+            or type(profile_revision) is not int
+            or profile_revision <= 0
+        ):
+            raise InvalidTaskOperation(
+                "cloud retry requires a profile and positive revisions"
+            )
+        try:
+            profile = self.configuration.snapshot_current_cloud_asr_retry_profile(
+                cloud_profile_id,
+                connection_revision=connection_revision,
+                profile_revision=profile_revision,
+            )
+        except InvalidConfiguration as error:
+            raise InvalidTaskOperation(str(error)) from error
+        return self._bounded_retry_override(
+            {
+                "schema_version": 1,
+                "strategy": "cloud_confirmed",
+                "asr": {"mode": "cloud", "profile": profile},
+            }
+        )
+
+    def _validate_retry_override(
+        self, override: RetryOverrideSnapshot | Mapping[str, object]
+    ) -> RetryOverrideSnapshot:
+        if not isinstance(override, Mapping):
+            raise InvalidTaskOperation("invalid retry override")
+        strategy = override.get("strategy")
+        schema_version = override.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
+            raise InvalidTaskOperation("invalid retry override schema")
+        if strategy == "same":
+            if set(override) != {"schema_version", "strategy"}:
+                raise InvalidTaskOperation("invalid same retry override")
+            normalized: dict[str, Any] = {
+                "schema_version": 1,
+                "strategy": "same",
+            }
+        elif strategy == "local":
+            if set(override) != {"schema_version", "strategy", "asr"}:
+                raise InvalidTaskOperation("invalid local retry override")
+            asr = override.get("asr")
+            if (
+                not isinstance(asr, Mapping)
+                or set(asr) != {"mode", "profile"}
+                or asr.get("mode") != "local"
+                or asr.get("profile") is not None
+            ):
+                raise InvalidTaskOperation("invalid local retry override")
+            normalized = {
+                "schema_version": 1,
+                "strategy": "local",
+                "asr": {"mode": "local", "profile": None},
+            }
+        elif strategy == "cloud_confirmed":
+            if set(override) != {"schema_version", "strategy", "asr"}:
+                raise InvalidTaskOperation("invalid cloud retry override")
+            asr = override.get("asr")
+            if (
+                not isinstance(asr, Mapping)
+                or set(asr) != {"mode", "profile"}
+                or asr.get("mode") != "cloud"
+                or not isinstance(asr.get("profile"), Mapping)
+            ):
+                raise InvalidTaskOperation("invalid cloud retry override")
+            supplied_profile = dict(cast(Mapping[str, Any], asr["profile"]))
+            profile_id = supplied_profile.get("id")
+            connection_revision = supplied_profile.get("connection_revision")
+            profile_revision = supplied_profile.get("profile_revision")
+            if (
+                not isinstance(profile_id, str)
+                or type(connection_revision) is not int
+                or type(profile_revision) is not int
+            ):
+                raise InvalidTaskOperation("invalid cloud retry profile snapshot")
+            try:
+                current_profile = (
+                    self.configuration.snapshot_current_cloud_asr_retry_profile(
+                        profile_id,
+                        connection_revision=connection_revision,
+                        profile_revision=profile_revision,
+                    )
+                )
+            except InvalidConfiguration as error:
+                raise InvalidTaskOperation(str(error)) from error
+            if supplied_profile != current_profile:
+                raise InvalidTaskOperation(
+                    "cloud retry profile changed; refresh and retry"
+                )
+            normalized = {
+                "schema_version": 1,
+                "strategy": "cloud_confirmed",
+                "asr": {"mode": "cloud", "profile": current_profile},
+            }
+        else:
+            raise InvalidTaskOperation("invalid retry strategy")
+        return self._bounded_retry_override(normalized)
+
+    @staticmethod
     def _allowed_stage_models(row: StageRunRecord) -> tuple[str, ...]:
         snapshot = row.item.task.pipeline_snapshot_json
         if not isinstance(snapshot, dict):
             return ()
         models: list[str] = []
         if row.stage == "transcribe":
+            override = row.retry_override_json
+            if isinstance(override, dict):
+                strategy = override.get("strategy")
+                override_asr = override.get("asr")
+                if strategy == "cloud_confirmed":
+                    override_profile = (
+                        override_asr.get("profile")
+                        if isinstance(override_asr, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(override_profile, dict)
+                        and isinstance(override_profile.get("model"), str)
+                    ):
+                        return (override_profile["model"],)
+                    return ()
+                if strategy == "local":
+                    local = snapshot.get("local_whisper")
+                    if (
+                        isinstance(local, dict)
+                        and isinstance(local.get("model"), str)
+                    ):
+                        return (local["model"],)
+                    return ()
             local = snapshot.get("local_whisper")
             if isinstance(local, dict) and isinstance(local.get("model"), str):
                 models.append(local["model"])
@@ -678,7 +891,34 @@ class TaskService:
         self.session.expire_all()
         return self._view(self._load_task(task_id))
 
-    def retry_stage(self, item_id: str, stage: str) -> ItemView:
+    def retry_stage(
+        self,
+        item_id: str,
+        stage: str,
+        expected_attempt: int,
+        override: RetryOverrideSnapshot,
+        *,
+        acknowledge_possible_charge: bool = False,
+    ) -> ItemView:
+        if type(expected_attempt) is not int or expected_attempt <= 0:
+            raise InvalidTaskOperation("expected_attempt must be a positive integer")
+        if type(acknowledge_possible_charge) is not bool:
+            raise InvalidTaskOperation("invalid possible-charge acknowledgement")
+        normalized_override = self._validate_retry_override(override)
+        strategy = normalized_override["strategy"]
+        if strategy == "cloud_confirmed":
+            if acknowledge_possible_charge is not True:
+                raise InvalidTaskOperation(
+                    "cloud retry requires acknowledging the possible charge"
+                )
+        elif acknowledge_possible_charge:
+            raise InvalidTaskOperation(
+                "possible-charge acknowledgement is valid only for cloud_confirmed"
+            )
+        if strategy in {"local", "cloud_confirmed"} and stage != "transcribe":
+            raise InvalidTaskOperation(
+                "ASR retry strategies are valid only for transcribe"
+            )
         item = self.session.scalar(
             select(ItemRecord)
             .where(ItemRecord.id == item_id)
@@ -699,8 +939,24 @@ class TaskService:
                 "cannot retry while a conflicting stage is active"
             )
         attempts = [run for run in item.stage_runs if run.stage == stage]
-        if not attempts or attempts[-1].status not in _RETRYABLE:
+        latest_attempt = (
+            max(attempts, key=lambda run: run.attempt) if attempts else None
+        )
+        if latest_attempt is None or latest_attempt.status not in _RETRYABLE:
             raise InvalidTaskOperation("only a failed or canceled stage can be retried")
+        submission_unknown = (
+            stage == "transcribe"
+            and latest_attempt.external_submission_state == "submission_unknown"
+        )
+        if submission_unknown and strategy == "same":
+            raise InvalidTaskOperation(
+                "submission_unknown requires an explicit local or "
+                "cloud_confirmed retry"
+            )
+        if strategy == "cloud_confirmed" and not submission_unknown:
+            raise InvalidTaskOperation(
+                "cloud_confirmed is valid only for submission_unknown"
+            )
         latest_by_stage: dict[str, StageRunRecord] = {}
         for run in item.stage_runs:
             previous = latest_by_stage.get(run.stage)
@@ -722,16 +978,34 @@ class TaskService:
             )
             .limit(1)
         ) is not None
-        next_attempt = max(run.attempt for run in attempts) + 1
-        item.stage_runs.append(StageRunRecord(stage=stage, attempt=next_attempt, status="queued"))
-        item.status = "running" if item_has_active_work else "queued"
-        item.task.status = "running" if task_has_active_work else "queued"
-        item.task.terminal_reason_code = None
+        if latest_attempt.attempt != expected_attempt:
+            raise InvalidTaskOperation(
+                "stage retry conflicted; refresh and retry"
+            )
+        next_attempt = latest_attempt.attempt + 1
+        retry = StageRunRecord(
+            stage=stage,
+            attempt=next_attempt,
+            status="queued",
+            retry_override_json=dict(normalized_override),
+        )
+        item.stage_runs.append(retry)
         try:
+            self.session.flush()
+            item.status = "running" if item_has_active_work else "queued"
+            item.task.status = "running" if task_has_active_work else "queued"
+            item.task.terminal_reason_code = None
             self.session.commit()
         except IntegrityError:
             self.session.rollback()
             raise InvalidTaskOperation("stage retry conflicted; refresh and retry") from None
+        except OperationalError as error:
+            self.session.rollback()
+            if self._is_sqlite_retry_conflict(error):
+                raise InvalidTaskOperation(
+                    "stage retry conflicted; refresh and retry"
+                ) from None
+            raise
         self.session.refresh(item)
         return self._view_item(item)
 
