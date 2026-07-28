@@ -316,7 +316,7 @@ def test_task_overrides_snapshot_all_pipeline_choices_and_fixed_item_path(tmp_pa
             "profile": snapshot["notes"]["profile"],
             "template": "custom",
             "output_language": "zh-Hans",
-            "custom_prompt": "Use headings",
+            "has_custom_prompt": True,
         }
         stored_item = session.get(ItemRecord, task.items[0].id)
         assert stored_item is not None

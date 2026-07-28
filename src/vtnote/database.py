@@ -13,6 +13,10 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 
 from vtnote.models import Base
+from vtnote.sensitive_text import (
+    SensitiveTextProtector,
+    migrate_sensitive_text,
+)
 
 
 _BOOTSTRAP_LOCK = threading.Lock()
@@ -32,6 +36,9 @@ _ADDITIVE_COLUMNS = {
         "execution_evidence_json": "JSON",
         "provider_status_code": "VARCHAR(128)",
         "recovered_count": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "default_settings": {
+        "notes_custom_prompt_envelope_json": "JSON",
     },
 }
 
@@ -98,7 +105,11 @@ def _initialize_schema(engine: Engine) -> None:
         connection.commit()
 
 
-def initialize_database(database_path: Path) -> Engine:
+def initialize_database(
+    database_path: Path,
+    *,
+    sensitive_text_protector: SensitiveTextProtector | None = None,
+) -> Engine:
     """Create a file-backed SQLite engine, enable durability pragmas, and create tables."""
 
     path = Path(database_path)
@@ -114,6 +125,7 @@ def initialize_database(database_path: Path) -> Engine:
         with _BOOTSTRAP_LOCK:
             _initialize_wal(engine)
             _initialize_schema(engine)
+            migrate_sensitive_text(engine, sensitive_text_protector)
     except Exception:
         engine.dispose()
         raise

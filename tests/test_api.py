@@ -409,7 +409,11 @@ def test_defaults_patch_allows_null_only_for_nullable_fields(
             "/api/defaults", headers=csrf(client), json={field: None}
         )
         assert response.status_code == 200
-        assert response.json()[field] is None
+        if field == "notes_custom_prompt":
+            assert response.json()["has_custom_prompt"] is False
+            assert field not in response.json()
+        else:
+            assert response.json()[field] is None
     finally:
         engine.dispose()
 

@@ -25,6 +25,13 @@ from vtnote.models import (
 from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
 from vtnote.paths import StoragePaths
+from vtnote.sensitive_text import (
+    DEFAULT_PROMPT_PURPOSE,
+    ProtectedTextEnvelope,
+    SensitiveTextProtector,
+    WindowsDpapiSensitiveTextProtector,
+    require_sensitive_text_migration,
+)
 
 
 class InvalidConfiguration(ValueError):
@@ -81,7 +88,7 @@ class DefaultsView(PublicModel):
     notes_profile_id: str | None
     notes_template: Literal["summary", "key_points", "custom"]
     notes_output_language: str
-    notes_custom_prompt: str | None
+    has_custom_prompt: bool
     local_whisper_options: dict[str, Any]
 
 
@@ -197,9 +204,14 @@ class ConfigurationService:
         secrets: SecretStore,
         *,
         paths: StoragePaths | None = None,
+        sensitive_text_protector: SensitiveTextProtector | None = None,
     ) -> None:
         self.session = session
         self.secrets = secrets
+        self.sensitive_text_protector = (
+            sensitive_text_protector
+            or WindowsDpapiSensitiveTextProtector()
+        )
         data_root = paths.data_root if paths else Path(r"D:\Workspace\Project\VtNote-data")
         cache_root = (
             paths.runtime_cache_root
@@ -851,8 +863,23 @@ class ConfigurationService:
             notes_profile_id=row.notes_profile_id,
             notes_template=row.notes_template,
             notes_output_language=row.notes_output_language,
-            notes_custom_prompt=row.notes_custom_prompt,
+            has_custom_prompt=bool(
+                row.notes_custom_prompt_envelope_json
+                or row.notes_custom_prompt
+            ),
             local_whisper_options=dict(row.local_whisper_options),
+        )
+
+    def resolve_default_custom_prompt(self) -> str | None:
+        require_sensitive_text_migration(self.session)
+        row = self._defaults_row()
+        if row.notes_custom_prompt_envelope_json is None:
+            return None
+        envelope = ProtectedTextEnvelope.model_validate(
+            row.notes_custom_prompt_envelope_json
+        )
+        return self.sensitive_text_protector.unprotect(
+            DEFAULT_PROMPT_PURPOSE, envelope
         )
 
     def update_defaults(self, **changes: Any) -> DefaultsView:
@@ -913,11 +940,32 @@ class ConfigurationService:
         notes_template = changes.get("notes_template", row.notes_template)
         if notes_template not in {"summary", "key_points", "custom"}:
             raise InvalidConfiguration("invalid notes template")
-        custom_prompt = changes.get("notes_custom_prompt", row.notes_custom_prompt)
+        prompt_changed = "notes_custom_prompt" in changes
+        custom_prompt = changes.pop("notes_custom_prompt", None)
+        has_custom_prompt = (
+            custom_prompt is not None
+            if prompt_changed
+            else bool(
+                row.notes_custom_prompt_envelope_json
+                or row.notes_custom_prompt
+            )
+        )
         if notes_template == "custom" and (
-            not isinstance(custom_prompt, str) or not custom_prompt.strip()
+            not has_custom_prompt
+            or (
+                prompt_changed
+                and (
+                    not isinstance(custom_prompt, str)
+                    or not custom_prompt.strip()
+                )
+            )
         ):
             raise InvalidConfiguration("custom notes template requires a prompt")
+        protected_prompt = None
+        if prompt_changed and custom_prompt is not None:
+            protected_prompt = self.sensitive_text_protector.protect(
+                DEFAULT_PROMPT_PURPOSE, custom_prompt
+            ).model_dump(mode="json")
         if "local_whisper_options" in changes:
             merged_local_options = {
                 **row.local_whisper_options,
@@ -928,6 +976,9 @@ class ConfigurationService:
             changes["local_whisper_options"] = merged_local_options
         for name, value in changes.items():
             setattr(row, name, dict(value) if name == "local_whisper_options" else value)
+        if prompt_changed:
+            row.notes_custom_prompt = None
+            row.notes_custom_prompt_envelope_json = protected_prompt
         if "notes_enabled" in changes or "notes_profile_id" in changes:
             row.notes_auto_enable_allowed = False
         try:

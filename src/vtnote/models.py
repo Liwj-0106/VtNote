@@ -338,6 +338,9 @@ class DefaultSettingsRecord(Base):
         String(64), nullable=False, default="zh-Hans"
     )
     notes_custom_prompt: Mapped[str | None] = mapped_column(Text)
+    notes_custom_prompt_envelope_json: Mapped[dict[str, Any] | None] = (
+        mapped_column(MutableDict.as_mutable(JSON))
+    )
     notes_auto_enable_allowed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
@@ -352,6 +355,18 @@ class DefaultSettingsRecord(Base):
             "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",
             "cache_root": r"D:\Workspace\Codex\cache\VtNote-runtime\models\faster-whisper",
         },
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class SensitiveTextMigrationRecord(Base):
+    __tablename__ = "sensitive_text_migration"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    status: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="complete"
     )
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False

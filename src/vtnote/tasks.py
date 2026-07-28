@@ -10,7 +10,7 @@ import copy
 import re
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select, update
@@ -35,6 +35,11 @@ from vtnote.pipeline import (
     validate_stage_progress,
 )
 from vtnote.url_security import SourceUrlPolicy
+from vtnote.sensitive_text import (
+    ProtectedTextEnvelope,
+    require_sensitive_text_migration,
+    task_prompt_purpose,
+)
 
 
 class InvalidTaskOperation(ValueError):
@@ -240,11 +245,23 @@ class TaskService:
 
     def _view(self, row: TaskRecord) -> TaskView:
         sensitive_values = self.configuration.diagnostic_sensitive_values()
+        options = copy.deepcopy(row.options)
+        options.pop("notes_custom_prompt", None)
+        snapshot = copy.deepcopy(row.pipeline_snapshot_json)
+        notes_value = snapshot.get("notes")
+        if isinstance(notes_value, dict):
+            notes = dict(notes_value)
+            has_custom_prompt = bool(
+                notes.pop("custom_prompt_envelope", None)
+                or notes.pop("custom_prompt", None)
+            )
+            notes["has_custom_prompt"] = has_custom_prompt
+            snapshot["notes"] = notes
         return TaskView(
             id=row.id,
             status=row.status,
-            options=copy.deepcopy(row.options),
-            pipeline_snapshot=copy.deepcopy(row.pipeline_snapshot_json),
+            options=options,
+            pipeline_snapshot=snapshot,
             items=tuple(
                 self._view_item(item, sensitive_values) for item in row.items
             ),
@@ -258,7 +275,9 @@ class TaskService:
             raise InvalidConfiguration(f"{purpose} profile must have a current successful test")
         return self.configuration.snapshot_profile(profile_id)
 
-    def _pipeline_snapshot(self, options: dict[str, Any]) -> dict[str, Any]:
+    def _pipeline_snapshot(
+        self, options: dict[str, Any], task_id: str
+    ) -> dict[str, Any]:
         defaults = self.configuration.get_defaults()
         asr_mode = options.get("asr_mode", defaults.asr_mode)
         if asr_mode not in {"auto", "cloud", "local"}:
@@ -316,7 +335,12 @@ class TaskService:
             "notes_output_language", defaults.notes_output_language
         )
         notes_template = options.get("notes_template", defaults.notes_template)
-        custom_prompt = options.get("notes_custom_prompt", defaults.notes_custom_prompt)
+        if "notes_custom_prompt" in options:
+            custom_prompt = options["notes_custom_prompt"]
+        elif defaults.has_custom_prompt:
+            custom_prompt = self.configuration.resolve_default_custom_prompt()
+        else:
+            custom_prompt = None
         if not isinstance(target_language, str) or not target_language.strip():
             raise InvalidTaskOperation("translation target language cannot be empty")
         if not isinstance(output_language, str) or not output_language.strip():
@@ -327,6 +351,13 @@ class TaskService:
             not isinstance(custom_prompt, str) or not custom_prompt.strip()
         ):
             raise InvalidTaskOperation("custom notes template requires a prompt")
+        custom_prompt_envelope = None
+        if notes_template == "custom":
+            custom_prompt_envelope = (
+                self.configuration.sensitive_text_protector.protect(
+                    task_prompt_purpose(task_id), custom_prompt
+                ).model_dump(mode="json")
+            )
         return {
             "schema_version": 1,
             "asr": {"mode": asr_mode, "profile": cloud},
@@ -340,7 +371,7 @@ class TaskService:
                 "profile": notes,
                 "template": notes_template,
                 "output_language": output_language,
-                "custom_prompt": custom_prompt if notes_template == "custom" else None,
+                "custom_prompt_envelope": custom_prompt_envelope,
             },
             "local_whisper": dict(defaults.local_whisper_options),
         }
@@ -378,8 +409,15 @@ class TaskService:
         validated: list[tuple[str, str, str | None]],
         selected_options: dict[str, Any],
     ) -> TaskView:
-        snapshot = self._pipeline_snapshot(selected_options)
-        task = TaskRecord(options=selected_options, pipeline_snapshot_json=snapshot)
+        task_id = str(uuid4())
+        snapshot = self._pipeline_snapshot(selected_options, task_id)
+        stored_options = dict(selected_options)
+        stored_options.pop("notes_custom_prompt", None)
+        task = TaskRecord(
+            id=task_id,
+            options=stored_options,
+            pipeline_snapshot_json=snapshot,
+        )
         translation_enabled = snapshot["translation"]["enabled"]
         notes_enabled = snapshot["notes"]["enabled"]
         for position, (kind, locator, display_name) in enumerate(validated):
@@ -696,6 +734,38 @@ class TaskService:
             raise InvalidTaskOperation("stage retry conflicted; refresh and retry") from None
         self.session.refresh(item)
         return self._view_item(item)
+
+    def resolve_notes_custom_prompt(
+        self, item_id: str, *, attempt: int
+    ) -> str | None:
+        """Resolve the immutable prompt only inside a concrete notes attempt."""
+
+        require_sensitive_text_migration(self.session)
+        item = self.session.scalar(
+            select(ItemRecord)
+            .where(ItemRecord.id == item_id)
+            .options(
+                selectinload(ItemRecord.stage_runs),
+                selectinload(ItemRecord.task),
+            )
+        )
+        if item is None:
+            raise KeyError(item_id)
+        if not any(
+            run.stage == "notes" and run.attempt == attempt
+            for run in item.stage_runs
+        ):
+            raise InvalidTaskOperation("notes attempt does not exist")
+        notes = item.task.pipeline_snapshot_json.get("notes")
+        if not isinstance(notes, dict):
+            return None
+        raw_envelope = notes.get("custom_prompt_envelope")
+        if raw_envelope is None:
+            return None
+        envelope = ProtectedTextEnvelope.model_validate(raw_envelope)
+        return self.configuration.sensitive_text_protector.unprotect(
+            task_prompt_purpose(item.task_id), envelope
+        )
 
     def export_item(
         self,

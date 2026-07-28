@@ -23,6 +23,13 @@ from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
+from vtnote.sensitive_text import (
+    SensitiveTextMigrationRequired,
+    SensitiveTextProtectionError,
+    SensitiveTextProtector,
+    WindowsDpapiSensitiveTextProtector,
+    migrate_sensitive_text,
+)
 from vtnote.tasks import InvalidTaskOperation, LocalSourceValidator, TaskService
 from vtnote.uploads import (
     LocalSourceFiles,
@@ -239,10 +246,20 @@ def create_app(
     source_probe: SourceProbe | None = None,
     local_source_validator: LocalSourceValidator | None = None,
     upload_limits: UploadLimits | None = None,
+    sensitive_text_protector: SensitiveTextProtector | None = None,
 ) -> FastAPI:
     selected_settings = settings or Settings()
     paths = StoragePaths.from_settings(selected_settings)
-    selected_engine = engine or initialize_database(paths.database)
+    selected_protector = (
+        sensitive_text_protector
+        or WindowsDpapiSensitiveTextProtector()
+    )
+    selected_engine = engine or initialize_database(
+        paths.database,
+        sensitive_text_protector=selected_protector,
+    )
+    if engine is not None:
+        migrate_sensitive_text(selected_engine, selected_protector)
     selected_secrets = secret_store or KeyringSecretStore()
     source_policy = SourceUrlPolicy(resolver or SocketResolver())
     selected_upload_limits = upload_limits or UploadLimits()
@@ -312,6 +329,22 @@ def create_app(
     async def configuration_error(_: Request, error: InvalidConfiguration):
         return _error(400, "invalid_configuration", str(error))
 
+    @app.exception_handler(SensitiveTextMigrationRequired)
+    async def sensitive_migration_error(_: Request, __: Exception):
+        return _error(
+            503,
+            "sensitive_snapshot_migration_required",
+            "sensitive text migration must be completed before execution",
+        )
+
+    @app.exception_handler(SensitiveTextProtectionError)
+    async def sensitive_protection_error(_: Request, __: Exception):
+        return _error(
+            503,
+            "sensitive_text_protection_unavailable",
+            "sensitive text protection is unavailable",
+        )
+
     async def operation_error(_: Request, error: Exception):
         code = "unsafe_source_url" if isinstance(error, UnsafeSourceUrl) else "invalid_task"
         return _error(400, code, str(error))
@@ -321,7 +354,12 @@ def create_app(
 
     def services() -> tuple[Session, ConfigurationService, TaskService]:
         session = sessions()
-        configuration = ConfigurationService(session, selected_secrets, paths=paths)
+        configuration = ConfigurationService(
+            session,
+            selected_secrets,
+            paths=paths,
+            sensitive_text_protector=selected_protector,
+        )
         tasks = TaskService(
             session,
             configuration,

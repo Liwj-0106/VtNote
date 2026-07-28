@@ -127,13 +127,19 @@ def test_enqueue_creates_durable_rows_and_immutable_redacted_snapshot(tmp_path: 
         assert_no_secret_fields(task.pipeline_snapshot)
         stored = session.get(TaskRecord, task.id)
         assert stored is not None
-        assert stored.pipeline_snapshot_json == task.pipeline_snapshot
+        assert (
+            stored.pipeline_snapshot_json["notes"]["custom_prompt_envelope"]
+            is None
+        )
+        assert task.pipeline_snapshot["notes"]["has_custom_prompt"] is False
+        assert "custom_prompt_envelope" not in task.pipeline_snapshot["notes"]
         assert "cloud-secret" not in json.dumps(stored.pipeline_snapshot_json)
         assert "chat-secret" not in json.dumps(stored.pipeline_snapshot_json)
 
         configuration.update_profile(notes_id, model="changed-after-enqueue")
         reloaded = tasks.get_task(task.id)
         assert reloaded.pipeline_snapshot["notes"]["profile"]["model"] == "notes-model"
+        assert "custom_prompt_envelope" not in reloaded.pipeline_snapshot["notes"]
     finally:
         session.bind.dispose()
         session.close()
