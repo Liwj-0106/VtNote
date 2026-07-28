@@ -4,16 +4,16 @@
 版本：V1
 Owner：VtNote 产品/工程负责人
 下次评审：实现计划 Task 4 启动前；外部接口、价格或合规边界变化时提前评审
-证据截止：2026-07-24
-对应实现计划：[2026-07-18-vtnote-v1.md](superpowers/plans/2026-07-18-vtnote-v1.md)
+证据截止：2026-07-28
+对应实现计划：[2026-07-28-vtnote-v1-completion.md](superpowers/plans/2026-07-28-vtnote-v1-completion.md)
 
 ## 1. 产品定义
 
 VtNote 是一款面向 Windows 单机用户的本地优先视频转录与笔记工具。用户可提交
 Bilibili/YouTube 的公开链接、本地媒体或本地字幕；系统先尝试直接使用原生字幕，
-没有可用字幕时才获取音频，并在得到明确上传同意后优先尝试已测试的火山引擎云端
-ASR，否则使用本地 faster-whisper。翻译与 AI 笔记是互不阻塞的可选后续分支，所有
-结果以不可变的规范转录 JSON 为源头按需导出。
+没有可用字幕时才获取音频，并在得到明确上传同意后优先尝试已测试的腾讯云录音文件
+识别，否则使用本地 faster-whisper。翻译与 AI 笔记只调用已测试的国内官方模型 API，
+是互不阻塞的可选后续分支；所有结果以不可变的规范转录 JSON 为源头按需导出。
 
 V1 的产品承诺是“把一段允许访问的视频可靠地变成可追踪、可导出的文本资产”，
 而不是万能下载器、字幕精修台或知识库。
@@ -38,7 +38,7 @@ VtNote 用明确的阶段、不可变规范产物、可恢复任务和本地数�
 1. 支持公开 Bilibili/YouTube URL、本地媒体、本地字幕三类入口。
 2. 对所有入口执行字幕优先策略，避免不必要的音频下载与 ASR。
 3. 在“云端配置已测试 + 当前 connection/profile 修订已有明确上传授权”时使用
-   火山引擎极速版 ASR，并以本地 faster-whisper 作为可控后备。
+   腾讯云标准录音文件识别与大模型 2.0，并以本地 faster-whisper 作为可控后备。
 4. 让转录、翻译、笔记、导出彼此解耦；可选分支失败时仍可交付已完成结果。
 5. 在应用重启后保留任务、阶段尝试、产物和可操作错误。
 6. 默认只监听本机回环地址，不在数据库、日志或 API 中暴露密钥。
@@ -55,7 +55,9 @@ VtNote 用明确的阶段、不可变规范产物、可恢复任务和本地数�
 - 插件框架或运行第三方任意代码；
 - macOS、Linux、服务器多用户或公网部署；
 - 自动删除用户原始文件；
-- 将商业供应商的价格、可用性或保留策略写成永久保证。
+- 将商业供应商的价格、可用性或保留策略写成永久保证；
+- 调用国外模型 API 或未经审计的模型中转站；若将来改变，必须由用户明确批准并新增
+  ADR、区域/隐私审计和迁移方案。
 
 上述项目若进入后续版本，必须重新做产品决策、威胁建模和验收。
 
@@ -183,23 +185,36 @@ item/task 聚合状态为 `queued`、`running`、`cancel_requested`、`canceled`
 - 检查不会向前端返回密钥值；
 - 未配置云端或聊天模型时，本地转录仍可使用；
 - 缺少 `yt-dlp-ejs` 或受控 Deno 时，YouTube URL 显示“运行链未就绪”且不宣称完整
-  支持；Bilibili、本地文件和本地字幕按自身依赖继续可用。
+  支持；Bilibili、本地文件和本地字幕按自身依赖继续可用；
+- 本地模型未安装时可由用户显式启动受管下载，显示固定来源/revision、总大小、逐文件
+  进度、取消/恢复和哈希结果；失败或取消的 staging 进入可恢复回收区，任务执行不得
+  隐式联网下载模型。
 
 ### FR-002 连接、配置档与默认项
 
-用户可创建、更新、归档并测试云端 ASR 和 OpenAI-compatible chat 连接/配置档，
+用户可创建、更新、归档并测试腾讯云 ASR 和国内官方 chat 连接/配置档，
 设置 ASR 模式 `auto|cloud|local`、翻译默认值和笔记模板。笔记模板固定为“综合总结”
 “干货提炼”“自定义提示词”三项。任务创建时必须保存不可变配置快照，后续修改默认项
-不得改变已入队任务。
+不得改变已入队任务。自定义提示词在默认项和任务快照中只保存 DPAPI 保护 envelope；
+公开读取只返回“已配置”，不回显明文。
 
 验收：
 
 - 密钥只写入 Windows Credential Manager/keyring；API、SQLite、日志只出现
   `has_secret` 或不可逆引用；
-- 仅连接测试成功且仍为当前修订的配置档可被默认启用；
-- 翻译默认关闭；首个当前修订 AI 配置档测试成功后，笔记一次性默认启用并默认输出
-  简体中文；用户关闭或改语言后不得再次被系统自动覆盖；
-- 归档中的配置若仍被历史/可重试任务引用，引用关系保持可追踪。
+- V1 chat 连接只接受单个合法 `workspace_id`，由应用构造阿里云百炼华北 2（北京）
+  工作空间官方 HTTPS endpoint；不接受任意 Base URL、国外 API 或第三方中转站；
+  使用的是兼容协议，不是国外服务；
+- 静态地址/字段校验只产生 `connection_policy_validated`，不能启用配置档；只有当前
+  connection/profile 修订的远程 `profile_capability_tested` 成功，且对应音频或文本
+  数据授权修订仍有效时，配置档才可用于新任务；
+- 翻译默认关闭；首个当前修订 AI 配置档能力测试和文本数据授权都成功后，笔记一次性
+  默认启用并默认输出简体中文；用户关闭或改语言后不得再次被系统自动覆盖；
+- 归档中的配置若仍被历史/可重试任务引用，引用关系保持可追踪；
+- 升级时旧 Volc/任意 `openai_compatible` 配置自动归档、清除默认项并使测试/授权失效；
+  旧 queued/running 快照在读取密钥或联网前稳定失败并提供本地/重新配置动作；
+- 明文自定义提示词只在创建/替换请求和编辑控件中短暂存在，不进入公开响应、任务
+  详情、浏览器存储、日志、错误、诊断包、URL 或导出。
 
 ### FR-003 URL 校验与安全探测
 
@@ -301,52 +316,73 @@ URL 来源必须先枚举并排序可用字幕。固定顺序为“首选语言�
 - `auto` 无有效云 profile 时快照不含云配置，并直接选择本地；
 - 用户可在提交前切换为仅本地。
 
-### FR-009 火山引擎极速版 ASR
+### FR-009 腾讯云标准录音文件识别
 
-云端实现按当前官方极速版合同发送 `X-Api-Key`、唯一 `X-Api-Request-Id`、
-`X-Api-Resource-Id: volc.bigasr.auc_turbo` 和 `X-Api-Sequence: -1`。请求体在内存中
-构造 `user.uid`（按当前新控制台合同取当前 AppKey，按密钥处理）、JSON
-`audio.data` Base64 和 `request.model_name: bigmodel`，上传 16 kHz、单声道
-OGG/Opus。响应中的 utterance/word 时间映射为提供商无关结果。V1 不实现
-`audio.url`、云端切片或 submit/query 轮询。实现前必须重新核验
-[官方文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh)的端点、限制和
-计费。
+V1 云端实现固定使用腾讯云 API 3.0 的 `CreateRecTask + DescribeTaskStatus`，ASR
+地域固定为官方当前列出的 `ap-guangzhou`，默认引擎为 `16k_zh_en_2.0` 大模型
+2.0，`ChannelNum=1`、`ResTextFormat=3`、`SentenceMaxLength=20`，关闭说话人、
+情绪、语义分段和口语转书面语等额外计费能力。音频统一转为 16 kHz、单声道、
+32 kbps OGG/Opus。标准版不需要 AppID；V1 只支持存放于 Credential Manager 的
+SecretId、SecretKey 原子凭据包和最小权限子账号，不支持无法自动续期的临时 STS
+凭据/session token。
+
+编码后整文件不超过应用阈值 4,500,000 字节（低于供应商 5 MB 边界）时，以
+`SourceType=1`、Base64 `Data` 和未编码字节
+`DataLen` 直接提交。更大的、最长 5 小时且不超过 1 GB 的音频，只在当前 profile
+配置并测试了私有 COS 桶时上传为不可预测对象键，再用最长 6 小时的单对象预签名
+GET URL 以 `SourceType=0` 提交。V1 不切片、不使用公开桶、不把签名 URL 写入数据库
+或日志。COS 未就绪、超过供应商边界或语言不合格时，`auto` 在发送前固定转本地，
+`cloud` 阻止提交并解释原因。接口、限制与结果结构以腾讯云
+[CreateRecTask](https://cloud.tencent.com/document/product/1093/37823)、
+[DescribeTaskStatus](https://cloud.tencent.com/document/product/1093/37822)和
+[数据结构](https://cloud.tencent.com/document/product/1093/37824)为准。
 
 验收：
 
-- 发送前预检音频时长、编码后 OGG/Opus 字节数、Base64 请求量级和任务语言；
-  Base64 长度按 `4 * ceil(binary_bytes / 3)` 计算并计入 JSON/内存预算；
-- 官方当前硬边界为 2 小时/100 MB，并建议上传二进制尽量约 20 MB 以内；应用的
-  THR-002 必须更保守且同时约束二进制、Base64 和峰值内存；
-- 超过 2 小时、应用/供应商大小限制或语言不符合当前 profile 时，`auto` 在发送前
-  固定转本地，`cloud` 阻止提交并解释原因，云请求次数为 0；
-- 网络失败被证明发生在远端受理前，或收到明确 429/5xx 时，`auto` 转本地；鉴权、
-  endpoint、resource ID、`model_name` 等配置错误必须停止并提示修复，不能以本地
-  成功掩盖错误配置；
-- HTTP 状态不能单独决定业务成功。明确 HTTP 429/5xx 按上一条作为远端失败处理，
-  若携带 provider status 仍须安全校验/记录；对可能承载业务结果的响应，尤其 HTTP
-  2xx，必须读取并校验 `X-Api-Status-Code`：`20000000` 才进入响应体校验和成功
-  映射；`20000003` 映射为
-  `cloud_audio_silent` 并停止，不自动转本地或重发；`45000001`（参数无效）、
-  `45000002`（空音频）和 `45000151`（格式错误）映射为配置/请求/预处理合同失败，
-  停止并提示修复，不以自动本地成功掩盖；`55000031`（繁忙）和其他 `550xxxx`
-  内部错误属于明确服务端失败，`auto` 可转本地但不得自动重发云端；
-- 格式合法但未在当前合同中识别的 `X-Api-Status-Code` 不得猜测为成功、配置失败
-  或可免费重试；统一记录 `cloud_outcome_unknown`，禁止自动云重发，`auto` 可转
-  本地并保留“云端可能已计费”警告。安全诊断可保留该限长状态码；
-- 可能承载业务结果的响应（尤其 HTTP 2xx）缺失/畸形 `X-Api-Status-Code`，或
-  `20000000` 携带不可解析/不完整响应体，视为结果不可安全判断：记录
-  `cloud_outcome_unknown`，不重发；`auto` 可转本地并保留“云端可能已计费”警告；
-- 请求体可能已发送而连接中断/超时、服务端结果未知时标记
-  `cloud_outcome_unknown`，不得自动重发付费请求；`auto` 可转本地并持续显示
-  “云端可能已计费”；
-- 保存脱敏且长度受限的 `X-Tt-Logid`、请求 ID、HTTP 状态、已校验的
-  `X-Api-Status-Code` 和安全错误码用于支持审计；`X-Api-Key`/`user.uid`、Base64
-  音频、原始 provider message 和原始云响应不得进入日志或持久化产物；
-- 合同测试覆盖 HTTP 200 + 每个已知 provider code、未知 code、缺失/畸形 status
-  header、成功码 + 非法 body，并断言云请求次数、是否自动转本地和是否允许显式新尝试；
-- 授权继续绑定当前 profile 与 connection 修订；地址、endpoint、resource、model
-  或其他相关配置变化会使测试与上传授权失效。
+- 发送前预检语言、时长、OGG/Opus 字节数、Base64 长度和峰值内存；Base64 长度按
+  `4 * ceil(binary_bytes / 3)` 计算，只有未编码字节 `<=4,500,000` 才走整文件
+  内联；
+- profile 的语音范围固定为中文、英语、粤语和该引擎官方列出的中文方言。创建页必须
+  保存显式 `spoken_language_scope=zh_en_dialects`；可靠元数据明确为日语、韩语等
+  范围外语言时云端不可选，元数据未知时页面明确“按所选中英方言范围处理”，不得宣称
+  自动语种检测；
+- 远程 profile 能力测试必须使用用户主动选择的 2–10 秒有声样本，经正常上传边界
+  校验并明确同意可能计费；静音或纯静态校验不能授予生产转写能力；
+- COS 桶必须为私有且地域固定 `ap-guangzhou`，桶名/prefix 通过严格校验，SDK 使用显式
+  `trust_env=false` 等价会话、禁止重定向和自动上传重试；对象键不含标题、URL 或
+  用户路径；
+- COS 上传成功后才允许创建 ASR 任务。只有腾讯 provider 明确返回 `success|failed`
+  才立即删除；`submission_unknown`、本地取消或停止等待不等于远端终态，对象保留到
+  已知远端终态，或 6 小时签名 URL 过期再加 30 分钟宽限后由独立维护任务清理。桶的
+  1 天生命周期只是按日扫描的漏删兜底，不承诺精确 24 小时；本地编码音频仍按 24
+  小时可恢复回收策略处理；上传、延期、删除和漏删均审计；
+- `CreateRecTask` 没有文档化幂等键。请求体明确未发送时可安全重试；可能已发送但
+  没有收到 `TaskId` 时记录 `submission_unknown`，禁止自动重新提交付费任务，
+  `auto` 可转本地并持续显示“云端可能已计费”；
+- 一旦获得 `TaskId` 和服务端 `RequestId`，先原子持久化，再轮询；worker 重启后只
+  查询既有任务，不重新创建。`TaskId` 按字符串处理，与 provider、提交日期和本地
+  stage attempt 组合标识，不能当全局唯一值或传给 JavaScript Number；
+- `waiting/doing/success/failed` 分别映射为等待、执行、成功、失败；查询网络错误可
+  重试，创建请求不可盲重试。提交 24 小时内的 `FailedOperation.NoSuchTask` 停止
+  轮询并进入可操作错误，要求检查地域、凭据、TaskId 和提交日期；超过结果保留窗口
+  标记 `provider_result_expired`，两者都不得自动重新付费提交；
+- 成功结果必须有可验证的 `ResultDetail`、非空 `FinalSentence` 和合法
+  `StartMs/EndMs`；缺少时间戳时记录 `provider_result_missing_timestamps`，不伪造
+  时间轴，`auto` 可转本地并保留云调用警告；
+- `AuthFailure.InvalidAuthorization`、`FailedOperation.CheckAuthInfoFailed`、
+  `FailedOperation.UserNotRegistered`、`FailedOperation.ServiceIsolate`、
+  `FailedOperation.UserHasNoAmount`、`FailedOperation.UserHasNoFreeAmount` 和
+  `InvalidParameter*|MissingParameter|UnknownParameter` 停止并提示修复；
+  `FailedOperation.ErrorDownFile|FailedOperation.ErrorRecognize`、
+  `RequestLimitExceeded.UinLimitExceeded` 和 `InternalError.*` 可让 `auto` 转本地，
+  但同一 attempt 不重新创建云任务；HTTP 200 内的 `Response.Error` 同样按此表处理；
+- 只保存限长 RequestId、TaskId、状态、供应商错误码、音频哈希、桶/对象键和安全
+  诊断；SecretId/SecretKey、Base64、预签名 URL、provider message 和
+  原始响应不得进入数据库、日志、任务快照或产物；
+- 本地取消只能停止用户等待，不能取消腾讯远端任务或保证停止计费；独立提交协调器
+  仍按到期时间做单次查询/清理，不持有主 worker lease；UI 必须明确说明；
+- 授权绑定当前 profile/connection 修订；engine、COS bucket/prefix、凭据或其他相关
+  配置变化会使能力测试与上传授权失效。
 
 ### FR-010 本地 faster-whisper 与云端后备
 
@@ -364,6 +400,8 @@ faster-whisper/CTranslate2、模型文件和 CUDA/cuBLAS/cuDNN 发行组合必�
 验收：
 
 - 首次需要模型下载时展示大小/来源/进度和磁盘错误；
+- 模型安装固定 manifest 与 revision，下载到 D 盘 staging，逐文件校验 SHA-256 后
+  原子发布；中断可恢复、取消可审计，运行时强制 `local_files_only`；
 - NVIDIA GPU 是 V1 本地 ASR 发布路径；GPU/CUDA 不满足时显示可诊断的“本地 ASR
   不可用”，字幕路径和已授权云路径仍可部分使用；
 - CPU 只做诊断性/未来备选，不是 V1 发布必选项，也不得成为静默性能退化路径；
@@ -386,19 +424,33 @@ faster-whisper/CTranslate2、模型文件和 CUDA/cuBLAS/cuDNN 发行组合必�
 
 ### FR-012 可选翻译
 
-用户可选择目标语言和已测试的 chat 配置档。翻译以规范 cue 为单位，保留 cue ID 和
-时间，不修改原文。长文本分块必须保留顺序并验证结构。
+用户可选择目标语言和已测试的国内 chat 配置档。V1 只实现阿里云百炼华北 2（北京）
+工作空间的官方 Chat Completions endpoint；模型名由用户从同地域工作空间确认后填写，
+并通过一次明确提示“可能产生少量费用”的 JSON 能力测试。翻译以规范 cue 为单位，
+保留 cue ID 和时间，不修改原文。长文本分块必须保留顺序并验证结构。
 
 验收：
 
 - 默认关闭，未选择有效配置时不能启用；
+- 只接受单个 DNS label 形状的 `workspace_id`，由应用构造
+  `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`；禁止
+  重定向、任意主机/路径/端口和非官方中转站；V1 不假定存在可用的 `/models`，以
+  用户填写模型 + 最小非流式 `json_object` profile test 为准；
+- profile 能力测试不等于授权上传真实字幕。独立 `chat_data_consent_revision` 绑定
+  endpoint、credential revision、model、`response_format`、thinking 模式和生产
+  options；提交页必须列出将上传的字幕 cue、标题/元数据、目标/输出语言、自定义提示词，
+  并明确“不上传音频”和“可能计费”；
+- 每个翻译请求固定 `stream=false` 和 `response_format={"type":"json_object"}`；除
+  明确拒绝受理的 429 可遵从 `Retry-After` 自动重试一次外，500/503、读取超时或连接
+  中断均记为 `chat_submission_unknown`，不得自动重发；
 - 翻译失败不阻止原文查看/导出，item 为 `completed_with_warnings`；
 - 部分/格式错误响应不得作为完整译文发布；
 - 可独立重试翻译，不重跑 source/transcribe/notes。
 
 ### FR-013 可选 AI 笔记
 
-用户可选择“综合总结”“干货提炼”或“自定义提示词”。一旦当前修订 AI 配置档测试
+用户可选择“综合总结”“干货提炼”或“自定义提示词”。笔记与翻译复用同一受控国内
+Chat 协议，但可以选择不同的百炼模型/profile。一旦当前修订 AI 配置档测试
 成功，笔记默认开启并默认输出简体中文；用户可关闭或显式更改语言，系统不得反复覆盖。
 笔记直接读取不可变原文转录，不读取译文。笔记应携带任务/转录来源标识，并明确标注为
 AI 生成内容。
@@ -408,11 +460,15 @@ AI 生成内容。
 - 自定义模板必须含非空提示词；
 - 提示词和响应大小有上限；长字幕严格按时间顺序分块，每块记录首末 cue ID/时间，
   先生成块摘要，再按原顺序合并，并保留块摘要到规范 cue 的映射；
+- map、reduce 和最终响应每一层都固定为非流式 `json_object`，由本地 schema 校验后
+  再渲染 Markdown；引用必须属于当前块或显式传递的 citation lineage；
 - 最终笔记包含可点击且可核验的时间点引用；每个引用必须解析回同一
   `transcript.json` 中存在的稳定 cue ID，并显示对应时间与原文；
 - 笔记失败不阻止转录/译文交付；
 - 可独立重试笔记，不重跑成功的平行翻译；
-- UI 提醒用户复核姓名、数字、专业术语和关键引用。
+- 结构化笔记产物和 Markdown 都保存任务 ID、转录 SHA-256、请求/响应模型标识及
+  `generated_by_ai=true`；UI/导出明确标注“AI 生成”，并提醒用户复核姓名、数字、
+  专业术语和关键引用。
 
 ### FR-014 进度、决策与诊断
 
@@ -451,8 +507,14 @@ AI 生成内容。
 
 - 同阶段已有 `running|cancel_requested` 尝试时拒绝重复重试；
 - 与活跃依赖阶段冲突时拒绝并要求刷新；
-- `cloud_outcome_unknown` 不提供“一键重复云端”，只提供“检查供应商”“改用本地”
+- `submission_unknown` 不提供“一键重复云端”，只提供“检查供应商”“改用本地”
   或带二次费用警告的显式新尝试；
+- `POST /api/tasks/{id}/retry` 必须携带 `expected_attempt`。未知云结果只接受
+  `strategy=local`，或 `strategy=cloud_confirmed` 加
+  `acknowledge_possible_charge=true`、当前 profile ID 与 connection/profile revision；
+  普通 `strategy=same` 被拒绝；
+- 显式 retry 把本次覆盖写入新的 attempt snapshot，不读取当前默认项；云端新 attempt
+  还必须重新通过当前修订测试和上传授权；
 - 历史 attempts 和已失效产物仍可审计，当前结果指向最新有效尝试。
 
 ### FR-017 结果查看与按需导出
@@ -580,21 +642,21 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
 
 <a id="threshold-registry"></a>
 
-## 10. 未冻结阈值登记
+## 10. 阈值登记
 
-下列项目是有 owner 和冻结门禁的命名 TBD，不是可由实现者自行选择的空白项。当前
-代码默认值若存在，也不等于已批准的产品/发布阈值。
+下列项目已由产品/技术负责人授权为**实施基线**，用于解除真实适配器、前端与 POC
+之间的循环依赖；它们不是未经实测的永久性能承诺。精确数值和理由见 ADR-014。
 
-| ID | 待冻结内容 | 当前状态 | Owner | 冻结门禁 |
+| ID | 内容 | 当前状态 | Owner | 发布冻结门禁 |
 |---|---|---|---|---|
-| THR-001 | 浏览器媒体/字幕上传上限、request overhead | 未冻结（TBD） | 产品 + Backend + Security | Task 5 客户端校验前；依据 Task 3 ingress 内存/磁盘/失败恢复测试 |
-| THR-002 | 低于供应商 2 小时/100 MB，且尊重“二进制尽量约 20 MB 内”建议的云端二进制/Base64/内存硬限制 | 未冻结（TBD） | ASR + Backend + 产品 | Task 3 火山 HTTP 实现前；依据 `4*ceil(n/3)` 放大、JSON overhead、峰值内存与 POC 时长分布 |
-| THR-003 | 翻译/笔记 prompt、chunk、response 上限 | 未冻结（TBD） | AI + Security + 产品 | Task 4 RED 测试前；依据 provider context 与最坏 cue corpus |
-| THR-004 | 本地 API p95 目标与基准 task/item 数量 | 未冻结（TBD） | Backend + QA | Task 5 性能验收前；先定义基准设备、数据量和冷/热缓存 |
-| THR-005 | 前台/后台轮询间隔、退避与允许请求负载 | 未冻结（TBD） | Frontend + Backend + QA | Task 5 API client 测试前；依据 THR-004 和多标签场景 |
+| THR-001 | 浏览器媒体/字幕上传上限、request overhead | 实施基线：媒体 8 GiB、字幕 16 MiB、metadata 32 KiB、overhead 128 KiB；总 request 公式见 ADR-014 | 产品 + Backend + Security | ingress 内存/磁盘/失败恢复与浏览器上传验收 |
+| THR-002 | 腾讯标准 ASR 内联/COS/内存硬限制 | 实施基线：编码音频 ≤4,500,000 B 走 Base64；较大且 ≤5 h、≤96 MiB 走私有 COS；估算 request ≤64 MiB，精确公式和查询退避见 ADR-014 | ASR + Backend + 产品 | Base64/COS 两路径、`4*ceil(n/3)`、真实峰值内存、时长分布、账单与失败 POC |
+| THR-003 | 翻译/笔记 prompt、chunk、response 上限 | 实施基线：30/15 cues、64 KiB prompt、48 KiB note chunk、24 chunks/4 levels、256 KiB response | AI + Security + 产品 | provider context/capability 与最坏 cue corpus |
+| THR-004 | 本地 API p95 目标与基准 task/item 数量 | 实施基线：100 tasks、热缓存、核心本地 API p95 ≤250 ms | Backend + QA | 固定设备重复基准与前端压力验收 |
+| THR-005 | 前台/后台轮询间隔、退避与允许请求负载 | 实施基线：1/2/5 s 前台、15 s 后台、2/4/8/16/30 s 网络退避、单一在途 | Frontend + Backend + QA | THR-004、多标签与后台节流验收 |
 
-任一阈值冻结都要在本表或后续 ADR 记录值、设备/语料、证据、批准人和日期；未冻结时
-网站只展示服务端实际限制，不作永久承诺。
+POC 后维持或修改任一值，都要记录设备/语料、证据、批准人和日期。正式冻结前网站只
+展示服务端实际限制，不作永久承诺。
 
 ## 11. 30–50 视频 POC 协议
 
@@ -634,11 +696,13 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
 
 ### 11.4 对照与决策
 
-同一无字幕样本在条件允许时运行火山极速版与已批准默认
-`large-v3-turbo/int8_float16/VAD/GPU concurrency=1`；只在格式兼容、账户同意且保留/
-区域条款已复核时加入 OpenAI/AssemblyAI 作为研究对照，不进入 V1 实现范围。三者按
-相同样本记录真实账单/usage，不在无实测时排列价格或质量名次。记录失败而不是剔除
-困难样本。POC 前冻结阈值，POC 后输出原始结果、置信区间/分布、异常说明和以下决策：
+同一无字幕样本在条件允许时运行腾讯云 `16k_zh_en_2.0` 与已批准默认
+`large-v3-turbo/int8_float16/VAD/GPU concurrency=1`。V1 不调用国外 ASR 作为
+对照；腾讯极速版、其他国内 ASR 也只做离线合同研究，除非用户另行批准一次明确的
+付费 POC。两条正式路径按相同样本记录真实账单/usage，不在无实测时排列价格或质量
+名次。记录失败而不是剔除困难样本。POC 前记录 ADR-014 的实施基线，POC 后输出原始
+结果、置信区间/分布、
+异常说明，冻结发布阈值并作出以下决策：
 
 1. `auto` 是否继续云端优先；
 2. 已批准本地默认模型/计算精度是否通过发布门禁；若建议改变，提交证据并等待用户
@@ -656,6 +720,6 @@ API 的创建、列表、详情、取消与重试在本地基准数据量下应�
 在基线 HEAD `2a36eb0` 上，计划 Tasks 1、2、3A、3B 的后端基础已落地：规范转录与导出、
 SQLite 数据模型、配置/任务 API、安全上传、本地来源校验、运行资产生命周期和 FFmpeg
 媒体原语和基础确定性导出。现有 Markdown 是基础文本导出，尚不满足 FR-019 的完整
-来源证明。真实 Bilibili/YouTube 适配、火山/本地 ASR 调用、租约 worker 主循环、
+来源证明。真实 Bilibili/YouTube 适配、腾讯云/COS/本地 ASR 调用、租约 worker 主循环、
 翻译/笔记执行、React 网站、启动器与发布验证仍未完成。逐项状态见
 [traceability.md](traceability.md)；本文的需求状态不等同于实现完成。

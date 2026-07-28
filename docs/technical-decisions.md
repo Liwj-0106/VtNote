@@ -2,8 +2,9 @@
 
 状态：架构基线
 Owner：VtNote 技术负责人
-下次评审：实现计划 Task 3C/4/5 各阶段开始前，及 POC 结论产生后
-证据截止：2026-07-24
+下次评审：[剩余开发计划](superpowers/plans/2026-07-28-vtnote-v1-completion.md)
+Tasks 8、12、17、23 开始前，及 POC 结论产生后
+证据截止：外部合同 2026-07-28；治理决议 2026-07-28
 需求基线：[product-requirements.md](product-requirements.md)
 
 ## 1. 使用方法
@@ -24,8 +25,8 @@ flowchart TB
     API --> KEY["Windows Credential Manager / keyring"]
     WORKER["独立 durable worker"] --> DB
     WORKER --> SRC["显式 SourceAdapter：Bilibili / YouTube / local"]
-    WORKER --> ASR["显式 Transcriber：Volc / faster-whisper"]
-    WORKER --> AI["显式 Translator / NoteGenerator"]
+    WORKER --> ASR["显式 Transcriber：Tencent Recording / faster-whisper"]
+    WORKER --> AI["显式国内 Chat：Aliyun Bailian"]
     WORKER --> STORE["规范产物与运行资产"]
     API --> STORE
 ```
@@ -238,75 +239,109 @@ Cookie，不读取浏览器登录态。
 
 平台发布稳定官方读取接口、yt-dlp 许可/运行时要求变化，或连续适配故障无法满足门禁。
 
-## ADR-006：V1 云 ASR 固定火山引擎极速版 Base64 路径
+## ADR-006：V1 云 ASR 固定腾讯云标准录音文件识别
 
 状态：Provisional（接口方向接受，质量/成本待 POC）
 关联：FR-008、FR-009、FR-019、NFR-002
 
 ### 背景
 
-需要一个中文友好、单请求返回的云端后备。火山引擎当前
-[极速版文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh)描述
-`X-Api-Key`、`X-Api-Request-Id`、`X-Api-Resource-Id`、`X-Api-Sequence`、
-`user.uid`、JSON Base64/URL 请求、`request.model_name: bigmodel`、
-`X-Api-Status-Code` 业务状态、utterance/word 时间结果、2 小时/100 MB 上限、上传
-二进制尽量约 20 MB 内的建议和 `X-Tt-Logid`。外部合同、价格与保留政策易变；公开
-DPA 没有给出此 endpoint 可直接承诺的固定 TTL。
+需要一个中文/中英混合质量较高、付费但成本可控、可在 worker 崩溃后恢复的国内云端
+后备。腾讯云标准录音文件识别当前支持 `CreateRecTask + DescribeTaskStatus`、
+`16k_zh_en_2.0` 大模型 2.0、字幕分段时间戳、最长 5 小时 URL 音频和 24 小时
+任务结果窗口。直接数据提交只有 5 MB；官方推荐用 COS URL 提交长音频。同步极速版
+虽然更快且可直接上传 100 MB/2 小时，但当前只列大模型 1.0，而且丢失响应后没有可
+查询的任务 ID，不符合 VtNote 的耐久 worker 与付费副作用防重目标。
 
 ### 决定
 
-V1 只实现：
+V1 只实现一个 `TencentRecordingAsrAdapter`，放在 provider-neutral `CloudAsrAdapter`
+协议后，不建设插件系统。固定合同：
 
-- `POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash`；
-- `X-Api-Key`、唯一 `X-Api-Request-Id`、
-  `X-Api-Resource-Id: volc.bigasr.auc_turbo`、`X-Api-Sequence: -1`；
+- ASR endpoint：`POST https://asr.tencentcloudapi.com/`，TC3-HMAC-SHA256，
+  `X-TC-Version: 2019-06-14`，region 固定 `ap-guangzhou`；
+- 创建：`CreateRecTask`；查询：`DescribeTaskStatus`；
+- 引擎 `16k_zh_en_2.0`、`ChannelNum=1`、`ResTextFormat=3`、
+  `SentenceMaxLength=20`，其余增值能力关闭；
+- provider profile 的语音范围固定为 `zh_en_dialects`，即中文、英语、粤语和该引擎
+  官方列出的中文方言；可靠来源元数据明确为范围外语言时不得走云端，元数据未知时
+  必须在任务审阅中显示并保存这个显式范围，不能称为自动语种检测；
 - 本地转码为 16 kHz、单声道、32 kbps OGG/Opus；
-- JSON `user.uid` 取当前 AppKey 并按密钥处理，`audio.data` 使用 Base64 上传；
-- `request.model_name` 固定为 `bigmodel`；
-- 同一响应内映射 utterance/word 信息到 provider-neutral 中间结果。
+- 整文件 `<=4,500,000` 未编码字节时使用 `SourceType=1`、Base64 `Data` 和
+  `DataLen`，保守低于供应商 5 MB 边界；Base64 长度仍按
+  `4 * ceil(binary_bytes / 3)` 预检；
+- 更大的文件只在 `ap-guangzhou` 私有 COS 已测试时使用 `SourceType=0` 与最长 6
+  小时的单对象预签名 GET URL；最长 5 小时、最大 1 GB；
+- COS 对象键为 `vtnote-runtime/<task_uuid>/<audio_hash_prefix>.ogg`，不含标题或
+  来源。provider 明确 `success|failed` 时立即删除；`submission_unknown`、本地取消
+  和停止等待不算远端终态，对象保留至已知远端终态，或签名 URL 到期加 30 分钟宽限
+  后由独立维护任务删除；桶的 1 天生命周期只作按日扫描的漏删兜底。
 
-V1 不实现 `audio.url`、云端对象存储、客户端/云端切片、轮询或其他火山模型。发送前
-重新核验官方合同，并依次预检时长、OGG/Opus 编码后字节数、按
-`4 * ceil(binary_bytes / 3)` 计算的 Base64 量级、JSON/峰值内存和 profile 支持语言。
-THR-002 必须低于 2 小时/100 MB，并尊重二进制尽量约 20 MB 内的官方建议。
+V1 不切片、不使用公开桶、不自动创建存储桶、不开放任意 ASR endpoint/region/model，
+也不实现腾讯极速版或其他付费 ASR。COS 桶和 prefix 是严格校验的非秘密配置，地域
+固定 `ap-guangzhou`；SecretId、SecretKey 作为一个原子 secret bundle。V1 不接受
+无法自动续期的临时 STS/session token。COS 访问使用用户已创建的最小权限子账号；
+应用只需要目标 prefix 的 put/get/delete 和两个 ASR action。没有 COS 时，小文件仍能
+直接走云端，大文件在 `auto` 模式转本地。
 
-预检超过时长/大小/语言边界时，`auto` 在任何云请求前转本地，`cloud` 阻止并说明。
-HTTP 状态不能单独判定业务成功。明确 HTTP 429/5xx 作为远端失败处理，若携带
-provider status 仍须安全校验/记录；可能承载业务结果的响应，尤其 HTTP 2xx，必须
-校验 `X-Api-Status-Code`：
+`CreateRecTask` 没有文档化的幂等键：
 
-- `20000000`：继续严格校验响应体并映射成功；
-- `20000003`：静音音频，映射 `cloud_audio_silent`；停止且不自动转本地或重发；
-- `45000001`、`45000002`、`45000151`：分别作为参数、空音频、格式合同失败，停止
-  并提示修复，不用本地成功掩盖；
-- `55000031` 与其他 `550xxxx`：明确服务端繁忙/内部失败，`auto` 可转本地，但不得
-  自动重发云端；
-- 格式合法但当前合同未识别的 provider status：`cloud_outcome_unknown`；禁止自动
-  云重发，`auto` 可转本地并保留可能计费警告，限长状态码可进入安全诊断；
-- 可能承载业务结果的响应缺失/畸形状态码，或 `20000000` 携带无法解析或不完整的响应体：
-  `cloud_outcome_unknown`，不得重发；`auto` 可转本地并保留可能计费警告。
+- 请求体明确未发送前的 DNS/TCP/TLS 失败可以安全重试；
+- 请求可能已发送但没有收到 `TaskId` 时持久化 `submission_unknown`，禁止自动重提；
+- 收到 `TaskId`/RequestId 后先原子提交数据库，重启后只查询既有任务；
+- `TaskId` 按字符串保存，并与 provider、提交日期和本地 attempt 组合，不作为全局
+  唯一值；
+- 远端没有取消 API；本地取消只停止等待，不承诺停止远端处理或计费；
+- 查询网络/限流/内部错误可以按有界退避安全重试，直到 24 小时结果窗口；过期后
+  标记 `provider_result_expired`，不自动重提。
 
-明确 HTTP 429/5xx 或可证明远端未受理的网络失败也允许 `auto` 转本地；鉴权、
-endpoint、resource ID、`model_name` 配置错误停止并要求修复。请求体可能已发送但
-结果未知时不得重发，允许本地完成并保留可能计费警告。
+`cloud_submissions` 持久化 `next_poll_at`、`poll_attempt`、`last_query_at`、
+`signed_url_expires_at`、`cleanup_due_at` 和 `remote_terminal_at`。独立 submission
+reconciler 每次只领取一个到期记录、执行一次查询/清理、写入下一时间并释放 lease；
+不得在唯一主 worker 内 sleep 到远端完成。用户任务取消后仍可继续此安全协调。
+
+错误映射在发布前按腾讯当前官方代码冻结：
+
+| 腾讯错误码 | 本地行为 |
+|---|---|
+| `AuthFailure.InvalidAuthorization`、`FailedOperation.CheckAuthInfoFailed`、`FailedOperation.UserNotRegistered` | `stop_configuration`，提示修复鉴权/开通状态 |
+| `FailedOperation.ServiceIsolate`、`FailedOperation.UserHasNoAmount`、`FailedOperation.UserHasNoFreeAmount` | `stop_billing_or_quota`，不以本地结果掩盖账户问题 |
+| `InvalidParameter`、`InvalidParameterValue`、`MissingParameter`、`UnknownParameter` | `stop_configuration`，不重提 |
+| `FailedOperation.ErrorDownFile`、`FailedOperation.ErrorRecognize` | `fallback_allowed`，同一 attempt 不再创建腾讯任务 |
+| `RequestLimitExceeded.UinLimitExceeded`、`InternalError.*` | `fallback_allowed`；查询可有界重试，创建不自动重提 |
+| `FailedOperation.NoSuchTask` | 24 小时内停止轮询并检查地域/凭据/TaskId/提交日期；窗口外为 `provider_result_expired` |
+
+HTTP 200 内的 `Response.Error` 也必须经过上表，不能按 HTTP 成功处理。成功必须严格
+验证 `ResultDetail[].FinalSentence/StartMs/EndMs`；成功状态却没有可用时间戳时标记
+`provider_result_missing_timestamps`，不伪造时间轴，`auto` 可转本地并保留云调用
+警告。
+
+数据库升级时自动归档旧 `volc_bigasr_flash` connection/profile、清除其默认项并失效
+测试/上传授权；历史记录保留只读。旧 queued/running 快照在任何密钥读取或网络调用前
+进入 `legacy_provider_requires_reconfiguration`，允许用户显式改用本地，旧 endpoint
+网络调用必须为 0。
 
 ### 后果
 
-- 单一协议降低实现与故障状态数量；
-- Base64 有约 4/3 体积放大，必须在构造请求前检查内存和请求体；
+- 一个标准版协议覆盖中英混合、大模型 2.0、小文件直传和长文件，避免多付费 ASR
+  自动竞速；
+- Base64 快速路径有约 4/3 体积放大，必须在构造请求前检查内存和请求体；
+- COS 增加一次临时媒体治理和极少量存储/请求费用，但避免分片上下文损失、时间轴
+  偏移与多子任务恢复；
 - OGG/Opus 解码采样率细节需用 FFprobe/解码结果验证，不能只相信容器头；
-- 只持久化脱敏且长度受限的 `X-Tt-Logid`、请求 ID、HTTP 状态、已校验的
-  `X-Api-Status-Code`、安全错误码与 provider-neutral 结果；不持久化原始云响应、
-  provider message、Base64、`user.uid` 或认证头；
-- 合同测试必须覆盖 HTTP 200 搭配所有已知/未知 provider status、缺失/畸形 status
-  header、成功码搭配非法 body，并验证云调用数、fallback 与显式新尝试权限；
+- 只持久化限长 RequestId、TaskId、provider 状态/安全错误码、音频哈希和 COS 对象
+  定位；不持久化原始云响应、provider message、Base64、预签名 URL 或认证头；
+- 合同测试必须覆盖 TC3 签名、Base64/COS 路由、创建前/后的断线、全部任务状态、
+  结果缺失/过期、COS 删除失败、云调用数、fallback 与显式新尝试权限；
 - 供应商价格、区域、保留策略以用户当前控制台/合同为准；
-- OpenAI、AssemblyAI 只作研究对照，不进入 V1 provider 列表。
+- Biji 的 `CreateRecTask` 字段和 ResultDetail 映射只作思路交叉核验；不复制其同步
+  pipeline、明文配置、固定切片或脆弱文本时间解析；
+- 腾讯极速版、火山、OpenAI、AssemblyAI 不进入 V1 provider 列表。
 
 ### 重审触发器
 
-POC 质量/成本不达阈值、官方接口/资源 ID/格式变化，或单请求内存和时长无法满足目标
-语料。
+POC 质量/成本不达阈值、腾讯标准接口/大模型/地域/结果窗口变化、COS 治理不可接受，
+或目标语料大量超过 5 小时。
 
 ## ADR-007：上传授权绑定修订；未知云结果不盲重试
 
@@ -321,7 +356,8 @@ POC 质量/成本不达阈值、官方接口/资源 ID/格式变化，或单请�
 ### 决定
 
 - 上传授权绑定当前 profile revision 与其 connection revision；
-- 只有连接测试成功且授权修订都匹配时，`auto`/`cloud` 才能包含该云 profile；
+- 只有当前修订远程 profile 能力测试成功且音频上传授权匹配时，`auto`/`cloud` 才能
+  包含该云 profile；静态策略校验不满足此门禁；
 - 没有有效云 profile 时，`auto` 仍可创建并把本地路由写入快照；只有 `cloud` 被阻止；
 - 相关配置、地址、模型或连接修订变化时测试/授权按生命周期规则失效；
 - 任务快照保存所用 profile/connection/授权修订，不保存密钥；
@@ -329,10 +365,17 @@ POC 质量/成本不达阈值、官方接口/资源 ID/格式变化，或单请�
 - 明确未受理/明确失败时，`auto` 可转本地；
 - 明确 429/5xx 或可证明远端未受理的网络失败属于上述可转本地类；鉴权、endpoint、
   resource/model 配置错误停止并提示修复；
-- 请求已发送但结果未知时记录 `cloud_outcome_unknown`，不得自动再次发云请求；可转
+- 请求已发送但结果未知时记录 `submission_unknown`，不得自动再次发云请求；可转
   本地并保留“可能已计费”警告；
-- 原始云响应不持久化；只保存 provider-neutral 映射、脱敏 `X-Tt-Logid` 和安全状态；
-- 用户若显式新建云 attempt，必须二次确认重复计费风险。
+- 原始云响应不持久化；只保存 provider-neutral 映射、限长 RequestId/TaskId、安全状态
+  和清理所需的非秘密 COS locator；签名 URL 不持久化；
+- 未知结果的转录阶段只能通过显式 retry strategy 创建新 attempt：
+  `local` 固定本地覆盖；`cloud_confirmed` 必须携带
+  `acknowledge_possible_charge=true`、`expected_attempt`、当前已测试/授权的 cloud
+  profile 与 connection/profile revision；
+- retry 创建时将显式覆盖写成新的无密钥 attempt snapshot，不读取当前默认项；旧
+  attempt 的 profile/修订只作来源证明，不能被静默替换；
+- 普通 `same` retry 对 `submission_unknown` 拒绝。
 
 ### 后果
 
@@ -367,10 +410,18 @@ V1 固定 `faster-whisper==1.2.1` 与 `ctranslate2==4.8.1`。批准的运行默�
 - 规范输出使用 segment 起止时间；
 - 单个 GPU worker 并发 1。
 
-模型文件、模型哈希与 CUDA/cuBLAS/cuDNN 发行组合固定版本、按需取得并放在 D 盘受控
-目录，不得静默升级或写入 C 盘。NVIDIA GPU 是 V1 本地 ASR 发布路径；CPU 仅保留
-诊断/未来备选，不是 V1 发布必选项，也不得成为静默性能降级。若 provider 返回 word，
-可保留为可选 provenance/扩展，但 V1 UI 与导出不依赖逐字级时间。
+模型 manifest 固定为
+`dropbox-dash/faster-whisper-large-v3-turbo@0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf`
+及其逐文件大小/SHA-256；`model.bin` 为 `1,617,884,929` bytes，SHA-256
+`e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da`。其余文件哈希
+进入受版本控制的 model manifest。
+
+模型只能由用户在就绪/设置页显式启动受管安装：D 盘 staging、允许的 manifest 文件、
+断点状态、总量进度、逐文件哈希、原子目录发布、取消和失败回收均持久化；任务执行只
+接受已经发布的本地绝对模型目录并强制 `local_files_only`，不得在 `WhisperModel`
+构造期间联网。模型不得静默升级或写入 C 盘。NVIDIA GPU 是 V1 本地 ASR 发布路径；
+CPU 仅保留诊断/未来备选，不是 V1 发布必选项，也不得成为静默性能降级。若 provider
+返回 word，可保留为可选 provenance/扩展，但 V1 UI 与导出不依赖逐字级时间。
 
 WhisperX 不进入 V1；V1.1/Later 只有在 POC 证明逐字对齐的用户价值大于模型、显存、
 许可证与运维成本后再评估。
@@ -388,7 +439,7 @@ WhisperX 不进入 V1；V1.1/Later 只有在 POC 证明逐字对齐的用户价�
 POC 时间戳门禁失败、用户明确需要逐字高亮/说话人，或 faster-whisper/CTranslate2 在
 目标 Windows/CUDA 矩阵不可维护。
 
-## ADR-009：翻译与笔记使用显式 OpenAI-compatible chat 适配器并行执行
+## ADR-009：翻译与笔记使用受控国内 Chat 适配器并行执行
 
 状态：Accepted
 关联：FR-012、FR-013、FR-016、NFR-009
@@ -400,30 +451,79 @@ POC 时间戳门禁失败、用户明确需要逐字高亮/说话人，或 faste
 
 ### 决定
 
-- 显式 `ChatConnection/Profile` 支持 OpenAI-compatible HTTP 合同，不动态加载插件；
+- V1 只实现 `AliyunBailianChatAdapter`，调用阿里云百炼华北 2（北京）工作空间官方
+  OpenAI-compatible Chat Completions endpoint；“兼容”只描述协议，不表示调用
+  OpenAI 或任何国外服务；
+- 用户只输入单个 DNS label 形状的 `workspace_id`，应用构造
+  `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`；固定
+  HTTPS/host/path，无端口、userinfo、query、fragment 或重定向，不接受任意 Base URL、
+  非官方中转站或国外 API；模型名必须匹配
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`，由用户从同地域工作空间确认后填写，V1 不假定
+  `/models` 可用；
+- `DomesticChatAdapter` 是编译期注册的 typed protocol，能力包含
+  `supports_json_object`、`supports_model_list` 和非流式调用；未来新增 DeepSeek
+  官方等国内 provider 时增加显式 adapter/host policy，不建设动态插件系统；
+- 静态 host/字段校验只产生 `connection_policy_validated`，不启用 profile；profile
+  test 必须由用户点击并通过统一 `ProfileTestInput` 确认“可能产生少量费用”，发送
+  最小非流式请求，
+  使用 `response_format={"type":"json_object"}` 且提示词明确包含 `JSON`，验证当前
+  模型访问权和 JSON 能力；`profile_capability_tested` 指纹绑定 endpoint、credential
+  revision、model、`stream=false`、`response_format`、thinking 模式和所有生产 options，
+  任一变化立即失效；
+- 能力测试授权不等于上传真实字幕。独立 `chat_data_consent_revision` 模态框必须列出
+  字幕 cue、标题/元数据、目标/输出语言和自定义提示词，明确不上传音频和可能计费；
+  endpoint、credential、model/profile options 变化后失效；
 - `Translator` 输入规范 cue，输出相同 cue ID 和源哈希的结构化译文；
 - `NoteGenerator` 直接输入原始规范转录，不读取译文；模板固定为“综合总结”
-  “干货提炼”“自定义提示词”，默认输出简体中文；
+  “干货提炼”“自定义提示词”，输出语言默认简体中文但允许任务显式覆盖；
 - `translate` 与 `notes` 都只依赖 `transcribe`，由 worker 独立领取；
-- 结构化响应失败时，翻译只允许一次更小 batch 的受控重试；不得重跑 source/ASR；
+- 结构化响应失败时，翻译只允许一次 retry round：把失败的最多 30-cue batch 拆成
+  至多两个、每个最多 15 cues 的子批；任一子批失败则整份译文不发布；不得重跑
+  source/ASR；
 - 长笔记按 cue 时间顺序做有界 chunk/map/reduce；每块记录首末 cue/时间，map 摘要
   保留 cue 映射，reduce 严格按原顺序合并；
 - 最终笔记的每个时间点引用携带稳定 cue ID，可从 UI 点击并解析回同一规范转录的
-  时间和原文；无法解析的引用不得发布；
-- 可选分支失败使 item `completed_with_warnings`，不遮蔽原文。
+  时间和原文；map 引用必须属于当前 chunk，reduce 引用必须来自显式 citation lineage，
+  无法解析或与 lineage 无关的引用不得发布；
+- 翻译、笔记 map、reduce 和最终调用全部固定 `stream=false`、
+  `response_format={"type":"json_object"}` 和受控 thinking 选项；本地验证空 content、
+  缺失 choices、`finish_reason=length`、拒答/过滤、未知字段、响应字节上限和 schema，
+  最终 Markdown 只由本地 renderer 生成；
+- AI batch 同时受 cue 数和 UTF-8 prompt 字节数限制；单 cue 超过可用 64 KiB prompt
+  预算时返回 `cue_exceeds_ai_prompt_limit`，不截断原文；
+- 可选分支失败使 item `completed_with_warnings`，不遮蔽原文；
+- 自定义提示词按敏感文本处理。默认项和任务快照只保存由 Windows DPAPI 保护的版本化
+  envelope；worker 在 notes attempt 内按需解密。公开 API、任务详情、日志、错误、
+  诊断包、导出、URL 和浏览器存储不返回/记录明文。创建/替换请求和编辑中的输入控件
+  可以短暂包含明文，这是功能必需的数据流，测试不得把它误报为泄漏；
+- 提示词保护器可注入以便跨平台单元测试；Windows 生产启动缺少 DPAPI 时，自定义模板
+  不可入队。旧明文默认项和任务快照在启动迁移中原子转换为 DPAPI envelope 并清空旧
+  字段，记录不含明文的迁移事件；任何一条保护失败则整批回滚并进入
+  `sensitive_snapshot_migration_required`，不执行相关任务；
+- 结构化 NoteDocument/Markdown 保存 `generated_by_ai=true`、task ID、transcript
+  SHA-256、请求模型和响应实际模型，并显示对姓名、数字、专业术语和引用的复核提醒；
+- 数据库升级时归档旧任意 `openai_compatible` connection/profile、清除默认项并失效
+  测试/授权。旧 queued/running 快照在密钥读取和 HTTP 前进入
+  `legacy_chat_endpoint_blocked`，网络与密钥发送次数必须为 0。
 
 ### 后果
 
-- 可更换兼容供应商，且阶段重试成本可控；
-- “兼容”需通过 profile connection test 验证，不能假定所有端点完全相同；
+- 可在 typed contract 下增加其他国内官方供应商，且阶段重试成本可控；
+- `json_object` 只保证语法可解析，不保证字段、cue ID 或引用正确；业务校验始终在
+  本地完成；
+- HTTP 400/401/403/404 停止并修复；只有明确拒绝受理的 429 可按 `Retry-After`
+  有界重试一次。500/503、读取超时、连接中断或其他可能已发送的 POST 进入
+  `chat_submission_unknown`，不得自动重发；用户显式重试 AI 阶段时必须确认可能重复
+  计费。transport retry 与结构失败后的拆批 retry 分别计数；
 - 提示词、响应、token/字符限制和错误必须脱敏并有界；
-- 首个当前修订 AI profile 测试成功后，笔记一次性默认开启且输出简体中文；用户关闭
-  或改语言后不得自行重新覆盖。
+- 首个当前修订 AI profile 能力测试和文本数据授权都成功后，笔记一次性默认开启且
+  输出简体中文；用户关闭或改语言后不得自行重新覆盖。
 
 ### 重审触发器
 
-需要供应商特有结构化输出、离线翻译成为 V1.1，或 POC 表明 chat 翻译无法保持 cue
-结构。
+用户批准其他国内官方 provider、百炼 endpoint/JSON 合同变化、离线翻译成为 V1.1，
+或 POC 表明当前模型无法保持 cue/引用结构。国外 API 或第三方中转站只能经新的用户
+明确决定和 ADR 进入范围。
 
 ## ADR-010：密钥、持久数据与运行缓存三分离
 
@@ -534,6 +634,79 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 
 发行渠道、FFmpeg build configuration、链接方式、启用 codec/库或许可证发生变化。
 
+## ADR-014：实施阈值采用可配置的保守基线，POC 后冻结发布值
+
+状态：Accepted for implementation；Release value pending POC
+关联：FR-004、FR-009、FR-012、FR-013、FR-014、NFR-006、NFR-008
+
+### 背景
+
+THR-001～THR-005 同时阻塞真实适配器、前端合同和 POC，而 POC 又依赖一条可运行的
+实现链。等待全部实测后才写生产路径会形成循环依赖；直接把未经实测的数字宣传为
+发布承诺也不诚实。
+
+### 决定
+
+V1 先使用以下**实施基线**，全部由服务端配置/就绪 API 返回，前端不得重复硬编码：
+
+| ID | 实施基线 |
+|---|---|
+| THR-001 | 媒体 `8 GiB`；字幕 `16 MiB`；metadata `32 KiB`；multipart overhead `128 KiB`；`max_request_bytes=max(media_limit, subtitle_limit)+metadata_limit+overhead_limit` |
+| THR-002 | 腾讯标准 ASR 最长 `5 h`；编码后 OGG/Opus 最多 `96 MiB`。未编码字节 `<=4,500,000` 才走内联 Base64，长度按 `4*ceil(n/3)` 且 `<=6,000,000`；`estimated_request_bytes=binary_bytes+3*base64_bytes+json_envelope_utf8_bytes <=64 MiB`，空 `Data` envelope `<=64 KiB`。更大的合格音频必须走已测试私有 COS；COS 未就绪则本地。provider 查询退避为前 30 秒每 2 秒、至 2 分钟每 5 秒、至 10 分钟每 15 秒、之后每 60 秒，并加 `±20%` jitter，最长不超过 24 小时结果窗口 |
+| THR-003 | 翻译常规批次最多 `30 cues`，结构失败后唯一一次重试最多 `15 cues`；单次 prompt UTF-8 最多 `64 KiB`；笔记 source chunk 最多 `48 KiB`、最多 `24` 个初级 chunk、最多 `4` 层归并；单响应最多 `256 KiB`，同时受 profile context/max-token 限制 |
+| THR-004 | 基准为同机 SQLite 中 `100 tasks / 1 item each`、热缓存、排除上传/导出/外网，创建/列表/详情/取消/重试 p95 `≤250 ms` |
+| THR-005 | 前台运行详情：前 `30 s` 每 `1 s`、至 `2 min` 每 `2 s`、之后每 `5 s`；后台标签每 `15 s`；网络错误按 `2/4/8/16/30 s` 退避；始终单一在途请求，终态停止 |
+
+这些值只授权实现和离线/mock 验收。30–50 视频 POC 必须记录命中率、内存、API 延迟、
+多标签负载、实际费用和失败分布；发布负责人据证据维持或修改数值并记录日期。UI 与
+README 在正式冻结前只能称其为“当前服务限制”，不得承诺永久不变。
+
+### 后果
+
+- 真实实现不再因阈值循环依赖停滞；
+- 所有边界都可集中配置、测试并通过 readiness 展示；
+- 任何 POC 后修改都需更新本 ADR、测试、前端显示和发布记录。
+
+### 重审触发器
+
+POC 完成、供应商硬限制变化、目标硬件/浏览器变化，或本地基准无法满足当前数值。
+
+## ADR-015：供应商凭据使用原子结构化密钥包
+
+状态：Accepted
+关联：FR-002、FR-008、FR-009、NFR-002、NFR-007
+
+### 背景
+
+腾讯云标准 ASR 与 COS 需要 SecretId、SecretKey。V1 不支持无法自动续期的临时 STS
+凭据；百炼使用独立 API Key。数据库现有单一 `credential_ref` 合同适合引用一个
+Credential Manager 条目，但一个不透明拼接字符串无法可靠校验、轮换或脱敏。
+
+### 决定
+
+- `credential_ref` 继续只引用一个 Windows Credential Manager/DPAPI 条目；
+- 腾讯连接条目值是版本化 JSON secret bundle：
+  `{"schema_version":1,"secret_id":"...","secret_key":"..."}`；
+- 阿里云百炼连接使用
+  `{"schema_version":1,"api_key":"..."}`；
+- API 接受 provider 对应的独立 secret fields，但读取时只返回 `has_secret` 和字段是否
+  已配置，不返回值、长度、前后缀或可逆掩码；
+- 任一 secret field 改变都原子替换整个 bundle、递增 connection revision，并使连接
+  测试与云上传授权失效；
+- 发现旧式/畸形条目时不猜测或拼接，标记 `credential_reentry_required`；
+- 数据库、任务快照、日志、诊断包和产物不得保存 bundle 或其中字段。
+
+### 后果
+
+- 保留单一引用模型，同时明确表达双凭据；
+- 不会出现部分轮换导致请求携带新旧凭据的状态；
+- provider 新增凭据字段必须先更新显式 schema，不能塞入任意 JSON。
+
+### 重审触发器
+
+Windows Credential Manager 条目大小不足、需要企业级共享密钥库，或新增 provider
+需要独立权限/轮换周期。
+
 ## 3. 跨 ADR 不变量
 
 以下规则不得由单个适配器自行改变：
@@ -549,6 +722,8 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 - 密钥不进入数据库、API、日志或产物；
 - 原始云响应不持久化；provider log ID 只能脱敏、限长并按审计字段保存；
 - 本地 ASR 默认只能经用户明确批准和 ADR 更新后改变；
+- V1 所有云模型调用只到已审计的国内官方 endpoint；国外 API、任意中转站和动态
+  provider URL 均不在允许列表；
 - 用户原件不修改、不删除；
 - 所有长任务只在 worker 执行；
 - 任何未测得的速度、准确率和成本都保持“待验证”。
@@ -562,27 +737,29 @@ muxer 或媒体封装。发布冻结对实际随包 artifact 运行 `-version/-b
 | ADR-003 | schema、不可变写入与按需导出已实现 | 后续只扩展调用链 |
 | ADR-004 | 选择/逐条字幕校验原语已实现；真实平台调用未接通 | Task 3C |
 | ADR-005 | 仅输入 URL/DNS 预检与 source protocol 基础已实现；`trust_env=false` transport、逐连接 DNS pin、受控 redirect、yt-dlp 网络边界、`yt-dlp-ejs`/Deno 受控运行链和平台 adapter 均未实现；当前环境缺 EJS/Deno | Task 3C/6 |
-| ADR-006 | FFmpeg 云音频原语部分已实现；火山 eligibility/HTTP、完整 header/body、`X-Api-Status-Code` 分类、响应映射与 logid 审计未实现 | Task 3C |
+| ADR-006 | FFmpeg 云音频原语部分已实现；腾讯 TC3/Create/Query、Base64/COS 路由、持久到期查询、取消后协调、结果映射与临时云对象治理未实现 | Tasks 8–11、22 |
 | ADR-007 | 测试/上传授权修订与任务快照已实现；worker 远程副作用状态未实现 | Task 3C |
 | ADR-008 | 依赖与 `large-v3-turbo/int8_float16/VAD` 默认快照已实现；当前 `device:auto` 尚未落实“GPU 必需、CPU 不静默回退”，实际模型加载/单并发转录未实现 | Task 3C |
-| ADR-009 | `summary/key_points/custom` 内部值、`zh-Hans`、一次性自动启用和阶段依赖已实现；中文 UI 标签、chat 调用、顺序分块/cue 引用与产物生成未实现 | Task 4/5 |
+| ADR-009 | `summary/key_points/custom` 内部值、`zh-Hans`、一次性自动启用和阶段依赖已实现；百炼 canonical workspace、能力测试/文本授权、旧 endpoint 隔离、chat unknown、顺序 JSON 分块/citation lineage 与产物生成未实现 | Tasks 12–15、17–20 |
 | ADR-010 | 路径、keyring、回收与清理原语大部已实现；监督/完整清理流程待集成 | Task 3C/6 |
 | ADR-011 | 当前无插件/Cookie 实现，符合 | 持续安全门禁 |
 | ADR-012 | 后端导出纯函数与 API 已实现；网站下载交互未实现 | Task 5 |
 | ADR-013 | 当前开发 FFmpeg build 已只读审计；发行 artifact/SBOM/NOTICE 尚未冻结 | Task 6/7 |
 
-该表是 2026-07-24 的代码审计快照，不是路线图完成声明。
+该表是 2026-07-28 的代码审计快照，不是路线图完成声明。
 
 ## 5. 发布前必须关闭的技术问题
 
 1. 30–50 视频 POC 尚未运行：云/本地质量、RTF、成本和平台覆盖无结果；
-2. 火山引擎完整 header/body、`X-Api-Status-Code` 分类、二进制/Base64/内存硬限制、
-   语言 eligibility 和超时值需以真实样本冻结；
+2. 腾讯云标准 ASR 的 TC3/Create/Query、Base64/COS 分流、权限、轮询/24 小时恢复、
+   临时对象删除需实现；已冻结 `zh_en_dialects` 范围的质量、未知元数据提示和超时值
+   需以真实样本验证；
 3. 已批准的 faster-whisper 默认与 GPU/CUDA 支持矩阵需实测验证；改变默认需用户批准；
 4. worker 租约时长、心跳、启动恢复和关机取消策略需故障注入；
 5. Bilibili/YouTube adapter pin 升级与验收语料的维护责任需指定；yt-dlp/EJS/Deno
    D 盘资产、哈希、solver、禁远程 component 和 SBOM 门禁需验证；
-6. chat provider 的最大输入、结构化输出与一次小 batch 重试合同需测试；
+6. 阿里云百炼北京工作空间的最大输入、`json_object`、错误分类与一次小 batch
+   重试合同需测试；
 7. Windows 启动器、静态深链、日志轮转、回收恢复，以及实际 FFmpeg、
    yt-dlp/EJS/Deno、其他依赖/模型 artifact 的许可证清单需完成；
 8. 外部供应商接口、价格、区域和数据保留需在发布日重新核验

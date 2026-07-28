@@ -2,9 +2,10 @@
 
 状态：已审计的产品调研基线
 Owner：VtNote 产品/技术负责人
-证据截止：2026-07-24（Asia/Shanghai）
+证据截止：2026-07-28（Asia/Shanghai）
 范围：`product-requirements.md`、`website-specification.md`、
-`technical-decisions.md` 和 `reference-projects.md` 使用的外部事实
+`technical-decisions.md`、`reference-projects.md` 和
+`superpowers/plans/2026-07-28-vtnote-v1-completion.md` 使用的外部事实
 
 本登记把“观察到的事实”和“VtNote 决策”分开。链接只证明发布者在访问日公开陈述的
 内容。价格、模型名、限制、平台支持与 “Latest” 徽标都可能变化，实现、发布或采购前
@@ -22,7 +23,9 @@ Owner：VtNote 产品/技术负责人
   upstream commit 或与任何 GitHub release 等价；
 - 用户提供的网页或私有会话只登记为输入；未经一手来源交叉核对或无法读取正文时，
   不升级为事实证据；
-- 本次调研没有复制 BiliNote 或其他第三方源码。
+- 用户自己的私有 Biji 仓库已在获得访问权后做只读 commit-bound 审计；没有复制其
+  源码。该仓库当前未见 LICENSE，VtNote 只借鉴公开给本任务的职责/流程并独立实现；
+- 本次调研没有复制 BiliNote、Biji 或其他项目源码。
 
 ## 来源登记
 
@@ -67,11 +70,33 @@ Owner：VtNote 产品/技术负责人
 | [SRC-037](https://github.com/denoland/deno/releases/tag/v2.8.1) | Deno v2.8.1 release | Windows x64 发行资产、校验文件和固定版本入口 | 固定 release；运行兼容仍需 POC | 中 | 2026-07-24 |
 | [SRC-038](https://github.com/denoland/deno/blob/main/LICENSE.md) | Deno license | MIT 许可证 | default branch；发布时随固定 artifact 再留证 | 低 | 2026-07-24 |
 | [SRC-039](https://docs.deno.com/runtime/getting_started/installation/) | Deno 官方安装文档 | Windows 可手动取得单文件 runtime；安装目录和 `DENO_DIR` 缓存可显式改到受控位置 | 文档高波动；VtNote 不运行在线安装脚本 | 高 | 2026-07-24 |
+| [SRC-040](https://github.com/lycohana/BiliSum) | BiliSum 仓库 | Bilibili/YouTube/本地输入、worker、AI 摘要与知识库方向的产品/架构对照 | default branch 访问日快照；不固定 Latest | 高 | 2026-07-28 |
+| [SRC-041](https://github.com/wendy7756/AI-Video-Transcriber) | AI Video Transcriber 仓库 | 字幕优先、faster-whisper 后备、OpenAI-compatible 配置与移动端 UI 表达 | default branch 访问日快照；Apache-2.0 | 高 | 2026-07-28 |
+| [SRC-042](https://github.com/yt-dlp/yt-dlp/wiki/EJS) | yt-dlp EJS 官方 wiki | YouTube 完整支持需要外部 JS runtime 与匹配的 `yt-dlp-ejs`；Deno 推荐且默认启用；运行时远程 component 是可选路径 | 2026-07-28 页面；接口高波动 | 很高 | 2026-07-28 |
+| [SRC-043](https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/utils.py) | faster-whisper model registry | `large-v3-turbo` 当前映射到 `mobiuslabsgmbh/faster-whisper-large-v3-turbo`，该仓库现重定向到 Dropbox Dash canonical model | faster-whisper 1.2.1 行为需由固定测试复核 | 高 | 2026-07-28 |
+| [SRC-044](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo/tree/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf) | Dropbox Dash Hugging Face model revision | CTranslate2 `large-v3-turbo` 模型文件、MIT model card 与固定 revision；HF API 的 LFS metadata 给出 `model.bin` 大小/SHA-256 | 固定 revision；下载可用性仍需安装门禁 | 中 | 2026-07-28 |
+| [SRC-045](https://github.com/Liwj-0106/Biji) | 用户的 Biji 私有仓库 | 字幕优先、腾讯 `CreateRecTask`、32 kbps/10 分钟切片、ResultDetail 映射和 OpenAI-compatible 摘要流程的只读参考 | 审计 commit `6b09f600bc767a8fa26efce9f5e03a85c9fab841`；未见 LICENSE | 高 | 2026-07-28 |
+| [SRC-046](https://cloud.tencent.com/document/product/1093/37823) | 腾讯云 CreateRecTask | 标准录音文件识别、API 3.0、5 MB 本地数据/5 小时 1 GB URL、`16k_zh_en_2.0` 中英粤/方言范围、Base64/DataLen、字幕格式、COS 推荐与创建错误码 | 中国站；页面 2026-07-21 更新 | 很高 | 2026-07-28 |
+| [SRC-047](https://cloud.tencent.com/document/product/1093/37822) | 腾讯云 DescribeTaskStatus | 异步等待/执行/成功/失败、TaskId 24 小时输入、`NoSuchTask` 与查询错误合同 | 中国站；页面 2025-09-12 更新；高波动 API | 很高 | 2026-07-28 |
+| [SRC-048](https://cloud.tencent.com/document/product/1093/37824) | 腾讯云 ASR 数据结构 | TaskId 为 uint64、24 小时有效且可跨日期重复；任务状态与 ResultDetail/AudioDuration | 中国站；页面 2026-07 更新 | 很高 | 2026-07-28 |
+| [SRC-049](https://cloud.tencent.com/document/product/1093/35682) | 腾讯云 ASR 产品功能 | `16k_zh_en_2.0` 大模型 2.0、中英/方言范围、最长时长和服务时效 | 中国站；页面 2026-07-23 更新 | 很高 | 2026-07-28 |
+| [SRC-050](https://cloud.tencent.com/document/product/1093/35686) | 腾讯云 ASR 计费 | 标准版/极速版/大模型计费类别、免费额度、后付费默认开关和访问日价格 | CNY、中国站；价格/账户高波动 | 很高 | 2026-07-28 |
+| [SRC-051](https://cloud.tencent.com/document/api/1093/35640) | 腾讯云 ASR 公共参数 | TC3 公共 header、version、region 与签名时间边界 | 中国站；API 高波动 | 很高 | 2026-07-28 |
+| [SRC-052](https://cloud.tencent.com/document/product/436/35153) | 腾讯云 COS 预签名 URL | 私有对象可生成有界单对象临时 URL；建议最小权限/短有效期 | 中国站；页面 2026-06-11 更新 | 很高 | 2026-07-28 |
+| [SRC-053](https://cloud.tencent.com/document/api/436/17028) | 腾讯云 COS 生命周期 | 桶生命周期可作为临时对象漏删兜底；按日规则不是应用级精确 24 小时倒计时 | 中国站；按实际桶配置复核 | 高 | 2026-07-28 |
+| [SRC-054](https://pypi.org/project/cos-python-sdk-v5/1.9.44/) | 腾讯云 COS Python SDK | 当前审计发行包、Python SDK 依赖与版本入口 | `1.9.44`；发布时锁 hash/license | 高 | 2026-07-28 |
+| [SRC-055](https://help.aliyun.com/zh/model-studio/text-generation) | 阿里云百炼文本生成 | 华北 2 工作空间 OpenAI-compatible Chat Completions、Bearer API Key 和调用形状 | 中国站/北京工作空间；模型高波动 | 很高 | 2026-07-28 |
+| [SRC-056](https://help.aliyun.com/en/model-studio/qwen-structured-output) | Qwen 结构化输出 | `response_format={"type":"json_object"}`、提示词必须包含 JSON、支持模型清单 | 中国站模型；清单高波动 | 很高 | 2026-07-28 |
+| [SRC-057](https://help.aliyun.com/zh/model-studio/regions/) | 百炼地域与 endpoint | 工作空间专属北京 endpoint 与地域隔离 | 中国站；区域合同高波动 | 很高 | 2026-07-28 |
+| [SRC-058](https://help.aliyun.com/zh/model-studio/get-api-key/) | 百炼 API Key | 工作空间/API Key 获取与权限边界 | 中国站；账户相关 | 很高 | 2026-07-28 |
+| [SRC-059](https://help.aliyun.com/en/model-studio/error-code) | 百炼错误码 | HTTP/业务错误、限流和结构化输出与思考模式冲突 | 中国站；接口高波动 | 很高 | 2026-07-28 |
+| [SRC-060](https://api-docs.deepseek.com/zh-cn/) | DeepSeek 官方 API | 国内官方 Chat Completions 的后续适配候选；不进入 V1 | 中国官方服务；模型/合同高波动 | 高 | 2026-07-28 |
 
 ### 来源使用映射
 
 缩写：P=`product-requirements.md`，W=`website-specification.md`，
 T=`technical-decisions.md`，R=`reference-projects.md`，
+C=`superpowers/plans/2026-07-28-vtnote-v1-completion.md`，
 S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/T 的已审计
 结论使用；页面规格不自行扩大供应商声明。
 
@@ -80,9 +105,9 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 | SRC-001 | R, S | SRC-014 | T, R |
 | SRC-002 | R | SRC-015 | P, W, T, R |
 | SRC-003 | P, W, T, R | SRC-016 | P, W, T, R |
-| SRC-004 | P, T, R | SRC-017 | P, W, T, R |
+| SRC-004 | P, T, R, C | SRC-017 | P, W, T, R, C |
 | SRC-005 | P, T, R | SRC-018 | P, T, R |
-| SRC-006 | P, T, R | SRC-019 | R |
+| SRC-006 | P, T, R, C | SRC-019 | R |
 | SRC-007 | R | SRC-020 | R |
 | SRC-008 | P, T, R | SRC-021 | R |
 | SRC-009 | R | SRC-022 | R |
@@ -90,13 +115,23 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 | SRC-011 | R | SRC-024 | R |
 | SRC-012 | P, T, R | SRC-025 | R |
 | SRC-013 | T, R | SRC-026 | R |
-| SRC-027 | P, T, R, S | SRC-030 | R, S |
-| SRC-028 | P, T, R | SRC-031 | R |
+| SRC-027 | P, T, R, S, C | SRC-030 | R, S |
+| SRC-028 | P, T, R, C | SRC-031 | R |
 | SRC-029 | R, S | SRC-032 | R |
 | SRC-033 | R, S | SRC-034 | R |
-| SRC-035 | P, W, T, R, S | SRC-036 | P, W, T, R, S |
-| SRC-037 | P, W, T, R, S | SRC-038 | T, R, S |
-| SRC-039 | P, W, T, R, S |  |  |
+| SRC-035 | P, W, T, R, S, C | SRC-036 | P, W, T, R, S, C |
+| SRC-037 | P, W, T, R, S, C | SRC-038 | T, R, S, C |
+| SRC-039 | P, W, T, R, S, C | SRC-040 | R |
+| SRC-041 | R | SRC-042 | P, W, T, R, C |
+| SRC-043 | P, T, R, C | SRC-044 | P, T, R, C |
+| SRC-045 | T, R, C | SRC-046 | P, W, T, R, C |
+| SRC-047 | P, W, T, R, C | SRC-048 | P, W, T, R, C |
+| SRC-049 | P, W, T, R, C | SRC-050 | P, W, T, R |
+| SRC-051 | P, T, C | SRC-052 | P, W, T, R, C |
+| SRC-053 | P, W, T, R, C | SRC-054 | T, R, C |
+| SRC-055 | P, W, T, R, C | SRC-056 | P, W, T, R, C |
+| SRC-057 | P, W, T, R, C | SRC-058 | P, W, T, R, C |
+| SRC-059 | P, W, T, R, C | SRC-060 | T, R |
 
 ## 本地证据登记
 
@@ -115,6 +150,9 @@ S=`.superpowers/sdd/task-product-docs-report.md`。W 中的外部事实通过 P/
 | LOCAL-011 | `D:\ProgramData\Anaconda3\envs\vtnote\Library\bin\ffmpeg.exe -version/-buildconf` | 本机开发环境为 FFmpeg 7.1.1；configure 含 `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-shared --disable-static`，未见 `--enable-nonfree`，所以该开发构建按 GPL v3+ 审计，不能代表未来发行构建。 |
 | LOCAL-012 | 2026-07-24 审查会话的一次“不继承环境代理”的 YouTube 只读直连探测 | 在当前中国网络环境中超时；这是单次环境观察，不证明 YouTube 平台永久不可用，也不构成成功率或地区支持结论。V1 的 `trust_env=false` 是由该观察与安全设计导出的产品合同，并非对当次探测客户端实现的反向描述。 |
 | LOCAL-013 | `vtnote` Conda 环境 `pip show yt-dlp-ejs`、`Get-Command node/deno` | 当前未安装 `yt-dlp-ejs` 或 Deno；只发现 C 盘系统 Node。它不能作为未来发行依赖，也不能证明当前环境具备完整 YouTube 支持。 |
+| LOCAL-014 | `D:\Workspace\Codex\cache\VtNote-biji-audit\Biji` | 从用户私有仓库只读 clone 的 commit `6b09f600...`；`tencent_asr.py` 使用 SDK Create/Query，`audio.py` 使用 10 分钟 32 kbps MP3 切片，`llm.py` 使用任意中转 endpoint；测试未证明 live Windows 全链。 |
+| LOCAL-015 | `D:\Workspace\Codex\cache\VtNote-tencent-cos-sdk-audit` | 官方 COS Python SDK 允许注入 caller session；默认 `requests.session()` 会继承环境代理，VtNote 必须传入 `trust_env=False` session、禁重定向/重试/调试日志。 |
+| LOCAL-016 | `D:\Workspace\Codex\cache\VtNote-tencent-api-sdk-audit` | 官方 TencentCloud Python SDK 的 HTTP 层会在未指定 proxy 时读取 `HTTP(S)_PROXY` 环境；VtNote 的 direct-only 合同因此采用自有 TC3 signer + httpx，而不是默认 SDK transport。 |
 
 ## 用户输入登记
 
@@ -210,4 +248,8 @@ VtNote 必须显示所选 provider/profile 与上传授权状态，不能承诺�
   闸门验证；
 - Argos Translate 仅是 V1.1 候选；语言对模型包质量与再分发义务尚未验证；
 - INPUT-002 的私有会话正文尚未取得；用户提供正文前不得把其内容写入结论；
-- 本次审计中的 OpenAI 事实仅来自上表所列 OpenAI 官方网页，访问日期为 2026-07-24。
+- 腾讯 ASR/COS 与百炼模型/endpoint/价格/结果保留仍须在用户实际账户和发布日复核；
+- Biji 只提供实现思路交叉核验；它没有耐久 worker、COS 长文件路径、敏感信息边界或
+  足以替代 VtNote 合同测试的 live 证据；
+- V1 不调用 OpenAI、AssemblyAI 等国外模型 API；历史来源继续保留用于说明为什么
+  不应从旧调研误推当前实现。

@@ -2,7 +2,7 @@
 
 状态：已审计基线
 Owner：VtNote 产品/技术负责人
-证据截止：2026-07-24
+证据截止：2026-07-28
 完整来源：[research-sources.md](research-sources.md)
 
 ## 1. 结论先行
@@ -15,8 +15,11 @@ Owner：VtNote 产品/技术负责人
   `yt-dlp-ejs`/Deno 运行链，不直接移植 BiliNote downloader。
 - 本地 ASR 采用 VtNote 自有 faster-whisper adapter；WhisperX、VideoLingo 和 Argos
   是后续候选/工程参考，不进入 V1 依赖。
-- BibiGPT、Videosays、AssemblyAI、OpenAI 和火山引擎用于产品/服务对照，不代表 V1
-  集成承诺。
+- 用户的 Biji 仓库用于交叉核验腾讯 `CreateRecTask`、音频压缩和长文本总结流程；
+  VtNote 不复制其源码，也不采用明文配置、固定切片、任意中转 endpoint 或同步进程内
+  pipeline。
+- V1 云 ASR 固定腾讯云标准录音文件识别；翻译/笔记固定阿里云百炼北京工作空间。
+  腾讯极速版、DeepSeek 官方、火山、OpenAI 和 AssemblyAI 只作后续/历史对照。
 - 用户提供的 `https://www.bilinote.net/` 是高波动商业/内测营销输入；其身份、版本
   和代码与 upstream/local BiliNote 的关系均未核实，不能混同。
 
@@ -27,11 +30,14 @@ Owner：VtNote 产品/技术负责人
 用于回答“用户能完成什么、如何呈现、商业/隐私边界如何表达”：
 
 - BiliNote；
+- BiliSum；
+- AI Video Transcriber；
 - 用户提供的 BiliNote Pro `.net` 营销页（身份未核实）；
 - BibiGPT；
 - Videosays；
 - VideoLingo（既是开源项目，也体现完整产品工作流）；
-- AssemblyAI、OpenAI、火山引擎（ASR 服务对照）。
+- 腾讯云标准/极速版、阿里云百炼、DeepSeek 官方、火山、OpenAI、AssemblyAI
+  （服务对照；后四项不进入 V1）。
 
 ### 2.2 可复用组件候选
 
@@ -104,7 +110,7 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 | YouTube downloader/subtitle | 适配重写 | 通过固定 yt-dlp/EJS/Deno 运行链的 VtNote adapter 实现 | 不复制平台代码，统一错误、安全与运行时边界 |
 | Bilibili downloader/subtitle | 仅参考 | 用 yt-dlp adapter + 平台语料合同测试 | BiliNote 路径依赖网站接口/Cookie，非官方稳定合同 |
 | `local_downloader.py` | 适配重写 | 浏览器上传与受信本机路径分开，原件只读 | VtNote 已有自己的安全上传/本地校验 |
-| transcriber base/factory | 适配重写 | 显式 `Transcriber`，编译期注册 Volc/local 两项 | 不采用动态 provider/plugin 工厂 |
+| transcriber base/factory | 适配重写 | 显式 `Transcriber`，编译期注册 Tencent Recording/local 两项 | 不采用动态 provider/plugin 工厂 |
 | `whisper.py` / model UI | 仅参考 | 自有 lazy faster-whisper adapter 与 D 盘模型目录 | schema、取消、provenance、资源门禁不同 |
 | `services/note.py` 一体流水线 | 拒绝 | source/transcribe/translate/notes 分阶段 | 单体流程不利于阶段重试、平行可选分支和恢复 |
 | `task_serial_executor.py` | 拒绝 | SQLite lease/heartbeat 独立 worker | 进程内状态无法满足重启恢复 |
@@ -138,6 +144,23 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 - 暴露 uploads/本机路径或使用宽松 CORS；
 - 为追求功能数量加入 RAG、截图、多模态或配音。
 
+### 3.5 用户 Biji 仓库专项审计
+
+审计对象是用户提供的私有仓库 `Liwj-0106/Biji`，只读 commit
+`6b09f600bc767a8fa26efce9f5e03a85c9fab841`。仓库未见 LICENSE，因此本次只借鉴
+职责和测试思路，不复制实现。
+
+| Biji 观察 | VtNote 采用边界 |
+|---|---|
+| `CreateRecTask`/`DescribeTaskStatus`、SecretId/SecretKey、ResultDetail 时间戳映射 | 采用同一腾讯标准产品方向；独立实现 TC3 direct-only transport、持久 TaskId 和严格结果校验 |
+| 16 kHz mono、32 kbps、10 分钟 MP3 切片 | 采用 16 kHz mono/32 kbps 思路；不采用固定切片，长音频走私有 COS 保留整段上下文 |
+| 字幕优先，无字幕才下载音频 | 与 VtNote 已有核心不变量一致 |
+| 同步 CLI/pipeline 与 `tempfile.TemporaryDirectory()` | 不采用；VtNote 使用 D 盘 runtime、SQLite lease/heartbeat、崩溃恢复和可恢复回收 |
+| 腾讯 SDK 默认 transport | 不直接采用；默认 SDK 会读取环境代理，VtNote 自有 TC3 + `httpx(trust_env=False)` |
+| `ai-hub.vivi-x.ai`、`x-bf-vk`、TOML 明文 API Key | 拒绝；非官方中转站不进入 V1，密钥只在 Credential Manager |
+| 按字符分块、模型直接输出 Markdown/时间字符串 | 只借鉴顺序分块；VtNote 要求 JSON、cue exact-set、引用解析和本地 Markdown 渲染 |
+| `_segments_from_result_text` 按最后一个冒号取秒 | 拒绝；无法可靠处理小时/分钟，VtNote 只接受结构化 ResultDetail 时间戳 |
+
 ## 4. 产品/商业服务对照
 
 ### 4.1 能力对照
@@ -146,10 +169,13 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 |---|---|---|---|
 | BiliNote | 上游仓库描述多平台链接、本地视频、Whisper、AI 笔记等（[SRC-001](https://github.com/JefferyHcool/BiliNote)） | 本地部署 + 多阶段结果对用户有价值 | 只作 UX/架构反例审计 |
 | BiliNote Pro `.net` | 用户提供页面的高波动营销陈述；与 upstream 明示的 `.app` 关系未知 | 商业落地页可提示用户期待，但不能证明组件能力、版本或来源 | 单独登记、不采用、不据此扩大 V1 |
+| BiliSum | 仓库展示 Bilibili/YouTube/本地输入、worker、摘要、图文笔记与知识库（[SRC-040](https://github.com/lycohana/BiliSum)） | worker 分层、配置隔离和可重跑笔记值得对照 | 仅参考；Electron、扫码登录、截图/VLM、多 ASR 与知识库超出 V1 |
+| AI Video Transcriber | 仓库展示字幕优先、faster-whisper 后备、OpenAI-compatible 和移动端页面（[SRC-041](https://github.com/wendy7756/AI-Video-Transcriber)） | 清楚向用户解释“原生字幕或 ASR”路径 | 仅参考；不采用其同步单流水线或以 Markdown 代替规范原文 |
 | BibiGPT | 官方文档列出多平台与本地文件；产品强调转录、摘要、思维导图/聊天（[平台文档](https://docs.bibigpt.co/getting-started/bibigpt-supported-platforms)、[产品页](https://bibigpt.co/)） | 用户期待“一次提交后直接获得可用知识产物” | V1 只做转录、可选翻译/笔记，不做导图/RAG |
 | Videosays | 官方页支持公开链接、时间戳、TXT/SRT/VTT，并说明私有/登录/地区内容可能不可访问（[官网](https://videosays.com/)） | 输入边界和人类复核提示应直白 | 作为公开链接 UX/错误口径参考 |
 | VideoLingo | 开源流程覆盖字幕切分、翻译、对齐和配音（[仓库](https://github.com/Huanshere/VideoLingo)） | 展示了高级本地化链路的价值与复杂度 | 仅参考；对齐/配音是 Later |
-| 火山引擎 ASR | 极速版为单请求录音文件识别，当前合同见[官方文档](https://docs.volcengine.com/docs/6561/1631584?lang=zh) | 中文云端 ASR 可作为本地后备前的加速路径 | V1 唯一云 ASR，质量/成本待 POC |
+| 腾讯云标准录音文件识别 | `CreateRecTask + DescribeTaskStatus` 支持大模型 2.0、字幕时间戳和任务恢复（[官方文档](https://cloud.tencent.com/document/product/1093/37823)） | 中文/中英云端 ASR 可作为本地后备前的高质量路径 | V1 唯一云 ASR；小文件内联、大文件私有 COS，质量/成本待 POC |
+| 阿里云百炼/Qwen | 北京工作空间支持官方 Chat Completions 与 `json_object`（[文本生成](https://help.aliyun.com/zh/model-studio/text-generation)、[结构化输出](https://help.aliyun.com/en/model-studio/qwen-structured-output)） | 适合 cue JSON 与笔记 JSON，中间结果可本地严格验证 | V1 唯一 chat provider；模型由用户填写并测试 |
 | OpenAI Audio | 官方 reference 按模型限制响应格式与时间戳能力（[API reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)） | provider 能力必须按具体模型测试，不能按 endpoint 联集猜测 | 研究对照，不进入 V1 ASR |
 | AssemblyAI | 官方提供 async/stream/sync 与商业 self-hosted（[价格](https://www.assemblyai.com/pricing/)、[自托管](https://www.assemblyai.com/deployments/self-hosted)） | 云端、自托管和开源本地是不同采购/部署类别 | 研究对照，不进入 V1 |
 
@@ -160,7 +186,7 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 - AssemblyAI 价格页在 2026-07-24 显示 Universal-3.5 Pro async USD 0.21/小时、
   Universal-2 USD 0.15/小时；这只用于量级对照，税费、附加能力、区域与合同另计，
   发布/采购前必须重查。
-- 火山引擎价格、额度和促销以用户当前中国区控制台/合同为准；本文不把营销价写入
+- 腾讯云与百炼价格、额度和促销以用户当前中国区控制台/合同为准；本文不把营销价写入
   V1 成本承诺。
 - OpenAI 的输入/输出格式、模型和数据控制按 endpoint/account 变化；不使用历史报告
   的统一格式或统一保留期描述。
@@ -172,9 +198,10 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 
 | 候选 | 中文/区域适配 | 提交模型 | 时间戳 | 保留/隐私核验 | 工程量观察 | 成本验证方式 | 决定 |
 |---|---|---|---|---|---|---|---|
-| 火山极速版 | 中国区产品；普通话、中英混合及 profile 语言 eligibility 进入真实 POC | [官方极速版](https://docs.volcengine.com/docs/6561/1631584?lang=zh)：16 kHz mono OGG/Opus → JSON `audio.data` Base64 → 同步单请求；固定 resource 与 `model_name` | 官方响应含 utterance/word 时间；映射到规范 cue | endpoint TTL 不作公开承诺；按账户合同/DPA、区域与上传授权复核 | 当前 FFmpeg 原语与单请求路径最贴合；仍需 eligibility、unknown outcome 和审计实现 | 相同样本记录控制台/账单、编码后与 Base64 字节、请求数、每分钟实际成本 | **V1 provisional**；质量、隐私和成本过 POC/合同门禁后才发布 |
-| OpenAI Audio | 中文和目标地区可用性按账户/模型实测，不从“全球 API”推断采购资格 | [官方 reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)为 multipart file 请求，当前 guide 记录 25 MB 文件边界；格式随模型变化 | word/segment 能力随模型与 response format 变化 | 当前 [data-control](https://platform.openai.com/docs/models/default-usage-policies-by-endpoint) 表需按 endpoint/account/ZDR eligibility 复核，不把默认不训练写成从不保留 | 直接请求不等于低风险；仍需模型 capability、错误、授权、规范映射合同 | 相同样本记录 usage/账单和请求失败；发布日重查定价，不以目录价预排名 | 仅 POC/研究对照，不进入 V1 provider |
-| AssemblyAI | [region guide](https://www.assemblyai.com/docs/pre-recorded-audio/select-the-region)记录 US 默认与 EU async endpoint；中文/混合语质量须实测 | [submit API](https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit)：本地上传或可访问 URL，pre-recorded async 提交后 poll/webhook | [transcript schema](https://www.assemblyai.com/docs/api-reference/transcripts/get?explorer=true)含 word/utterance 时间字段 | [async TTL/训练说明](https://www.assemblyai.com/docs/data-retention-and-model-training)、删除、opt-out 和 EU 条件均依账户/合同，采购时逐项留证 | 多出 upload/URL、异步状态、poll/webhook、删除生命周期合同 | 相同样本记录账单/usage、成功秒数、附加能力和区域费用；不跨产品猜价 | 仅 POC/研究对照，不进入 V1 provider |
+| 腾讯标准录音文件识别 2.0 | 中国区产品；中英混合/方言与 profile eligibility 进入真实 POC | [CreateRecTask](https://cloud.tencent.com/document/product/1093/37823)：小文件 Base64；大文件私有 COS URL；异步 TaskId 查询 | `ResTextFormat=3` 的 ResultDetail 句/词时间；严格映射到规范 cue | 结果 24 小时；COS 私有对象 6 小时 URL、终态删除、1 天生命周期兜底；账户合同另验 | 一任务可恢复且整段上下文；增加 COS 权限/清理合同，但不做切片 | 相同样本记录 ASR 账单、COS 请求/存储、编码字节、请求数和未知提交 | **V1 provisional**；质量、隐私和成本过 POC/合同门禁后才发布 |
+| 腾讯极速版 | 中国区同步直接二进制，100 MB/2 小时；当前列大模型 1.0 | [官方极速版](https://cloud.tencent.com/document/product/1093/52097) | 句/词时间戳 | 无可查询 TaskId；响应丢失后结果不可恢复 | 首次集成最小且最快，但不符合耐久 worker 付费防重目标 | 只做合同/可选 POC，不自动竞速 | 后续显式 adapter 候选，不进入 V1 |
+| OpenAI Audio | 历史报告中的国外服务 | [官方 reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)仅用于纠正旧报告中的格式误读 | 不进入实现映射 | 地域/保留不符合当前“国内 API only”范围 | 不实现、不联调 | 不产生调用或费用 | 历史文献对照；用户未改变决定前禁止调用 |
+| AssemblyAI | 历史报告中的 US/EU 服务 | 官方 async/schema 页面仅用于纠正旧报告 | 不进入实现映射 | 地域不符合当前“国内 API only”范围 | 不实现、不联调 | 不产生调用或费用 | 历史文献对照；用户未改变决定前禁止调用 |
 
 ## 5. 开源组件对照
 
@@ -184,7 +211,7 @@ Bilibili/抖音/快手/YouTube、faster-whisper、Markdown/时间轴/AI 摘要�
 | yt-dlp-ejs | yt-dlp 的 YouTube 外部 JavaScript solver（[PyPI](https://pypi.org/project/yt-dlp-ejs/)） | 初始研究 pin `0.8.0`，须与 yt-dlp 一起过 POC | wheel 为 Unlicense、MIT、ISC 组件组合 | **直接依赖**；本地 wheel，禁止运行时远程 component |
 | Deno | 执行 yt-dlp-ejs 的受支持 JavaScript runtime（[安装文档](https://docs.deno.com/runtime/getting_started/installation/)） | 初始研究 pin `2.8.1` Windows x64 | MIT（[LICENSE](https://github.com/denoland/deno/blob/main/LICENSE.md)） | **受控运行时**；D 盘单文件和 cache，不用系统 Node 兜底 |
 | youtube-transcript-api | 通过非官方 YouTube Web 行为取得字幕（[仓库](https://github.com/jdepoix/youtube-transcript-api)、[PyPI](https://pypi.org/project/youtube-transcript-api/)） | PyPI 访问日为 `1.2.4` | MIT；但许可证不提供平台合同 | **仅参考/不采用**：YouTube-only，并增加第二套网络、安全、IP-block 与漂移合同 |
-| faster-whisper | CTranslate2 本地 ASR、CPU/GPU（[仓库](https://github.com/SYSTRAN/faster-whisper)） | VtNote pin `1.2.1` | MIT（[LICENSE](https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE)） | **直接依赖**，自有 adapter |
+| faster-whisper | CTranslate2 本地 ASR、CPU/GPU（[仓库](https://github.com/SYSTRAN/faster-whisper)） | VtNote pin `1.2.1`；`large-v3-turbo` 固定到 [Dropbox Dash revision](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo/tree/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf) | MIT（[LICENSE](https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE)）；模型 card 标 MIT | **直接依赖**，自有 adapter + 显式 D 盘模型安装 |
 | CTranslate2 | faster-whisper 推理后端 | VtNote pin `4.8.1` | 分发前按锁文件与官方 license 复核 | faster-whisper 的固定依赖 |
 | WhisperX | 强制对齐、word timestamps、可选 diarization（[仓库](https://github.com/m-bain/whisperX)） | [PyPI](https://pypi.org/project/whisperx/)稳定版访问日显示 `3.8.6`；`3.8.7rc1` 为预发布 | BSD-2-Clause（[LICENSE](https://github.com/m-bain/whisperX/blob/main/LICENSE)） | V1 不依赖；Later POC |
 | Argos Translate | 离线翻译与语言包（[PyPI](https://pypi.org/project/argostranslate/)） | 访问日显示 `1.11.0` | MIT 或 CC0 双许可 | V1.1 中英包候选 |
@@ -248,7 +275,10 @@ FFmpeg [legal 页面](https://ffmpeg.org/legal.html)与
 - 固定且经发行审计的 FFmpeg/FFprobe 二进制；直接复用，不自研 codec/封装；
 - BiliNote 的创建/进度/历史/设置仅作 UX 参考；
 - VideoLingo 的阶段拆解仅作 Later 参考；
-- 火山极速版作为唯一云 ASR，等待 POC 门禁。
+- 腾讯云标准录音文件识别作为唯一云 ASR，小文件 Base64、大文件私有 COS，等待 POC
+  门禁；
+- 阿里云百炼北京工作空间作为唯一 chat provider；协议适配器显式可替换，但 V1 不开放
+  任意 endpoint。
 
 ### V1.1 评估
 
@@ -263,6 +293,7 @@ FFmpeg [legal 页面](https://ffmpeg.org/legal.html)与
 - BiliNote 进程内 serial executor 和 monolithic note pipeline；
 - youtube-transcript-api 作为第二条 YouTube 生产网络路径；
 - 动态插件系统；
-- AssemblyAI/OpenAI 作为 V1 ASR provider；
+- 腾讯极速版、火山、AssemblyAI/OpenAI 作为 V1 ASR provider；
+- 国外模型 API、任意 Chat Base URL、非官方中转站；
 - RAG、聊天、配音、烧录、说话人分离、硬字幕 OCR；
 - 任何登录、会员、DRM、地区限制绕过。

@@ -1,5 +1,60 @@
 # VtNote implementation log
 
+## 2026-07-28
+
+### Domestic-provider V1 decision and plan alignment
+
+- Froze V1 external model calls to domestic services only. Tencent Cloud standard Recording File
+  Recognition is the sole compiled cloud ASR adapter, and Aliyun Bailian's official China
+  (Beijing) workspace endpoint is the sole compiled chat adapter. OpenAI compatibility describes
+  only Bailian's wire protocol and does not authorize an OpenAI or arbitrary relay endpoint.
+- Chose Tencent `CreateRecTask` plus `DescribeTaskStatus` so a returned task ID can be persisted and
+  recovered without repeating a paid submission. Encoded OGG/Opus files at or below 4,500,000 bytes
+  use inline Base64; larger eligible files use a short-lived URL for a private, app-owned COS
+  object in `ap-guangzhou`.
+- Defined `submission_unknown` for a crash or timeout before a Tencent task ID is durably known.
+  The worker never automatically resubmits that paid request; local ASR remains available, while
+  any cloud resubmission requires an explicit possible-duplicate-charge acknowledgement.
+- Audited the user's private `Liwj-0106/Biji` repository read-only from commit
+  `6b09f600bc767a8fa26efce9f5e03a85c9fab841`. Its Tencent request/polling and audio-normalization
+  flow informed the boundary review, but no source was copied; its synchronous in-process pipeline,
+  chunking workaround, and arbitrary relay-style LLM client were not adopted.
+- Closed independent contract-review findings before implementation: Tencent COS is deleted
+  immediately only after a known provider terminal state; cancellation/unknown submission defers
+  cleanup until provider completion or URL expiry plus grace. A persistent one-query-per-claim
+  reconciler prevents a 24-hour cloud wait from monopolizing the main worker.
+- Simplified Tencent credentials to long-lived SecretId/SecretKey in a least-privilege subaccount,
+  fixed COS to `ap-guangzhou`, defined the `zh_en_dialects` scope and official error-code mapping,
+  and replaced the unreliable silent profile test with a user-authorized short speech sample.
+- Added deterministic quarantine for legacy Volc/arbitrary chat configurations, separate static
+  policy validation/profile capability testing/audio-or-text data consent, Bailian ambiguous-POST
+  no-retry behavior, UTF-8 request limits, JSON at every AI layer, citation lineage, and AI
+  provenance/review labels.
+- Updated the product, technical, website, source/reference, traceability, and remaining-plan
+  documents to this provider decision. This entry records research and planning only; production
+  source, tests, dependencies, runtime configuration, credentials, and user data were not changed
+  or deleted by this documentation pass.
+
+### Remaining-scope research and implementation-plan refresh
+
+- Re-audited the current code boundary at `e4a8fdf`: Tasks 1, 2, 3A, and 3B foundations exist;
+  durable worker execution, live platform adapters, cloud/local ASR calls, AI processing, React,
+  launcher, and release qualification remain.
+- Refreshed external reference evidence for BiliNote, BiliSum, AI Video Transcriber, yt-dlp
+  EJS/Deno, faster-whisper, and Volc Flash. No third-party source was copied.
+- Added ADR-014 with conservative server-owned implementation limits that unblock test-first
+  implementation while keeping final release values gated by the 30–50 item POC.
+- Added ADR-015: Volc `api_key` and AppKey are one versioned atomic Credential Manager secret
+  bundle referenced by the database; changing either field invalidates test/upload consent.
+- Replaced the oversized remaining work description with
+  `docs/superpowers/plans/2026-07-28-vtnote-v1-completion.md`: 25 independently testable/reviewable
+  tasks covering lifecycle evidence, durable worker, secure source transport, yt-dlp/EJS/Deno,
+  Bilibili/YouTube, Volc/local ASR, AI, React, supervisor, maintenance, release evidence, offline
+  fault injection, and authorized live POC.
+- This entry records research and planning only. No production source, tests, dependencies,
+  environment, project configuration, or user data were changed or deleted in this documentation
+  pass.
+
 ## 2026-07-24
 
 ### Product-document final external-contract review
