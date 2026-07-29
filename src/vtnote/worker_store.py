@@ -29,6 +29,7 @@ from vtnote.pipeline import (
     SUCCESSFUL_STAGE_STATUSES,
     aggregate_item_status,
     aggregate_task_status,
+    validate_execution_evidence,
 )
 
 
@@ -68,10 +69,34 @@ class StageClaim:
 class StageResult:
     status: str = "completed"
     warning: str | None = None
+    item_title: str | None = None
+    execution_evidence: Mapping[str, str] | None = None
+    skip_stages: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in {"completed", "skipped"}:
             raise ValueError("stage result status must be completed or skipped")
+        if self.item_title is not None and (
+            not isinstance(self.item_title, str)
+            or not self.item_title.strip()
+            or len(self.item_title) > 4096
+        ):
+            raise ValueError("invalid stage result item title")
+        if (
+            not isinstance(self.skip_stages, tuple)
+            or len(self.skip_stages) != len(set(self.skip_stages))
+            or any(stage not in STAGE_ORDER for stage in self.skip_stages)
+        ):
+            raise ValueError("invalid stage result skip stages")
+        if self.execution_evidence is not None:
+            normalized = validate_execution_evidence(self.execution_evidence)
+            object.__setattr__(
+                self,
+                "execution_evidence",
+                MappingProxyType(dict(normalized)),
+            )
+        if self.item_title is not None:
+            object.__setattr__(self, "item_title", self.item_title.strip())
 
 
 @dataclass(frozen=True)
@@ -359,6 +384,21 @@ class WorkerStore:
             assert row is not None
             row.status = result.status
             row.warning = sanitize_diagnostic(result.warning)
+            if result.item_title is not None:
+                row.item.title = result.item_title
+            if result.execution_evidence is not None:
+                row.execution_evidence_json = dict(result.execution_evidence)
+            if result.skip_stages:
+                if row.stage != "source" or result.skip_stages != ("transcribe",):
+                    session.rollback()
+                    return False
+                latest = self._latest_by_stage(row.item)
+                transcribe = latest.get("transcribe")
+                if transcribe is None or transcribe.status != "queued":
+                    session.rollback()
+                    return False
+                transcribe.status = "skipped"
+                transcribe.finished_at = now
             row.finished_at = now
             row.lease_owner = None
             row.lease_expires_at = None

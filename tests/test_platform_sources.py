@@ -705,3 +705,38 @@ def test_controlled_operations_authorize_only_the_current_extraction_resource(
         operations.fetch_resource(str(first_url), max_bytes=1024)
     assert caught.value.code == "adapter_drift"
     assert len(transport.calls) == 1
+
+
+def test_controlled_download_publishes_complete_target_via_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = copy.deepcopy(BILIBILI_INFO)
+    audio_url = "https://audio.hdslb.com/bfs/audio/example.webm"
+    info["formats"] = [
+        {
+            "url": audio_url,
+            "ext": "webm",
+            "acodec": "opus",
+            "vcodec": "none",
+        }
+    ]
+    bridge = FakeControlledBridge(info)
+    monkeypatch.setattr(
+        platform_sources_module,
+        "build_controlled_platform_ytdlp",
+        lambda *args, **kwargs: bridge,
+    )
+    transport = FakePinnedTransport(b"complete audio")
+    operations = ControlledYtDlpOperations(
+        platform="bilibili",
+        transport=transport,  # type: ignore[arg-type]
+        output_root=tmp_path,
+    )
+    operations.extract("https://www.bilibili.com/video/BV1xx411c7mD")
+    target = tmp_path / "downloaded.webm"
+
+    operations.download_resource(audio_url, target, max_bytes=1024)
+
+    assert target.read_bytes() == b"complete audio"
+    assert list(tmp_path.glob("*.partial")) == []

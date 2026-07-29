@@ -16,7 +16,10 @@ from pathlib import Path
 
 from vtnote.paths import StoragePaths
 from vtnote.schemas import (
+    Provenance,
+    ProvenanceMethod,
     Transcript,
+    TranscriptSegment,
     Translation,
     canonical_transcript_bytes,
     canonical_translation_bytes,
@@ -93,6 +96,16 @@ def _ensure_immutable(paths: StoragePaths, destination: Path, data: bytes) -> Pa
 def validate_source_subtitle(extension: str, data: bytes) -> None:
     """Validate source bytes without writing a durable artifact."""
 
+    if not parse_source_subtitle(extension, data):
+        raise ValueError("source subtitle contains no cues")
+
+
+def parse_source_subtitle(
+    extension: str,
+    data: bytes,
+) -> tuple[TranscriptSegment, ...]:
+    """Parse validated source bytes into canonical, chronological segments."""
+
     normalized = extension.casefold()
     try:
         text = data.decode("utf-8-sig")
@@ -109,11 +122,10 @@ def validate_source_subtitle(extension: str, data: bytes) -> None:
             payload = json.loads(text)
         except json.JSONDecodeError as error:
             raise ValueError("source subtitle JSON is invalid") from error
-        cues = _validated_json_cues(payload)
+        cues = _json_segments(payload)
     else:
         raise ValueError("unsupported source subtitle format")
-    if not cues:
-        raise ValueError("source subtitle contains no cues")
+    return tuple(cues)
 
 
 def _finite_number(value: object) -> bool:
@@ -150,6 +162,60 @@ def _validated_json_cues(payload: object) -> list[object]:
         ):
             return cues
     return []
+
+
+def _json_segments(payload: object) -> list[TranscriptSegment]:
+    cues = _validated_json_cues(payload)
+    if not cues:
+        return []
+    bili = isinstance(payload, dict) and payload.get("body") is cues
+    segments: list[TranscriptSegment] = []
+    for index, raw in enumerate(cues, start=1):
+        assert isinstance(raw, dict)
+        if bili:
+            start_ms = round(float(raw["from"]) * 1000)
+            end_ms = round(float(raw["to"]) * 1000)
+            text = str(raw["content"]).strip()
+        else:
+            start_ms = round(float(raw["start_ms"]))
+            end_ms = round(float(raw["end_ms"]))
+            text = str(raw["text"]).strip()
+        segments.append(
+            TranscriptSegment(
+                id=f"seg_{index:06d}",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                text=text,
+            )
+        )
+    return segments
+
+
+def transcript_from_source_subtitle(
+    extension: str,
+    data: bytes,
+    *,
+    language: str,
+    method: ProvenanceMethod,
+    provider: str,
+    duration_ms: int | None = None,
+) -> Transcript:
+    """Build the sole canonical transcript representation from source bytes."""
+
+    segments = parse_source_subtitle(extension, data)
+    if not segments:
+        raise ValueError("source subtitle contains no cues")
+    covered_duration = max(segment.end_ms for segment in segments)
+    return Transcript(
+        language=language,
+        duration_ms=max(covered_duration, duration_ms or 0),
+        provenance=Provenance(
+            method=method,
+            provider=provider,
+            model=None,
+        ),
+        segments=segments,
+    )
 
 
 def write_note_markdown(

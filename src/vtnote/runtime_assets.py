@@ -32,6 +32,15 @@ RUNTIME_ASSET_ROLES = frozenset(
     }
 )
 PURGE_BLOCKING_STATUSES = frozenset({"queued", "running", "cancel_requested"})
+_RECOVERABLE_AUDIO_EXTENSIONS = (
+    "wav",
+    "mp3",
+    "m4a",
+    "flac",
+    "ogg",
+    "opus",
+    "webm",
+)
 
 
 class RuntimeAssetError(ValueError):
@@ -284,6 +293,37 @@ class RuntimeAssetService:
         self.resolve(rows[0].id)
         return self._view(rows[0])
 
+    def recover_downloaded_audio(
+        self,
+        *,
+        item_id: str,
+    ) -> RuntimeAssetView | None:
+        """Recover exactly one canonical audio handoff after an interrupted stage."""
+
+        active = self.active_for_role(item_id=item_id, role="downloaded_audio")
+        if active is not None:
+            return active
+        restored = self.restore_trashed_for_role(
+            item_id=item_id,
+            role="downloaded_audio",
+        )
+        if restored is not None:
+            return restored
+        candidates = tuple(
+            path
+            for extension in _RECOVERABLE_AUDIO_EXTENSIONS
+            if (path := self.paths.downloaded_audio(item_id, extension)).is_file()
+        )
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise RuntimeAssetError("ambiguous_downloaded_audio")
+        return self.register_staged(
+            item_id=item_id,
+            role="downloaded_audio",
+            relative_path=self.paths.runtime_relative(candidates[0]),
+        )
+
     def discard_empty_conversion_staging(
         self, *, item_id: str, staging_id: str, extension: str
     ) -> None:
@@ -371,6 +411,13 @@ class RuntimeAssetService:
             raise RuntimeAssetError("invalid_asset_state")
         self._verify(row, selected)
         return selected
+
+    def get(self, asset_id: str) -> RuntimeAssetView:
+        """Return one verified asset without exposing its ORM record."""
+
+        row = self._load(asset_id)
+        self.resolve(row.id)
+        return self._view(row)
 
     def trash(self, asset_id: str, *, now: datetime | None = None) -> RuntimeAssetView:
         row = self._load(asset_id)

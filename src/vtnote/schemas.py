@@ -14,6 +14,8 @@ class ProvenanceMethod(str, Enum):
     """Stable transcript acquisition methods in the v1 artifact contract."""
 
     PLATFORM_SUBTITLE = "platform_subtitle"
+    UPLOADED_SUBTITLE = "uploaded_subtitle"
+    LOCAL_SUBTITLE = "local_subtitle"
     CLOUD_ASR = "cloud_asr"
     LOCAL_ASR = "local_asr"
 

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Literal, Protocol, cast
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 from yt_dlp.utils import ExtractorError
 
@@ -854,8 +855,14 @@ class ControlledYtDlpOperations:
     ) -> None:
         response = self._request(resource_url, max_bytes=max_bytes)
         written = 0
+        destination_path = Path(target)
+        staging = destination_path.with_name(
+            f".{destination_path.name}.{uuid4()}.partial"
+        )
         try:
-            with Path(target).open("xb") as destination:
+            if destination_path.exists():
+                raise YtDlpOperationFailure("invalid_content")
+            with staging.open("xb") as destination:
                 for chunk in response:
                     written += len(chunk)
                     if written > max_bytes:
@@ -863,6 +870,7 @@ class ControlledYtDlpOperations:
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
+            os.rename(staging, destination_path)
         except YtDlpOperationFailure:
             raise
         except TransportSecurityError:

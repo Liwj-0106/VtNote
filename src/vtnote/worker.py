@@ -16,6 +16,21 @@ class StageCancelled(RuntimeError):
     """Raised at a cooperative checkpoint after cancellation is persisted."""
 
 
+class StageExecutionError(RuntimeError):
+    """A handler failure represented by a closed safe machine code."""
+
+    def __init__(self, code: str) -> None:
+        if (
+            not isinstance(code, str)
+            or not code
+            or len(code) > 64
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in code)
+        ):
+            raise ValueError("invalid stage execution error code")
+        self.code = code
+        super().__init__(code)
+
+
 class StageHandler(Protocol):
     def run(self, context: StageContext) -> StageResult: ...
 
@@ -94,6 +109,15 @@ class Worker:
                 result = handler.run(context)
             except StageCancelled:
                 continue
+            except StageExecutionError as error:
+                self.store.fail(
+                    claim,
+                    StageFailure(
+                        error_code=error.code,
+                        error_message=error.code,
+                    ),
+                    now=self.clock(),
+                )
             except Exception as error:
                 self.store.fail(
                     claim,
