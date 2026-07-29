@@ -256,7 +256,6 @@ class RetryInput(InputModel):
             "cloud_profile_id",
             "connection_revision",
             "profile_revision",
-            "acknowledge_possible_charge",
         }
         if self.strategy == "cloud_confirmed":
             if (
@@ -272,6 +271,10 @@ class RetryInput(InputModel):
         elif self.model_fields_set & cloud_fields:
             raise ValueError(
                 "cloud retry fields are valid only for cloud_confirmed"
+            )
+        elif self.strategy == "local" and self.acknowledge_possible_charge:
+            raise ValueError(
+                "possible-charge acknowledgement is invalid for local retry"
             )
         return self
 

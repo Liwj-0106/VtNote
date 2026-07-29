@@ -423,3 +423,25 @@
 - Added deterministic reduce grouping with a four-level maximum. Every map citation must exactly match a cue in its source chunk; every reduce citation must also descend from a child citation, preventing a later model call from inventing unrelated transcript evidence.
 - Added a strict note schema with task/transcript hash, template/language, requested and actual model, cited summary, and cited key points. Markdown is rendered locally with stable cue IDs, human-readable time ranges, AI provenance, and a warning to verify names, numbers, terminology, and citations.
 - Cancellation and all schema/filter/truncation/unknown-submission/oversize failures stop without replay or partial publication. Only a fully validated document is atomically written. The full suite passed with 708 tests; no real model request was sent.
+
+### Task 15: durable optional AI stage orchestration
+
+- Added independent translation and notes worker handlers after the immutable transcript stage.
+  Each handler reads only the task snapshot, verifies the exact Bailian profile/test capability and
+  revision-bound text-data consent against SQLite, and performs no secret-store or network access
+  when that authorization is missing or stale.
+- Production handler construction now shares one strict Bailian credential resolver while keeping
+  translation and notes as separate durable branches. Custom prompts are unprotected only inside
+  the concrete notes attempt, remain user-data rather than system instructions, and are absent from
+  the generated Markdown.
+- Added artifact-aware crash recovery. A valid source-hash-bound translation or note metadata file
+  published before a process loss completes the recovered attempt without a duplicate model call;
+  a conflicting or corrupt artifact fails closed.
+- Persisted `chat_submission_unknown`, a possible-duplicate-charge warning, and a closed safe error
+  code. Automatic replay remains prohibited. An explicit AI retry creates only a new AI attempt,
+  keeps the immutable task snapshot, and requires a durable `charge_acknowledged=true` override.
+  Source and transcription attempts and artifacts are not rerun or replaced.
+- Optional branch failures preserve the original transcript and any successful sibling result,
+  aggregating to `completed_with_warnings`. Focused AI orchestration, configuration, retry, API, and
+  worker-transition coverage uses only scripted clients; no real model request or credential was
+  used.

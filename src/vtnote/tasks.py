@@ -54,6 +54,7 @@ class RetryOverrideSnapshot(TypedDict, total=False):
     schema_version: Literal[1]
     strategy: Literal["same", "local", "cloud_confirmed"]
     asr: dict[str, Any]
+    charge_acknowledged: bool
 
 
 class LocalSourceValidator(Protocol):
@@ -205,14 +206,23 @@ class TaskService:
                 cloud_profile_id is not None
                 or connection_revision is not None
                 or profile_revision is not None
-                or acknowledge_possible_charge
             ):
                 raise InvalidTaskOperation(
                     "cloud retry fields are valid only for cloud_confirmed"
                 )
             if strategy == "same":
+                payload: dict[str, Any] = {
+                    "schema_version": 1,
+                    "strategy": "same",
+                }
+                if acknowledge_possible_charge:
+                    payload["charge_acknowledged"] = True
                 return self._bounded_retry_override(
-                    {"schema_version": 1, "strategy": "same"}
+                    payload
+                )
+            if acknowledge_possible_charge:
+                raise InvalidTaskOperation(
+                    "possible-charge acknowledgement is invalid for local retry"
                 )
             return self._bounded_retry_override(
                 {
@@ -262,12 +272,20 @@ class TaskService:
         if type(schema_version) is not int or schema_version != 1:
             raise InvalidTaskOperation("invalid retry override schema")
         if strategy == "same":
-            if set(override) != {"schema_version", "strategy"}:
+            if set(override) not in (
+                {"schema_version", "strategy"},
+                {"schema_version", "strategy", "charge_acknowledged"},
+            ) or (
+                "charge_acknowledged" in override
+                and override.get("charge_acknowledged") is not True
+            ):
                 raise InvalidTaskOperation("invalid same retry override")
             normalized: dict[str, Any] = {
                 "schema_version": 1,
                 "strategy": "same",
             }
+            if override.get("charge_acknowledged") is True:
+                normalized["charge_acknowledged"] = True
         elif strategy == "local":
             if set(override) != {"schema_version", "strategy", "asr"}:
                 raise InvalidTaskOperation("invalid local retry override")
@@ -953,9 +971,9 @@ class TaskService:
                     raise InvalidTaskOperation(
                         "cloud retry requires acknowledging the possible charge"
                     )
-            elif acknowledge_possible_charge:
+            elif strategy == "local" and acknowledge_possible_charge:
                 raise InvalidTaskOperation(
-                    "possible-charge acknowledgement is valid only for cloud_confirmed"
+                    "possible-charge acknowledgement is invalid for local retry"
                 )
             if strategy in {"local", "cloud_confirmed"} and stage != "transcribe":
                 raise InvalidTaskOperation(
@@ -1003,18 +1021,43 @@ class TaskService:
                     "only a failed or canceled stage can be retried"
                 )
             submission_unknown = (
-                stage == "transcribe"
-                and latest_attempt.external_submission_state == "submission_unknown"
+                latest_attempt.external_submission_state == "submission_unknown"
             )
-            if submission_unknown and strategy == "same":
-                raise InvalidTaskOperation(
-                    "submission_unknown requires an explicit local or "
-                    "cloud_confirmed retry"
+            if stage == "transcribe":
+                if submission_unknown and strategy == "same":
+                    raise InvalidTaskOperation(
+                        "submission_unknown requires an explicit local or "
+                        "cloud_confirmed retry"
+                    )
+                if strategy == "cloud_confirmed" and not submission_unknown:
+                    raise InvalidTaskOperation(
+                        "cloud_confirmed is valid only for submission_unknown"
+                    )
+                if strategy == "same" and acknowledge_possible_charge:
+                    raise InvalidTaskOperation(
+                        "possible-charge acknowledgement is not valid for this retry"
+                    )
+            elif stage in {"translate", "notes"}:
+                if strategy != "same":
+                    raise InvalidTaskOperation(
+                        "AI stages can only retry the immutable task snapshot"
+                    )
+                charge_acknowledged = (
+                    normalized_override.get("charge_acknowledged") is True
+                    and acknowledge_possible_charge is True
                 )
-            if strategy == "cloud_confirmed" and not submission_unknown:
-                raise InvalidTaskOperation(
-                    "cloud_confirmed is valid only for submission_unknown"
-                )
+                if submission_unknown and not charge_acknowledged:
+                    raise InvalidTaskOperation(
+                        "AI submission has an unknown outcome; acknowledge the "
+                        "possible charge before retrying"
+                    )
+                if not submission_unknown and (
+                    acknowledge_possible_charge
+                    or normalized_override.get("charge_acknowledged") is True
+                ):
+                    raise InvalidTaskOperation(
+                        "possible-charge acknowledgement is not valid for this retry"
+                    )
             latest_by_stage: dict[str, StageRunRecord] = {}
             for run in item.stage_runs:
                 previous = latest_by_stage.get(run.stage)

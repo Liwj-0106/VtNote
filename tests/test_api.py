@@ -1079,13 +1079,6 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
             "item_id": "item",
             "stage": "transcribe",
             "expected_attempt": 1,
-            "strategy": "same",
-            "acknowledge_possible_charge": True,
-        },
-        {
-            "item_id": "item",
-            "stage": "transcribe",
-            "expected_attempt": 1,
             "strategy": "local",
             "cloud_profile_id": "profile",
         },

@@ -38,7 +38,13 @@ class StageCancelled(RuntimeError):
 class StageExecutionError(RuntimeError):
     """A handler failure represented by a closed safe machine code."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        external_submission_state: str | None = None,
+        warning: str | None = None,
+    ) -> None:
         if (
             not isinstance(code, str)
             or not code
@@ -46,7 +52,11 @@ class StageExecutionError(RuntimeError):
             or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in code)
         ):
             raise ValueError("invalid stage execution error code")
+        if external_submission_state not in {None, "submission_unknown"}:
+            raise ValueError("invalid external submission state")
         self.code = code
+        self.external_submission_state = external_submission_state
+        self.warning = warning
         super().__init__(code)
 
 
@@ -206,6 +216,8 @@ class Worker:
                     StageFailure(
                         error_code=error.code,
                         error_message=error.code,
+                        external_submission_state=error.external_submission_state,
+                        warning=error.warning,
                     ),
                     now=self.clock(),
                 )

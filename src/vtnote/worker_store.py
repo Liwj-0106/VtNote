@@ -111,10 +111,14 @@ class StageResult:
 class StageFailure:
     error_code: str
     error_message: str
+    external_submission_state: str | None = None
+    warning: str | None = None
 
     def __post_init__(self) -> None:
         if _ERROR_CODE.fullmatch(self.error_code) is None:
             raise ValueError("invalid stage error code")
+        if self.external_submission_state not in {None, "submission_unknown"}:
+            raise ValueError("invalid external submission state")
 
 
 class StageDeferred(RuntimeError):
@@ -176,6 +180,12 @@ class WorkerStore:
         snapshot = row.item.task.pipeline_snapshot_json
         if not isinstance(snapshot, dict):
             return ()
+        if row.stage in {"translate", "notes"}:
+            section_name = "translation" if row.stage == "translate" else "notes"
+            section = snapshot.get(section_name)
+            profile = section.get("profile") if isinstance(section, dict) else None
+            model = profile.get("model") if isinstance(profile, dict) else None
+            return (model,) if isinstance(model, str) else ()
         local = snapshot.get("local_whisper")
         local_model = (
             local.get("model")
@@ -573,6 +583,8 @@ class WorkerStore:
             row.status = "failed"
             row.error_code = failure.error_code
             row.error_message = sanitize_diagnostic(failure.error_message)
+            row.external_submission_state = failure.external_submission_state
+            row.warning = sanitize_diagnostic(failure.warning)
             row.finished_at = now
             row.lease_owner = None
             row.lease_expires_at = None

@@ -6,6 +6,7 @@ import uuid
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -420,9 +421,11 @@ def _chat_capability_fingerprint(
     }
 
 
-def _fingerprint_digest(value: dict[str, Any]) -> str:
+def chat_capability_fingerprint_digest(value: Mapping[str, Any]) -> str:
+    """Return the stable non-secret digest bound to one tested chat capability."""
+
     body = json.dumps(
-        value,
+        dict(value),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -666,7 +669,7 @@ class ConfigurationService:
         chat_data_authorized = (
             capability_fingerprint is not None
             and row.chat_data_authorized_fingerprint
-            == _fingerprint_digest(capability_fingerprint)
+            == chat_capability_fingerprint_digest(capability_fingerprint)
         )
         return ProfileView(
             id=row.id,
@@ -1202,7 +1205,7 @@ class ConfigurationService:
             raise InvalidConfiguration(
                 "chat data authorization requires a current successful capability test"
             )
-        row.chat_data_authorized_fingerprint = _fingerprint_digest(
+        row.chat_data_authorized_fingerprint = chat_capability_fingerprint_digest(
             view.capability_fingerprint
         )
         if row.purpose == "notes":
@@ -1520,6 +1523,21 @@ class ConfigurationService:
             "profile_revision": row.revision,
             "has_secret": has_secret,
         }
+        if connection.protocol == "aliyun_bailian":
+            capability_fingerprint = _chat_capability_fingerprint(row)
+            snapshot["capability_fingerprint"] = (
+                dict(capability_fingerprint)
+                if capability_fingerprint is not None
+                and dict(row.capability_fingerprint_json or {})
+                == capability_fingerprint
+                and row.test_ok is True
+                and row.tested_revision == row.revision
+                and row.tested_connection_revision == connection.revision
+                else None
+            )
+            snapshot["chat_data_consent_fingerprint"] = (
+                row.chat_data_authorized_fingerprint
+            )
         if connection.protocol == "volc_bigasr_flash":
             snapshot["resource"] = "volc.bigasr.auc_turbo"
         return snapshot
