@@ -494,3 +494,19 @@
 - Backed up and removed generated TypeScript build metadata/emitted config files from source
   control; the source tree now ignores those build products. The API/static/launcher focused suite
   passed with 44 tests and no cloud request.
+
+### Task 22: secure logs, maintenance, and diagnostics
+
+- Added per-process rotating JSON logs under the configured D-drive runtime root. Log records are
+  single-line, field-bounded, and redact credential-shaped values, bearer tokens, custom prompts,
+  raw-response fields, and Windows paths before serialization.
+- Added a lease-guarded maintenance loop inside the supervised worker service. Each pass purges due
+  recoverable trash through the existing audited runtime-asset boundary and performs at most one
+  due Tencent query/expiry/COS cleanup action. Provider cleanup resolves the immutable submission
+  stage and never stores credentials in its lease or result state.
+- Added a deterministic metadata-only diagnostic zip and a settings-page download action. The
+  bundle reports only version/platform/storage availability and database reachability; it excludes
+  database rows, credentials, prompts, transcript content, logs, and configured absolute paths.
+- Focused logging, rotation, redaction, diagnostics, maintenance lease, provider worker, and
+  launcher checks passed. Frontend lint and the production build also passed; no live provider
+  request was sent.

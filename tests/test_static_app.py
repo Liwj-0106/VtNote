@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from io import BytesIO
+from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 
@@ -56,6 +58,10 @@ def test_built_spa_is_served_without_capturing_api_or_mutation_routes(
         assert client.get("/docs").status_code == 404
         readiness = client.get("/api/readiness").json()
         assert readiness["ui"] == {"available": True}
+        diagnostics = client.get("/api/diagnostics")
+        assert diagnostics.status_code == 200
+        with ZipFile(BytesIO(diagnostics.content)) as archive:
+            assert archive.namelist() == ["diagnostics.json"]
 
     engine.dispose()
 

@@ -24,6 +24,8 @@ from vtnote.api import create_app
 from vtnote.config import Settings
 from vtnote.database import initialize_database
 from vtnote.local_asr import FasterWhisperTranscriber
+from vtnote.logging_setup import configure_logging
+from vtnote.maintenance import MaintenanceLoop, build_maintenance_service
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.model_assets import ModelAssetService
 from vtnote.paths import StoragePaths
@@ -161,6 +163,9 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
 
 def run_api(settings: Settings) -> int:
     production_settings = settings.model_copy(update={"enable_dev_docs": False})
+    paths = StoragePaths.from_settings(production_settings)
+    paths.ensure_roots()
+    configure_logging(paths.runtime("logs"), process_name="api")
     uvicorn.run(
         create_app(settings=production_settings),
         host=production_settings.bind_host,
@@ -183,6 +188,7 @@ def _manifest_path() -> Path:
 def run_worker(settings: Settings) -> int:
     paths = StoragePaths.from_settings(settings)
     paths.ensure_roots()
+    configure_logging(paths.runtime("logs"), process_name="worker")
     protector = WindowsDpapiSensitiveTextProtector()
     engine = initialize_database(
         paths.database,
@@ -270,12 +276,30 @@ def run_worker(settings: Settings) -> int:
         name="vtnote-model-installer",
         daemon=True,
     )
+    maintenance_service, maintenance_session = build_maintenance_service(
+        engine=engine,
+        paths=paths,
+        secrets=secrets,
+        worker_id=f"maintenance-{uuid4()}",
+    )
+    maintenance = MaintenanceLoop(
+        service=maintenance_service,
+        stop_requested=stop_event.is_set,
+    )
+    maintenance_thread = threading.Thread(
+        target=maintenance.run,
+        name="vtnote-maintenance",
+        daemon=True,
+    )
     installer_thread.start()
+    maintenance_thread.start()
     try:
         worker.run()
     finally:
         stop_event.set()
         installer_thread.join(timeout=5.0)
+        maintenance_thread.join(timeout=5.0)
+        maintenance_session.close()
         asset_session.close()
         engine.dispose()
     return 0
@@ -298,6 +322,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
+    paths = StoragePaths.from_settings(settings)
+    paths.ensure_roots()
+    configure_logging(paths.runtime("logs"), process_name="supervisor")
     try:
         return supervise(settings, stop_requested=stop_event.is_set)
     except LauncherError as error:

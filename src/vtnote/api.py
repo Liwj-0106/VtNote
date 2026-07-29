@@ -23,6 +23,7 @@ from vtnote.config import Settings
 from vtnote.chat import BailianProfileTester
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
+from vtnote.diagnostics import diagnostic_bundle_bytes
 from vtnote.exports import ExportFormat, render_execution_summary
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.model_assets import ModelAssetError, ModelAssetService
@@ -1144,6 +1145,21 @@ def create_app(
             }
         finally:
             session.close()
+
+    @app.get("/api/diagnostics")
+    def download_diagnostics():
+        return Response(
+            diagnostic_bundle_bytes(
+                settings=selected_settings,
+                engine=selected_engine,
+            ),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    'attachment; filename="vtnote-diagnostics.zip"'
+                )
+            },
+        )
 
     @app.get("/api/storage/trash")
     def list_storage_trash():

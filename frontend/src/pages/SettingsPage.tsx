@@ -20,6 +20,7 @@ export function SettingsPage() {
   const [storage, setStorage] = useState<StorageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [downloadingDiagnostics, setDownloadingDiagnostics] = useState(false);
 
   const load = async () => {
     try {
@@ -74,6 +75,26 @@ export function SettingsPage() {
       );
     } finally {
       setSaving(false);
+    }
+  };
+
+  const downloadDiagnostics = async () => {
+    setDownloadingDiagnostics(true);
+    setError(null);
+    try {
+      const blob = await api.download("/api/diagnostics");
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "vtnote-diagnostics.zip";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError ? caught.message : "诊断包生成失败。",
+      );
+    } finally {
+      setDownloadingDiagnostics(false);
     }
   };
 
@@ -145,6 +166,18 @@ export function SettingsPage() {
           </div>
           <ArrowIcon />
         </AppLink>
+        <button
+          className="settings-row settings-link settings-action"
+          type="button"
+          disabled={downloadingDiagnostics}
+          onClick={() => void downloadDiagnostics()}
+        >
+          <div>
+            <h2>诊断包</h2>
+            <p>仅包含版本与可用性信息，不包含密钥、原文或本地路径</p>
+          </div>
+          <span>{downloadingDiagnostics ? "正在生成" : "下载"}</span>
+        </button>
       </div>
 
       {defaults && (

@@ -971,6 +971,14 @@
   background: color-mix(in srgb, var(--sidebar) 52%, transparent);
 }
 
+.settings-action {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
 .readiness-state {
   display: inline-flex;
   align-items: center;
