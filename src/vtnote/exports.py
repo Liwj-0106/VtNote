@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+from typing import Any, Literal
 
 from vtnote.schemas import (
     Transcript,
@@ -77,3 +78,48 @@ def render_export_from_json(
         else None
     )
     return render_export(transcript, export_format, translation)
+
+
+def render_execution_summary(
+    payload: dict[str, Any],
+    export_format: Literal["json", "markdown"] | str,
+) -> str:
+    """Render the sanitized, deterministic execution summary."""
+
+    selected = str(export_format)
+    if selected == "json":
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+    if selected != "markdown":
+        raise ValueError("unsupported execution summary format")
+
+    lines = [
+        "# 执行摘要",
+        "",
+        f"- 任务状态：{payload['task_status']}",
+        f"- 条目状态：{payload['item_status']}",
+        f"- 来源类型：{payload['source_kind']}",
+    ]
+    if payload.get("title"):
+        lines.append(f"- 标题：{payload['title']}")
+    lines.extend(("", "## 处理阶段", ""))
+    for stage in payload["stages"]:
+        lines.append(
+            f"### {stage['stage']} · 第 {stage['attempt']} 次 · {stage['status']}"
+        )
+        if stage.get("warning"):
+            lines.append(f"- 警告：{stage['warning']}")
+        if stage.get("error_code"):
+            lines.append(f"- 错误代码：{stage['error_code']}")
+        evidence = stage.get("execution_evidence")
+        if evidence:
+            details = "，".join(
+                f"{key}={value}" for key, value in sorted(evidence.items())
+            )
+            lines.append(f"- 执行依据：{details}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

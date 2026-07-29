@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -21,12 +21,13 @@ from vtnote.config import Settings
 from vtnote.chat import BailianProfileTester
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
-from vtnote.exports import ExportFormat
+from vtnote.exports import ExportFormat, render_execution_summary
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.model_assets import ModelAssetError, ModelAssetService
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.platform_sources import build_default_platform_registry
-from vtnote.runtime_assets import RuntimeAssetService
+from vtnote.readiness import ReadinessInspector
+from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
 from vtnote.sources import (
     REMOTE_SOURCE_KINDS,
@@ -453,6 +454,17 @@ def create_app(
             "sensitive text protection is unavailable",
         )
 
+    @app.exception_handler(RuntimeAssetError)
+    async def runtime_asset_error(_: Request, error: RuntimeAssetError):
+        status = 404 if error.code == "asset_not_found" else 409
+        if error.code in {"invalid_asset_id", "invalid_item_id"}:
+            status = 400
+        return _error(
+            status,
+            error.code,
+            "runtime asset operation failed",
+        )
+
     async def operation_error(_: Request, error: Exception):
         code = "unsafe_source_url" if isinstance(error, UnsafeSourceUrl) else "invalid_task"
         return _error(400, code, str(error))
@@ -497,6 +509,25 @@ def create_app(
             local_source_validator=selected_local_sources,
         )
         return session, configuration, tasks
+
+    @app.get("/api/health")
+    def health():
+        return {"status": "ok", "service": "vtnote", "version": "0.1.0"}
+
+    @app.get("/api/readiness")
+    def readiness():
+        report = ReadinessInspector(
+            engine=selected_engine,
+            paths=paths,
+            model_probe=lambda: model_assets.status().state,
+        ).inspect()
+        payload = report.model_dump(mode="json")
+        payload["limits"] = {
+            "max_task_sources": 1,
+            "max_media_bytes": selected_upload_limits.max_media_bytes,
+            "max_subtitle_bytes": selected_upload_limits.max_subtitle_bytes,
+        }
+        return payload
 
     @app.get("/api/security/csrf")
     def issue_csrf():
@@ -850,10 +881,27 @@ def create_app(
         }
 
     @app.get("/api/tasks")
-    def list_tasks():
+    def list_tasks(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = None,
+        status: str | None = Query(default=None, min_length=1, max_length=32),
+    ):
         session, _, tasks = services()
         try:
-            return [_dump(item) for item in tasks.list_tasks()]
+            page, next_cursor = tasks.list_tasks_page(
+                limit=limit,
+                cursor=cursor,
+                status=status,
+            )
+            headers = (
+                {"X-Next-Cursor": next_cursor}
+                if next_cursor is not None
+                else None
+            )
+            return JSONResponse(
+                [_dump(item) for item in page],
+                headers=headers,
+            )
         finally:
             session.close()
 
@@ -1019,7 +1067,109 @@ def create_app(
                 ExportFormat.TXT: "text/plain",
                 ExportFormat.MARKDOWN: "text/markdown",
             }
-            return Response(rendered, media_type=content_types[format])
+            extension = "md" if format is ExportFormat.MARKDOWN else format.value
+            filename = f"vtnote-{item_id[:8]}-{variant}.{extension}"
+            return Response(
+                rendered,
+                media_type=content_types[format],
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"'
+                },
+            )
+        finally:
+            session.close()
+
+    @app.get("/api/items/{item_id}/transcript")
+    def get_item_transcript(item_id: str):
+        session, _, tasks = services()
+        try:
+            return _dump(tasks.get_item_transcript(item_id))
+        finally:
+            session.close()
+
+    @app.get("/api/items/{item_id}/translations/{language}")
+    def get_item_translation(item_id: str, language: str):
+        session, _, tasks = services()
+        try:
+            return _dump(tasks.get_item_translation(item_id, language))
+        finally:
+            session.close()
+
+    @app.get("/api/items/{item_id}/notes")
+    def list_item_notes(item_id: str):
+        session, _, tasks = services()
+        try:
+            return tasks.list_item_notes(item_id)
+        finally:
+            session.close()
+
+    @app.get("/api/items/{item_id}/execution-summary")
+    def get_item_execution_summary(
+        item_id: str,
+        format: Literal["json", "markdown"] = "json",
+    ):
+        session, _, tasks = services()
+        try:
+            payload = tasks.item_execution_summary(item_id)
+            if format == "json":
+                return payload
+            return Response(
+                render_execution_summary(payload, "markdown"),
+                media_type="text/markdown",
+            )
+        finally:
+            session.close()
+
+    @app.get("/api/storage")
+    def storage_summary():
+        session = sessions()
+        try:
+            summary = RuntimeAssetService(session, paths).storage_summary()
+            return {
+                "data_root": str(paths.data_root),
+                "runtime_cache_root": str(paths.runtime_cache_root),
+                "retention_hours": 24,
+                **summary,
+            }
+        finally:
+            session.close()
+
+    @app.get("/api/storage/trash")
+    def list_storage_trash():
+        session = sessions()
+        try:
+            assets = RuntimeAssetService(session, paths).list_trashed()
+            return [
+                {
+                    "id": asset.id,
+                    "item_id": asset.item_id,
+                    "role": asset.role,
+                    "state": asset.state,
+                    "size_bytes": asset.size_bytes,
+                    "purge_after": (
+                        asset.purge_after.isoformat()
+                        if asset.purge_after is not None
+                        else None
+                    ),
+                }
+                for asset in assets
+            ]
+        finally:
+            session.close()
+
+    @app.post("/api/storage/trash/{asset_id}/restore")
+    def restore_storage_asset(asset_id: str):
+        session = sessions()
+        try:
+            asset = RuntimeAssetService(session, paths).restore(asset_id)
+            return {
+                "id": asset.id,
+                "item_id": asset.item_id,
+                "role": asset.role,
+                "state": asset.state,
+                "size_bytes": asset.size_bytes,
+                "purge_after": None,
+            }
         finally:
             session.close()
 

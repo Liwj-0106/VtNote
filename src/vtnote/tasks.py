@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
@@ -26,6 +26,7 @@ from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.exports import ExportFormat, render_export_from_json
 from vtnote.models import ItemRecord, RuntimeAssetRecord, StageRunRecord, TaskRecord
 from vtnote.paths import StoragePaths
+from vtnote.schemas import Transcript, Translation
 from vtnote.pipeline import (
     ACTIVE_STAGE_STATUSES as _ACTIVE,
     RETRY_ACTIVE_CONFLICTS as _RETRY_ACTIVE_CONFLICTS,
@@ -75,6 +76,11 @@ class StageView(BaseModel):
     progress: dict[str, Any] | None
     execution_evidence: dict[str, Any] | None
     provider_status_code: str | None
+    external_submission_state: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ItemView(BaseModel):
@@ -87,6 +93,8 @@ class ItemView(BaseModel):
     status: str
     title: str | None
     stage_runs: tuple[StageView, ...]
+    created_at: datetime
+    updated_at: datetime
 
 
 class TaskView(BaseModel):
@@ -96,6 +104,9 @@ class TaskView(BaseModel):
     options: dict[str, Any]
     pipeline_snapshot: dict[str, Any]
     items: tuple[ItemView, ...]
+    terminal_reason_code: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
@@ -114,6 +125,16 @@ _TASK_OPTION_KEYS = frozenset(
     }
 )
 _MAX_RETRY_OVERRIDE_BYTES = 16 * 1024
+_MAX_RESULT_ARTIFACT_BYTES = 32 * 1024 * 1024
+_NOTE_METADATA_KEYS = frozenset(
+    {
+        "generated_by_ai",
+        "template",
+        "output_language",
+        "requested_model",
+        "response_model",
+    }
+)
 
 
 class TaskService:
@@ -452,6 +473,11 @@ class TaskService:
             progress=progress,
             execution_evidence=execution_evidence,
             provider_status_code=provider_status_code,
+            external_submission_state=row.external_submission_state,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )
 
     def _load_task(self, task_id: str) -> TaskRecord:
@@ -492,6 +518,8 @@ class TaskService:
                     key=lambda run: (_STAGE_ORDER.get(run.stage, 99), run.attempt),
                 )
             ),
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )
 
     def _view(self, row: TaskRecord) -> TaskView:
@@ -516,6 +544,9 @@ class TaskService:
             items=tuple(
                 self._view_item(item, sensitive_values) for item in row.items
             ),
+            terminal_reason_code=row.terminal_reason_code,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )
 
     def _profile_snapshot(self, profile_id: str | None, purpose: str) -> dict[str, Any] | None:
@@ -779,11 +810,185 @@ class TaskService:
         return self._view(self._load_task(item.task_id))
 
     def list_tasks(self) -> list[TaskView]:
-        ids = self.session.scalars(select(TaskRecord.id).order_by(TaskRecord.created_at.desc())).all()
+        ids = self.session.scalars(
+            select(TaskRecord.id).order_by(
+                TaskRecord.created_at.desc(),
+                TaskRecord.id.desc(),
+            )
+        ).all()
         return [self._view(self._load_task(task_id)) for task_id in ids]
+
+    def list_tasks_page(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        status: str | None = None,
+    ) -> tuple[list[TaskView], str | None]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise InvalidTaskOperation("task page limit must be between 1 and 100")
+        query = select(TaskRecord.id)
+        if status is not None:
+            if not status or len(status) > 32:
+                raise InvalidTaskOperation("invalid task status filter")
+            query = query.where(TaskRecord.status == status)
+        if cursor is not None:
+            marker = self.session.get(TaskRecord, cursor)
+            if marker is None:
+                raise InvalidTaskOperation("invalid task cursor")
+            query = query.where(
+                (TaskRecord.created_at < marker.created_at)
+                | (
+                    (TaskRecord.created_at == marker.created_at)
+                    & (TaskRecord.id < marker.id)
+                )
+            )
+        ids = list(
+            self.session.scalars(
+                query.order_by(
+                    TaskRecord.created_at.desc(),
+                    TaskRecord.id.desc(),
+                ).limit(limit + 1)
+            ).all()
+        )
+        next_cursor = ids[limit - 1] if len(ids) > limit else None
+        return (
+            [self._view(self._load_task(task_id)) for task_id in ids[:limit]],
+            next_cursor,
+        )
 
     def get_task(self, task_id: str) -> TaskView:
         return self._view(self._load_task(task_id))
+
+    def _require_item(self, item_id: str) -> ItemRecord:
+        item = self.session.scalar(
+            select(ItemRecord)
+            .where(ItemRecord.id == item_id)
+            .options(
+                selectinload(ItemRecord.stage_runs),
+                selectinload(ItemRecord.task),
+            )
+        )
+        if item is None:
+            raise KeyError(item_id)
+        return item
+
+    @staticmethod
+    def _read_result(path: Path) -> bytes:
+        if not path.is_file():
+            raise InvalidTaskOperation("result artifact is not available")
+        try:
+            if path.stat().st_size > _MAX_RESULT_ARTIFACT_BYTES:
+                raise InvalidTaskOperation("result artifact exceeds the read limit")
+            return path.read_bytes()
+        except OSError as error:
+            raise InvalidTaskOperation("result artifact could not be read") from error
+
+    def get_item_transcript(self, item_id: str) -> Transcript:
+        self._require_item(item_id)
+        try:
+            return Transcript.model_validate_json(
+                self._read_result(self.paths.transcript(item_id))
+            )
+        except ValidationError as error:
+            raise InvalidTaskOperation("transcript artifact is invalid") from error
+
+    def get_item_translation(self, item_id: str, language: str) -> Translation:
+        transcript = self.get_item_transcript(item_id)
+        try:
+            translation = Translation.model_validate_json(
+                self._read_result(self.paths.translation(item_id, language))
+            )
+            return translation.validate_against(transcript)
+        except ValidationError as error:
+            raise InvalidTaskOperation("translation artifact is invalid") from error
+        except ValueError as error:
+            raise InvalidTaskOperation("translation artifact does not match transcript") from error
+
+    @staticmethod
+    def _note_metadata(markdown: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        lines = markdown.splitlines()
+        if not lines or lines[0] != "---":
+            return metadata
+        for line in lines[1:]:
+            if line == "---":
+                break
+            key, separator, value = line.partition(":")
+            normalized_key = key.strip()
+            if separator and normalized_key in _NOTE_METADATA_KEYS:
+                normalized_value = value.strip()
+                metadata[normalized_key] = (
+                    normalized_value.casefold() == "true"
+                    if normalized_key == "generated_by_ai"
+                    else normalized_value
+                )
+        return metadata
+
+    def list_item_notes(self, item_id: str) -> list[dict[str, Any]]:
+        self._require_item(item_id)
+        notes_root = self.paths.durable("items", str(UUID(item_id)), "notes")
+        if not notes_root.is_dir():
+            return []
+        notes: list[dict[str, Any]] = []
+        for path in sorted(notes_root.glob("*.md"), key=lambda item: item.name):
+            try:
+                note_id = str(UUID(path.stem))
+            except ValueError:
+                continue
+            owned_path = self.paths.note(item_id, note_id)
+            if path != owned_path:
+                continue
+            try:
+                markdown = self._read_result(owned_path).decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise InvalidTaskOperation("note artifact is not UTF-8") from error
+            notes.append(
+                {
+                    "id": note_id,
+                    "markdown": markdown,
+                    **self._note_metadata(markdown),
+                }
+            )
+        return notes
+
+    def item_execution_summary(self, item_id: str) -> dict[str, Any]:
+        item = self._require_item(item_id)
+        sensitive_values = self.configuration.diagnostic_sensitive_values()
+        view = self._view_item(item, sensitive_values)
+        return {
+            "schema_version": 1,
+            "task_id": item.task_id,
+            "task_status": item.task.status,
+            "item_id": view.id,
+            "item_status": view.status,
+            "title": view.title,
+            "source_kind": view.source_kind,
+            "stages": [
+                {
+                    "stage": stage.stage,
+                    "attempt": stage.attempt,
+                    "status": stage.status,
+                    "error_code": stage.error_code,
+                    "warning": stage.warning,
+                    "progress": stage.progress,
+                    "execution_evidence": stage.execution_evidence,
+                    "provider_status_code": stage.provider_status_code,
+                    "external_submission_state": stage.external_submission_state,
+                    "started_at": (
+                        stage.started_at.isoformat()
+                        if stage.started_at is not None
+                        else None
+                    ),
+                    "finished_at": (
+                        stage.finished_at.isoformat()
+                        if stage.finished_at is not None
+                        else None
+                    ),
+                }
+                for stage in view.stage_runs
+            ],
+        }
 
     def record_stage_failure(
         self, stage_run_id: str, *, error_code: str, message: str

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -418,6 +418,45 @@ class RuntimeAssetService:
         row = self._load(asset_id)
         self.resolve(row.id)
         return self._view(row)
+
+    def list_trashed(self) -> tuple[RuntimeAssetView, ...]:
+        """Return verified trash entries without permitting arbitrary path reads."""
+
+        rows = self.session.scalars(
+            select(RuntimeAssetRecord)
+            .where(RuntimeAssetRecord.state == "trash")
+            .order_by(
+                RuntimeAssetRecord.purge_after.asc(),
+                RuntimeAssetRecord.id.asc(),
+            )
+        ).all()
+        views: list[RuntimeAssetView] = []
+        for row in rows:
+            self.resolve(row.id)
+            views.append(self._view(row))
+        return tuple(views)
+
+    def storage_summary(self) -> dict[str, dict[str, int]]:
+        """Return aggregate managed-cache counts and sizes by lifecycle state."""
+
+        rows = self.session.execute(
+            select(
+                RuntimeAssetRecord.state,
+                func.count(RuntimeAssetRecord.id),
+                func.coalesce(func.sum(RuntimeAssetRecord.size_bytes), 0),
+            ).group_by(RuntimeAssetRecord.state)
+        ).all()
+        totals = {
+            "active": {"count": 0, "size_bytes": 0},
+            "trash": {"count": 0, "size_bytes": 0},
+        }
+        for state, count, size_bytes in rows:
+            if state in totals:
+                totals[state] = {
+                    "count": int(count),
+                    "size_bytes": int(size_bytes),
+                }
+        return totals
 
     def trash(self, asset_id: str, *, now: datetime | None = None) -> RuntimeAssetView:
         row = self._load(asset_id)

@@ -445,3 +445,24 @@
   aggregating to `completed_with_warnings`. Focused AI orchestration, configuration, retry, API, and
   worker-transition coverage uses only scripted clients; no real model request or credential was
   used.
+
+### Task 16: UI-facing read models and local storage controls
+
+- Added read-only health and capability inspection for SQLite, owned storage, FFmpeg, the managed
+  YouTube runtime, CUDA, and the pinned local model. Inspection performs no downloads or setup and
+  returns only typed capability state plus fixed upload limits; credentials and configuration
+  secrets are not included.
+- Added stable cursor pagination for task history and public UTC lifecycle timestamps for tasks,
+  items, and stages. Existing diagnostic redaction remains the only path into stage evidence and
+  warning read models.
+- Added typed transcript, translation, note, and sanitized execution-summary reads. Translation
+  artifacts are revalidated against the immutable transcript, result reads are size-bounded, note
+  files remain UUID-addressed below the item root, and execution summaries omit source locators and
+  configuration snapshots.
+- Added deterministic JSON/Markdown execution-summary rendering and safe ASCII attachment names for
+  on-demand exports.
+- Added aggregate managed-cache status, verified trash listing, and CSRF-protected restore. Public
+  trash records omit relative paths and hashes; restore still uses the existing typed
+  `RuntimeAssetService` boundary and writes its cleanup audit event.
+- Added focused API/readiness tests and ran the complete backend suite: 720 tests passed. No cloud
+  request was sent and no user file was modified or deleted.

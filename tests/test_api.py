@@ -11,16 +11,29 @@ from sqlalchemy.orm import Session
 
 import vtnote.api as api_module
 from vtnote.api import ConnectivityResult, create_app
-from vtnote.artifacts import write_transcript_json
+from vtnote.artifacts import (
+    write_note_markdown,
+    write_transcript_json,
+    write_translation_json,
+)
 from vtnote.config import Settings
 from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
 from vtnote.provider_credentials import BailianCredentialBundle, TencentCredentialBundle
-from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
+from vtnote.schemas import (
+    Provenance,
+    ProvenanceMethod,
+    Transcript,
+    TranscriptSegment,
+    Translation,
+    TranslationEntry,
+    transcript_sha256,
+)
 from vtnote.secrets import MemorySecretStore
 from vtnote.sources import SourceProbeResult, make_subtitle_track
+from vtnote.runtime_assets import RuntimeAssetService
 
 
 BASE_URL = "http://127.0.0.1:8765"
@@ -1065,6 +1078,224 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
 
         canceled = client.post(f"/api/tasks/{task['id']}/cancel", headers=headers)
         assert canceled.status_code == 200
+    finally:
+        engine.dispose()
+
+
+def test_health_readiness_pagination_and_result_read_models(tmp_path: Path) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        health = client.get("/api/health")
+        assert health.status_code == 200
+        assert health.json() == {
+            "status": "ok",
+            "service": "vtnote",
+            "version": "0.1.0",
+        }
+        readiness = client.get("/api/readiness")
+        assert readiness.status_code == 200
+        assert "secret" not in readiness.text.casefold()
+        assert readiness.json()["limits"]["max_task_sources"] == 1
+
+        created_tasks = [
+            client.post(
+                "/api/tasks",
+                headers=headers,
+                json={
+                    "sources": [
+                        {
+                            "kind": "url",
+                            "locator": f"https://youtu.be/read-{index}",
+                        }
+                    ]
+                },
+            ).json()
+            for index in range(3)
+        ]
+        first_page = client.get("/api/tasks?limit=2")
+        assert first_page.status_code == 200
+        assert len(first_page.json()) == 2
+        cursor = first_page.headers["x-next-cursor"]
+        second_page = client.get(f"/api/tasks?limit=2&cursor={cursor}")
+        assert len(second_page.json()) == 1
+        assert {
+            item["id"] for item in first_page.json() + second_page.json()
+        } == {item["id"] for item in created_tasks}
+
+        task = created_tasks[-1]
+        item_id = task["items"][0]["id"]
+        transcript = Transcript(
+            language="en",
+            duration_ms=2_000,
+            provenance=Provenance(
+                method=ProvenanceMethod.PLATFORM_SUBTITLE,
+                provider="youtube",
+            ),
+            segments=(
+                TranscriptSegment(
+                    id="seg_000001",
+                    start_ms=0,
+                    end_ms=1_000,
+                    text="First cue",
+                ),
+                TranscriptSegment(
+                    id="seg_000002",
+                    start_ms=1_000,
+                    end_ms=2_000,
+                    text="Second cue",
+                ),
+            ),
+        )
+        translation = Translation(
+            language="zh-Hans",
+            source_transcript_sha256=transcript_sha256(transcript),
+            entries=(
+                TranslationEntry(cue_id="seg_000001", text="第一句"),
+                TranslationEntry(cue_id="seg_000002", text="第二句"),
+            ),
+        )
+        write_transcript_json(paths, item_id, transcript)
+        write_translation_json(paths, item_id, translation, transcript)
+        note_id = "11111111-1111-4111-8111-111111111111"
+        write_note_markdown(
+            paths,
+            item_id,
+            note_id,
+            "---\n"
+            "generated_by_ai: true\n"
+            f"task_id: {task['id']}\n"
+            f"transcript_sha256: {translation.source_transcript_sha256}\n"
+            "template: summary\n"
+            "output_language: zh-Hans\n"
+            "requested_model: qwen-plus\n"
+            "response_model: qwen-plus\n"
+            "---\n\n# 笔记\n\n内容 [seg_000001 @ 00:00.000–00:01.000]\n",
+        )
+        with Session(engine) as session:
+            item = session.get(ItemRecord, item_id)
+            assert item is not None
+            item.title = "A title with / unsafe : filename"
+            item.status = "completed_with_warnings"
+            item.task.status = "completed_with_warnings"
+            source = next(run for run in item.stage_runs if run.stage == "source")
+            source.status = "completed"
+            transcribe = next(
+                run for run in item.stage_runs if run.stage == "transcribe"
+            )
+            transcribe.status = "completed"
+            transcribe.execution_evidence_json = {
+                "source_method": "platform_subtitle",
+                "provider": "youtube",
+            }
+            transcribe.warning = "safe warning"
+            session.commit()
+
+        task_result = client.get(f"/api/tasks/{task['id']}").json()
+        assert task_result["created_at"]
+        assert task_result["items"][0]["stage_runs"][0]["created_at"]
+        assert (
+            task_result["items"][0]["stage_runs"][1]["execution_evidence"][
+                "source_method"
+            ]
+            == "platform_subtitle"
+        )
+        transcript_response = client.get(f"/api/items/{item_id}/transcript")
+        assert transcript_response.status_code == 200
+        assert transcript_response.json()["segments"][0]["text"] == "First cue"
+        translated_response = client.get(
+            f"/api/items/{item_id}/translations/zh-Hans"
+        )
+        assert translated_response.status_code == 200
+        assert translated_response.json()["entries"][0]["text"] == "第一句"
+        notes_response = client.get(f"/api/items/{item_id}/notes")
+        assert notes_response.status_code == 200
+        assert notes_response.json()[0]["id"] == note_id
+        assert "# 笔记" in notes_response.json()[0]["markdown"]
+
+        summary_json = client.get(
+            f"/api/items/{item_id}/execution-summary?format=json"
+        )
+        assert summary_json.status_code == 200
+        assert summary_json.json()["task_status"] == "completed_with_warnings"
+        assert "source_locator" not in summary_json.text
+        summary_markdown = client.get(
+            f"/api/items/{item_id}/execution-summary?format=markdown"
+        )
+        assert summary_markdown.status_code == 200
+        assert "# 执行摘要" in summary_markdown.text
+        assert "safe warning" in summary_markdown.text
+
+        exported = client.get(
+            f"/api/items/{item_id}/export?variant=original&format=srt"
+        )
+        assert exported.status_code == 200
+        disposition = exported.headers["content-disposition"]
+        assert disposition.startswith('attachment; filename="')
+        assert "/" not in disposition
+        assert ":" not in disposition
+    finally:
+        engine.dispose()
+
+
+def test_storage_trash_list_and_restore_are_typed_and_csrf_protected(
+    tmp_path: Path,
+) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/storage"}
+                ]
+            },
+        ).json()
+        item_id = task["items"][0]["id"]
+        runtime_file = paths.downloaded_audio(item_id, "webm")
+        runtime_file.parent.mkdir(parents=True, exist_ok=True)
+        runtime_file.write_bytes(b"owned")
+        with Session(engine) as session:
+            item = session.get(ItemRecord, item_id)
+            assert item is not None
+            item.status = "completed"
+            item.task.status = "completed"
+            service = RuntimeAssetService(session, paths)
+            asset = service.register_staged(
+                item_id=item_id,
+                role="downloaded_audio",
+                relative_path=paths.runtime_relative(runtime_file),
+            )
+            trashed = service.trash(asset.id)
+            asset_id = trashed.id
+        storage = client.get("/api/storage")
+        assert storage.status_code == 200
+        assert storage.json()["trash"]["count"] == 1
+        trash = client.get("/api/storage/trash")
+        assert trash.status_code == 200
+        assert trash.json() == [
+            {
+                "id": asset_id,
+                "item_id": item_id,
+                "role": "downloaded_audio",
+                "state": "trash",
+                "size_bytes": 5,
+                "purge_after": trash.json()[0]["purge_after"],
+            }
+        ]
+        assert "relative_path" not in trash.text
+        assert client.post(
+            f"/api/storage/trash/{asset_id}/restore"
+        ).status_code == 403
+        restored = client.post(
+            f"/api/storage/trash/{asset_id}/restore",
+            headers=headers,
+        )
+        assert restored.status_code == 200
+        assert restored.json()["state"] == "active"
+        assert runtime_file.read_bytes() == b"owned"
     finally:
         engine.dispose()
 
