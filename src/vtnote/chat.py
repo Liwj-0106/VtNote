@@ -170,6 +170,92 @@ class ChatCapabilities:
     max_response_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class ChatProfileSnapshot:
+    model: str
+    context_length: int
+    temperature: float
+    max_tokens: int
+    enable_thinking: bool
+
+    def __post_init__(self) -> None:
+        validate_chat_model(self.model)
+        if (
+            isinstance(self.context_length, bool)
+            or not isinstance(self.context_length, int)
+            or self.context_length < 32_768
+        ):
+            raise ValueError("invalid chat context length")
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not 0 <= self.temperature <= 2
+        ):
+            raise ValueError("invalid chat temperature")
+        if (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens < 1_024
+            or self.max_tokens >= self.context_length
+        ):
+            raise ValueError("invalid chat max_tokens")
+        if not isinstance(self.enable_thinking, bool):
+            raise ValueError("invalid chat thinking mode")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "ChatProfileSnapshot":
+        if not isinstance(value, Mapping) or value.get("protocol") != "aliyun_bailian":
+            raise ValueError("invalid domestic chat profile snapshot")
+        options = value.get("options")
+        if not isinstance(options, Mapping):
+            raise ValueError("invalid domestic chat profile options")
+        return cls(
+            model=value.get("model"),  # type: ignore[arg-type]
+            context_length=value.get("context_length"),  # type: ignore[arg-type]
+            temperature=options.get("temperature"),  # type: ignore[arg-type]
+            max_tokens=options.get("max_tokens"),  # type: ignore[arg-type]
+            enable_thinking=options.get("enable_thinking"),  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AiLimits:
+    max_request_bytes: int = MAX_CHAT_REQUEST_BYTES
+    max_response_bytes: int = MAX_CHAT_RESPONSE_BYTES
+    translation_batch_cues: int = 30
+    translation_retry_batch_cues: int = 15
+    note_source_chunk_bytes: int = 48 * 1024
+    note_max_initial_chunks: int = 24
+    note_max_reduce_levels: int = 4
+
+    def __post_init__(self) -> None:
+        integer_values = (
+            self.max_request_bytes,
+            self.max_response_bytes,
+            self.translation_batch_cues,
+            self.translation_retry_batch_cues,
+            self.note_source_chunk_bytes,
+            self.note_max_initial_chunks,
+            self.note_max_reduce_levels,
+        )
+        if any(type(value) is not int or value <= 0 for value in integer_values):
+            raise ValueError("AI limits must be positive integers")
+        if self.max_request_bytes > MAX_CHAT_REQUEST_BYTES:
+            raise ValueError("AI request limit exceeds transport boundary")
+        if self.max_response_bytes > MAX_CHAT_RESPONSE_BYTES:
+            raise ValueError("AI response limit exceeds transport boundary")
+        if self.translation_batch_cues > 30:
+            raise ValueError("translation batch cue limit exceeds implementation baseline")
+        if self.translation_retry_batch_cues > 15:
+            raise ValueError("translation retry cue limit exceeds implementation baseline")
+        if self.note_source_chunk_bytes > 48 * 1024:
+            raise ValueError("note source chunk limit exceeds implementation baseline")
+        if self.note_max_initial_chunks > 24:
+            raise ValueError("note chunk count exceeds implementation baseline")
+        if self.note_max_reduce_levels > 4:
+            raise ValueError("note reduce depth exceeds implementation baseline")
+
+
 class ChatClient(Protocol):
     def complete(self, request: ChatRequest) -> ChatResponse: ...
 
@@ -216,6 +302,36 @@ def validate_chat_model(model: str) -> str:
     if not isinstance(model, str) or _MODEL_RE.fullmatch(model) is None:
         raise ValueError("invalid chat model")
     return model
+
+
+def canonical_chat_request_bytes(request: ChatRequest) -> bytes:
+    """Serialize the complete non-streaming request used for exact budget checks."""
+
+    if not isinstance(request, ChatRequest):
+        raise ValueError("ChatRequest is required")
+    if not any("JSON" in message.content for message in request.messages):
+        raise ChatError("chat_json_instruction_required")
+    payload: dict[str, object] = {
+        "model": request.model,
+        "messages": [
+            {"role": item.role, "content": item.content}
+            for item in request.messages
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    if request.temperature is not None:
+        payload["temperature"] = request.temperature
+    if request.max_tokens is not None:
+        payload["max_tokens"] = request.max_tokens
+    if request.enable_thinking is not None:
+        payload["enable_thinking"] = request.enable_thinking
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 class HttpxBailianTransport:
@@ -357,29 +473,7 @@ class AliyunBailianChatAdapter:
 
     @staticmethod
     def _payload(request: ChatRequest) -> bytes:
-        if not any("JSON" in message.content for message in request.messages):
-            raise ChatError("chat_json_instruction_required")
-        payload: dict[str, object] = {
-            "model": request.model,
-            "messages": [
-                {"role": item.role, "content": item.content}
-                for item in request.messages
-            ],
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
-        if request.enable_thinking is not None:
-            payload["enable_thinking"] = request.enable_thinking
-        body = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        body = canonical_chat_request_bytes(request)
         if len(body) > MAX_CHAT_REQUEST_BYTES:
             raise ChatError("chat_request_oversize")
         return body

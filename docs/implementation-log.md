@@ -407,3 +407,11 @@
 - Added startup migration that archives legacy arbitrary chat connections/profiles, clears their defaults/test/consent state, fails active legacy snapshots with `legacy_chat_endpoint_blocked`, and blocks legacy credential access before secret-store or transport use.
 - Updated durable task snapshots so translation and notes require both a current capability test and current chat-data consent. Provider/model/options/workspace/key changes invalidate both gates without altering historical snapshots.
 - Added adapter, configuration, API, migration, lifecycle, security, snapshot, and redaction regression coverage. No real model request was sent, no credential was persisted in SQLite or logs, and no user file was modified or deleted.
+
+### Task 13: cue-aligned transcript translation
+
+- Added deterministic domestic-chat translation requests that keep fixed system instructions separate from transcript JSON data and explicitly carry the target language, cue IDs, timestamps, and text.
+- Batches are greedily bounded by both 30 cues and the complete canonical 64-KiB request body. A single cue that cannot fit is rejected without truncation or a provider call.
+- Translation responses must contain one exact ordered cue-ID set, nonempty text, and no unknown fields. A structurally invalid batch receives one retry round only, split into no more than two 15-cue subbatches; transport, filtering, truncation, oversized-response, and unknown-submission errors are not replayed.
+- Added cancellation checks before and after each remote call and before publication. All batches are validated in memory before one source-hash-bound translation is atomically published, so a failed or canceled attempt leaves no partial artifact.
+- Added focused coverage for target propagation, UTF-8 request sizing, order/ID/schema failures, retry bounds, response bounds, static-instruction isolation, cancellation, source hashing, and atomic publication. The full suite passed with 686 tests; no real model request was sent.
