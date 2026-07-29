@@ -40,6 +40,27 @@
 - No network or billable request was made, no dependency changed, and no project or user file was
   deleted. The focused suite passed 47 tests and the full backend suite passed 364 tests.
 
+### Task 4 completion: direct-only pinned HTTPS transport
+
+- Added an explicit HTTP/1.1-over-TLS connector that dials only vetted DNS addresses while retaining
+  the normalized hostname for SNI, certificate verification, and `Host`. It does not consult proxy
+  environment variables, netrc, browser state, cookies, or credential helpers.
+- Added reviewed exact-host page/extractor policies and an expiring resource policy that accepts
+  only a typed, in-memory controlled-extractor host projection. Every redirect hop revalidates
+  HTTPS/443, host policy, the complete public DNS answer set, and the connected peer IP.
+- Request sanitization strips authentication, Cookie, Proxy, connection-specific, hop-by-hop, and
+  caller-owned Host/encoding headers. Response handling ignores `Set-Cookie`, bounds header count,
+  header lines, request targets, redirects, connect/read timeouts, wire bytes, and decoded bytes.
+- Added one shared incremental body reader for `read`, `readline`, iteration, close, and context
+  management. Gzip/deflate output is bounded inside the decompressor, and ambiguous framing,
+  duplicate encodings, truncated streams, and oversized declared or observed bodies fail closed.
+- Safe transport exceptions expose only a fixed category and normalized allowed host; URL queries,
+  DNS addresses, headers, bodies, and low-level socket/decompressor exceptions are not chained into
+  public errors.
+- No real network or billable request was made, no dependency changed, and no project or user file
+  was deleted. The focused suite passed 38 tests and the full backend suite passed 384 tests;
+  `compileall` and `pip check` passed.
+
 ## 2026-07-28
 
 ### Task 1B concurrency and transaction review follow-up
