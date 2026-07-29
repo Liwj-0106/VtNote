@@ -10,10 +10,10 @@ node_modules/
 frontend/dist/
 dist/
 build/
+*.egg-info/
 .superpowers/
 .env
 *.db
 *.db-shm
 *.db-wal
 VtNote-data/
-
