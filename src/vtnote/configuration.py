@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 import ipaddress
+import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -25,6 +27,19 @@ from vtnote.models import (
 from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
 from vtnote.paths import StoragePaths
+from vtnote.provider_credentials import (
+    CredentialBundle,
+    CredentialReentryRequired,
+    configured_credential_fields,
+    parse_credential_bundle,
+    serialize_credential_bundle,
+)
+from vtnote.tencent_contract import (
+    TENCENT_ASR_ENDPOINT,
+    TENCENT_ASR_MODEL,
+    TENCENT_ASR_REGION,
+    TENCENT_LANGUAGE_SCOPE,
+)
 from vtnote.sensitive_text import (
     DEFAULT_PROMPT_PURPOSE,
     SensitiveTextProtector,
@@ -50,6 +65,7 @@ class ConnectionView(PublicModel):
     parameters: dict[str, Any]
     revision: int
     has_secret: bool
+    configured_fields: dict[str, bool]
     tested: bool
     test_ok: bool | None
     test_message: str | None
@@ -94,15 +110,28 @@ class DefaultsView(PublicModel):
 
 _PROTOCOL_PARAMETERS = {
     "volc_bigasr_flash": frozenset(),
+    "tencent_recording_asr": frozenset(
+        {
+            "asr_region",
+            "cos_bucket",
+            "cos_region",
+            "cos_prefix",
+            "cos_private",
+            "cos_configured",
+        }
+    ),
     "openai_compatible": frozenset({"api_version", "organization"}),
 }
+_ACTIVE_PROTOCOLS = frozenset({"tencent_recording_asr", "openai_compatible"})
 _PURPOSE_PROTOCOL = {
-    "cloud_asr": "volc_bigasr_flash",
+    "cloud_asr": "tencent_recording_asr",
     "translation": "openai_compatible",
     "notes": "openai_compatible",
 }
 _PURPOSE_OPTIONS = {
-    "cloud_asr": frozenset({"language"}),
+    "cloud_asr": frozenset(
+        {"language_scope", "res_text_format", "sentence_max_length"}
+    ),
     "translation": frozenset({"temperature", "max_tokens"}),
     "notes": frozenset({"temperature", "max_tokens"}),
 }
@@ -118,11 +147,61 @@ def _reject_reserved_name(value: str) -> None:
         raise InvalidConfiguration("configuration name uses a reserved internal prefix")
 
 
-def _validate_connection_parameters(protocol: str, parameters: dict[str, Any]) -> None:
+_COS_BUCKET_RE = re.compile(
+    r"^[a-z0-9][a-z0-9-]{1,58}[a-z0-9]-[1-9][0-9]{4,11}$"
+)
+
+
+def _normalize_connection_parameters(
+    protocol: str,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
     if set(parameters) - _PROTOCOL_PARAMETERS[protocol]:
         raise InvalidConfiguration("unsupported or secret connection parameter")
+    if protocol == "tencent_recording_asr":
+        configured = parameters.get("cos_configured")
+        cos_keys = {"cos_bucket", "cos_region", "cos_prefix", "cos_private"}
+        supplied_cos_keys = cos_keys.intersection(parameters)
+        if supplied_cos_keys:
+            if supplied_cos_keys != cos_keys:
+                raise InvalidConfiguration("COS configuration must be complete")
+            if configured is False:
+                raise InvalidConfiguration("COS configuration state conflicts with fields")
+            bucket = parameters["cos_bucket"]
+            region = parameters["cos_region"]
+            prefix = parameters["cos_prefix"]
+            private = parameters["cos_private"]
+            if not isinstance(bucket, str) or _COS_BUCKET_RE.fullmatch(bucket) is None:
+                raise InvalidConfiguration("invalid private COS bucket")
+            if region != TENCENT_ASR_REGION:
+                raise InvalidConfiguration("COS region must be ap-guangzhou")
+            if prefix != "vtnote-runtime":
+                raise InvalidConfiguration("COS prefix must be vtnote-runtime")
+            if private is not True:
+                raise InvalidConfiguration("COS bucket must be private")
+            if parameters.get("asr_region", TENCENT_ASR_REGION) != TENCENT_ASR_REGION:
+                raise InvalidConfiguration("Tencent ASR region must be ap-guangzhou")
+            return {
+                "asr_region": TENCENT_ASR_REGION,
+                "cos_bucket": bucket,
+                "cos_region": region,
+                "cos_prefix": prefix,
+                "cos_private": True,
+                "cos_configured": True,
+            }
+        if set(parameters) - {"asr_region", "cos_configured"}:
+            raise InvalidConfiguration("COS configuration must be complete")
+        if parameters.get("asr_region", TENCENT_ASR_REGION) != TENCENT_ASR_REGION:
+            raise InvalidConfiguration("Tencent ASR region must be ap-guangzhou")
+        if configured is not None and configured is not False:
+            raise InvalidConfiguration("COS configuration fields are missing")
+        return {
+            "asr_region": TENCENT_ASR_REGION,
+            "cos_configured": False,
+        }
     if any(not isinstance(value, str) or not value.strip() for value in parameters.values()):
         raise InvalidConfiguration("connection parameter values must be non-empty strings")
+    return dict(parameters)
 
 
 def _validate_profile_options(purpose: str, options: dict[str, Any]) -> None:
@@ -143,6 +222,50 @@ def _validate_profile_options(purpose: str, options: dict[str, Any]) -> None:
         isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
     ):
         raise InvalidConfiguration("invalid profile option value")
+
+
+def _normalize_profile_contract(
+    purpose: str,
+    protocol: str,
+    model: str,
+    options: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    cleaned_model = model.strip()
+    if purpose == "cloud_asr":
+        if protocol == "volc_bigasr_flash":
+            if set(options) - {"language"}:
+                raise InvalidConfiguration("unsupported profile option")
+            language = options.get("language")
+            if language is not None and (
+                not isinstance(language, str) or not language.strip()
+            ):
+                raise InvalidConfiguration("invalid profile option value")
+            return cleaned_model, dict(options)
+        if protocol != "tencent_recording_asr":
+            raise InvalidConfiguration(
+                "profile purpose is incompatible with connection protocol"
+            )
+        if cleaned_model != TENCENT_ASR_MODEL:
+            raise InvalidConfiguration("Tencent ASR model must be 16k_zh_en_2.0")
+        if set(options) - _PURPOSE_OPTIONS[purpose]:
+            raise InvalidConfiguration("unsupported profile option")
+        if options.get("language_scope", TENCENT_LANGUAGE_SCOPE) != TENCENT_LANGUAGE_SCOPE:
+            raise InvalidConfiguration("Tencent ASR language scope is fixed")
+        if options.get("res_text_format", 3) != 3:
+            raise InvalidConfiguration("Tencent ASR result format is fixed")
+        if options.get("sentence_max_length", 20) != 20:
+            raise InvalidConfiguration("Tencent ASR sentence length is fixed")
+        return cleaned_model, {
+            "language_scope": TENCENT_LANGUAGE_SCOPE,
+            "res_text_format": 3,
+            "sentence_max_length": 20,
+        }
+    _validate_profile_options(purpose, options)
+    return cleaned_model, dict(options)
+
+
+def _purpose_protocol_is_compatible(purpose: str, protocol: str) -> bool:
+    return _PURPOSE_PROTOCOL.get(purpose) == protocol
 
 
 def _validate_local_whisper_options(options: dict[str, Any]) -> None:
@@ -188,7 +311,10 @@ def _clean_base_url(value: str, protocol: str) -> str:
         pass
     elif parts.scheme != "https":
         raise InvalidConfiguration("invalid provider base URL")
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    if protocol == "tencent_recording_asr" and cleaned != TENCENT_ASR_ENDPOINT:
+        raise InvalidConfiguration("Tencent ASR endpoint is fixed")
+    return cleaned
 
 
 def _clean_message(
@@ -380,6 +506,16 @@ class ConfigurationService:
 
     def _connection_view(self, row: ProviderConnectionRecord) -> ConnectionView:
         current = row.tested_revision == row.revision
+        stored_secret = self.secrets.get(row.credential_ref)
+        if row.protocol == "tencent_recording_asr":
+            configured_fields = configured_credential_fields(
+                row.protocol,
+                stored_secret,
+            )
+            has_secret = all(configured_fields.values())
+        else:
+            configured_fields = {}
+            has_secret = stored_secret is not None
         cleanup_pending = self.session.scalar(
             select(CredentialCleanupRecord.credential_ref)
             .where(CredentialCleanupRecord.connection_id == row.id)
@@ -392,7 +528,8 @@ class ConfigurationService:
             base_url=row.base_url,
             parameters=dict(row.parameters),
             revision=row.revision,
-            has_secret=self.secrets.get(row.credential_ref) is not None,
+            has_secret=has_secret,
+            configured_fields=configured_fields,
             tested=current,
             test_ok=row.test_ok if current else None,
             test_message=row.test_message if current else None,
@@ -435,10 +572,28 @@ class ConfigurationService:
         base_url: str,
         parameters: dict[str, Any],
         secret: str | None = None,
+        credentials: dict[str, object] | None = None,
     ) -> ConnectionView:
-        if protocol not in _PROTOCOL_PARAMETERS:
+        if protocol not in _ACTIVE_PROTOCOLS:
             raise InvalidConfiguration("unsupported provider protocol")
-        _validate_connection_parameters(protocol, parameters)
+        selected_parameters = _normalize_connection_parameters(protocol, parameters)
+        if secret is not None and credentials is not None:
+            raise InvalidConfiguration("cannot provide two credential formats")
+        if protocol == "tencent_recording_asr":
+            if secret is not None:
+                raise InvalidConfiguration("Tencent credentials must be an atomic pair")
+            try:
+                selected_secret = (
+                    serialize_credential_bundle(protocol, credentials)
+                    if credentials is not None
+                    else None
+                )
+            except ValueError:
+                raise InvalidConfiguration("invalid Tencent credential pair") from None
+        else:
+            if credentials is not None:
+                raise InvalidConfiguration("structured credentials are not supported")
+            selected_secret = secret
         cleaned_name = name.strip()
         if not cleaned_name:
             raise InvalidConfiguration("connection name cannot be empty")
@@ -447,7 +602,7 @@ class ConfigurationService:
             name=cleaned_name,
             protocol=protocol,
             base_url=_clean_base_url(base_url, protocol),
-            parameters=dict(parameters),
+            parameters=selected_parameters,
             credential_ref=f"connection:{uuid.uuid4()}",
         )
         try:
@@ -457,12 +612,12 @@ class ConfigurationService:
             self.session.flush()
             self.session.add(row)
             self.session.flush()
-            if secret is not None:
-                self.secrets.set(row.credential_ref, secret)
+            if selected_secret is not None:
+                self.secrets.set(row.credential_ref, selected_secret)
             self.session.commit()
         except Exception as error:
             self.session.rollback()
-            if secret is not None:
+            if selected_secret is not None:
                 self._delete_or_queue_orphaned_credential(row.credential_ref)
             if isinstance(error, IntegrityError):
                 raise InvalidConfiguration("connection name already exists") from None
@@ -477,11 +632,29 @@ class ConfigurationService:
         base_url: str | None = None,
         parameters: dict[str, Any] | None = None,
         secret: str | None = None,
+        credentials: dict[str, object] | None = None,
         clear_secret: bool = False,
     ) -> ConnectionView:
-        if secret is not None and clear_secret:
+        if secret is not None and credentials is not None:
+            raise InvalidConfiguration("cannot provide two credential formats")
+        if (secret is not None or credentials is not None) and clear_secret:
             raise InvalidConfiguration("cannot replace and clear a secret together")
         row = self._connection(connection_id)
+        if row.protocol == "tencent_recording_asr":
+            if secret is not None:
+                raise InvalidConfiguration("Tencent credentials must be an atomic pair")
+            try:
+                selected_secret = (
+                    serialize_credential_bundle(row.protocol, credentials)
+                    if credentials is not None
+                    else None
+                )
+            except ValueError:
+                raise InvalidConfiguration("invalid Tencent credential pair") from None
+        else:
+            if credentials is not None:
+                raise InvalidConfiguration("structured credentials are not supported")
+            selected_secret = secret
         old_reference = row.credential_ref
         old_secret = self.secrets.get(old_reference)
         cleaned_name = row.name
@@ -495,9 +668,11 @@ class ConfigurationService:
         )
         selected_parameters = dict(row.parameters)
         if parameters is not None:
-            _validate_connection_parameters(row.protocol, parameters)
-            selected_parameters = dict(parameters)
-        secret_changed = secret is not None and secret != old_secret
+            selected_parameters = _normalize_connection_parameters(
+                row.protocol,
+                parameters,
+            )
+        secret_changed = selected_secret is not None and selected_secret != old_secret
         secret_cleared = clear_secret and old_secret is not None
         execution_changed = (
             cleaned_base_url != row.base_url
@@ -519,8 +694,8 @@ class ConfigurationService:
             if secret_changed or secret_cleared:
                 new_reference = f"connection:{uuid.uuid4()}"
                 if secret_changed:
-                    assert secret is not None
-                    self.secrets.set(new_reference, secret)
+                    assert selected_secret is not None
+                    self.secrets.set(new_reference, selected_secret)
                 row.credential_ref = new_reference
                 self._queue_credential_cleanup(old_reference, row.id)
             row.name = cleaned_name
@@ -601,7 +776,7 @@ class ConfigurationService:
         options: dict[str, Any] | None = None,
     ) -> ProfileView:
         connection = self._connection(connection_id)
-        if _PURPOSE_PROTOCOL.get(purpose) != connection.protocol:
+        if not _purpose_protocol_is_compatible(purpose, connection.protocol):
             raise InvalidConfiguration("profile purpose is incompatible with connection protocol")
         cleaned_name = name.strip()
         cleaned_model = model.strip()
@@ -611,7 +786,12 @@ class ConfigurationService:
         if isinstance(context_length, bool) or context_length <= 0:
             raise InvalidConfiguration("context_length must be a positive integer")
         selected_options = dict(options or {})
-        _validate_profile_options(purpose, selected_options)
+        cleaned_model, selected_options = _normalize_profile_contract(
+            purpose,
+            connection.protocol,
+            cleaned_model,
+            selected_options,
+        )
         try:
             self._retire_archived_name_conflicts(
                 ProcessorProfileRecord, cleaned_name
@@ -641,8 +821,6 @@ class ConfigurationService:
             raise InvalidConfiguration("unsupported profile change")
         if "options" in changes and changes["options"] is None:
             raise InvalidConfiguration("profile options cannot be null")
-        if "options" in changes:
-            _validate_profile_options(row.purpose, changes["options"])
         if "context_length" in changes:
             context_length = changes["context_length"]
             if (
@@ -667,10 +845,24 @@ class ConfigurationService:
             if changes["connection_id"] is None:
                 raise InvalidConfiguration("profile connection_id cannot be null")
             connection = self._connection(changes["connection_id"])
-            if _PURPOSE_PROTOCOL[row.purpose] != connection.protocol:
+            if not _purpose_protocol_is_compatible(row.purpose, connection.protocol):
                 raise InvalidConfiguration(
                     "profile purpose is incompatible with connection protocol"
                 )
+        else:
+            connection = row.connection
+        selected_model = changes.get("model", row.model)
+        selected_options = dict(changes.get("options", row.options))
+        normalized_model, normalized_options = _normalize_profile_contract(
+            row.purpose,
+            connection.protocol,
+            selected_model,
+            selected_options,
+        )
+        if "model" in changes or normalized_model != row.model:
+            changes["model"] = normalized_model
+        if "options" in changes or normalized_options != dict(row.options):
+            changes["options"] = normalized_options
         selected = {
             name: dict(value) if name == "options" else value
             for name, value in changes.items()
@@ -1010,6 +1202,25 @@ class ConfigurationService:
             self._connection(connection_id, include_archived=True).credential_ref
         )
 
+    def credential_bundle_for_connection(
+        self,
+        connection_id: str,
+    ) -> CredentialBundle | str | None:
+        """Return a typed bundle at the execution boundary without exposing it publicly."""
+
+        row = self._connection(connection_id, include_archived=True)
+        stored = self.secrets.get(row.credential_ref)
+        if stored is None:
+            return None
+        if row.protocol not in {"tencent_recording_asr", "aliyun_bailian"}:
+            return stored
+        try:
+            return parse_credential_bundle(row.protocol, stored)
+        except CredentialReentryRequired:
+            raise InvalidConfiguration(
+                "stored credentials require complete re-entry"
+            ) from None
+
     def credential_cleanup_status(self) -> CredentialCleanupStatusView:
         pending_count = len(
             self.session.scalars(
@@ -1049,6 +1260,18 @@ class ConfigurationService:
                 secret = None
             if secret:
                 values.add(secret)
+                try:
+                    payload = json.loads(secret)
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    values.update(
+                        value
+                        for key, value in payload.items()
+                        if key != "schema_version"
+                        and isinstance(value, str)
+                        and value
+                    )
         return tuple(sorted(values, key=lambda value: (-len(value), value)))
 
     def snapshot_profile(
@@ -1056,6 +1279,15 @@ class ConfigurationService:
     ) -> dict[str, Any]:
         row = self._profile(profile_id, include_archived=include_archived)
         connection = row.connection
+        stored_secret = self.secrets.get(connection.credential_ref)
+        has_secret = stored_secret is not None
+        if connection.protocol == "tencent_recording_asr":
+            has_secret = all(
+                configured_credential_fields(
+                    connection.protocol,
+                    stored_secret,
+                ).values()
+            )
         snapshot = {
             "id": row.id,
             "connection_id": connection.id,
@@ -1069,7 +1301,7 @@ class ConfigurationService:
             "context_length": row.context_length,
             "options": dict(row.options),
             "profile_revision": row.revision,
-            "has_secret": self.secrets.get(connection.credential_ref) is not None,
+            "has_secret": has_secret,
         }
         if connection.protocol == "volc_bigasr_flash":
             snapshot["resource"] = "volc.bigasr.auc_turbo"

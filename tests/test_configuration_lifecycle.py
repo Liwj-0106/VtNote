@@ -553,12 +553,13 @@ def test_unreferenced_delete_hard_purges_and_tracks_failed_credential_cleanup(
 def test_profile_archive_repairs_all_affected_defaults(tmp_path: Path) -> None:
     configuration, _, _, session = make_services(tmp_path)
     cloud_connection = configuration.create_connection(
-        name="Cloud", protocol="volc_bigasr_flash",
-        base_url="https://openspeech.bytedance.com", parameters={}, secret="cloud"
+        name="Cloud", protocol="tencent_recording_asr",
+        base_url="https://asr.tencentcloudapi.com", parameters={},
+        credentials={"secret_id": "AKID", "secret_key": "cloud"}
     )
     cloud = configuration.create_profile(
         name="Cloud profile", purpose="cloud_asr",
-        connection_id=cloud_connection.id, model="bigmodel"
+        connection_id=cloud_connection.id, model="16k_zh_en_2.0"
     )
     configuration.record_profile_test(cloud.id, ok=True, message="ok")
     configuration.authorize_cloud_upload(cloud.id)
@@ -701,7 +702,7 @@ def test_cloud_connection_rejects_loopback_http(tmp_path: Path) -> None:
     configuration, _, _, session = make_services(tmp_path)
     with pytest.raises(InvalidConfiguration, match="HTTPS"):
         configuration.create_connection(
-            name="Cloud", protocol="volc_bigasr_flash",
+            name="Cloud", protocol="tencent_recording_asr",
             base_url="http://127.0.0.1:9000", parameters={}
         )
     local = configuration.create_connection(

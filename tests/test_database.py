@@ -12,7 +12,10 @@ from sqlalchemy.orm import Session
 from vtnote.database import initialize_database
 from vtnote.models import (
     Base,
+    DefaultSettingsRecord,
     ItemRecord,
+    ProcessorProfileRecord,
+    ProviderConnectionRecord,
     ResourceLeaseRecord,
     RuntimeAssetRecord,
     RuntimeCleanupEventRecord,
@@ -23,6 +26,7 @@ from vtnote.models import (
 
 
 _TASK3_TABLES = {
+    "cloud_submissions",
     "runtime_assets",
     "runtime_cleanup_events",
     "resource_leases",
@@ -85,7 +89,7 @@ def test_sqlite_initialization_creates_tables_and_enables_wal(tmp_path: Path) ->
         assert {
             "tasks", "items", "stage_runs", "provider_connections",
             "processor_profiles", "default_settings", "credential_cleanup",
-            "runtime_assets", "runtime_cleanup_events", "resource_leases",
+            "cloud_submissions", "runtime_assets", "runtime_cleanup_events", "resource_leases",
             "worker_heartbeats",
         } <= set(inspect(engine).get_table_names())
         assert {
@@ -97,6 +101,110 @@ def test_sqlite_initialization_creates_tables_and_enables_wal(tmp_path: Path) ->
         }
     finally:
         engine.dispose()
+
+
+def test_startup_archives_volc_configuration_and_fails_active_snapshots_closed(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "vtnote.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        connection = ProviderConnectionRecord(
+            name="Legacy Volc",
+            protocol="volc_bigasr_flash",
+            base_url="https://openspeech.bytedance.com",
+            parameters={},
+            credential_ref="connection:legacy-volc",
+            test_ok=True,
+            tested_revision=1,
+            test_message="old success",
+        )
+        profile = ProcessorProfileRecord(
+            name="Legacy ASR",
+            purpose="cloud_asr",
+            connection=connection,
+            model="bigmodel",
+            options={"language": "zh-CN"},
+            test_ok=True,
+            tested_revision=1,
+            tested_connection_revision=1,
+            upload_authorized_revision=1,
+            upload_authorized_connection_revision=1,
+        )
+        session.add(profile)
+        session.flush()
+        defaults = DefaultSettingsRecord(
+            id=1,
+            asr_mode="cloud",
+            cloud_asr_profile_id=profile.id,
+        )
+        task = TaskRecord(
+            status="running",
+            pipeline_snapshot_json={
+                "asr": {
+                    "mode": "cloud",
+                    "profile": {
+                        "protocol": "volc_bigasr_flash",
+                        "connection_id": connection.id,
+                    },
+                }
+            },
+        )
+        item = ItemRecord(
+            task=task,
+            position=0,
+            source_kind="local_media",
+            source_locator="sample.mp4",
+            status="running",
+        )
+        source = StageRunRecord(item=item, stage="source", status="completed")
+        transcribe = StageRunRecord(
+            item=item,
+            stage="transcribe",
+            status="running",
+            lease_owner="worker-1",
+        )
+        session.add_all([defaults, source, transcribe])
+        session.commit()
+        ids = (connection.id, profile.id, task.id, transcribe.id)
+    engine.dispose()
+
+    migrated = initialize_database(database_path)
+    try:
+        with Session(migrated) as session:
+            connection = session.get(ProviderConnectionRecord, ids[0])
+            profile = session.get(ProcessorProfileRecord, ids[1])
+            task = session.get(TaskRecord, ids[2])
+            transcribe = session.get(StageRunRecord, ids[3])
+            defaults = session.get(DefaultSettingsRecord, 1)
+            assert connection is not None and connection.archived_at is not None
+            assert connection.test_ok is None
+            assert connection.tested_revision is None
+            assert connection.test_message is None
+            assert profile is not None and profile.archived_at is not None
+            assert profile.test_ok is None
+            assert profile.tested_revision is None
+            assert profile.tested_connection_revision is None
+            assert profile.upload_authorized_revision is None
+            assert profile.upload_authorized_connection_revision is None
+            assert defaults is not None
+            assert defaults.asr_mode == "auto"
+            assert defaults.cloud_asr_profile_id is None
+            assert task is not None
+            assert task.status == "failed"
+            assert (
+                task.terminal_reason_code
+                == "legacy_provider_requires_reconfiguration"
+            )
+            assert transcribe is not None
+            assert transcribe.status == "failed"
+            assert (
+                transcribe.error_code
+                == "legacy_provider_requires_reconfiguration"
+            )
+            assert transcribe.lease_owner is None
+    finally:
+        migrated.dispose()
 
 
 def test_runtime_foundation_fields_round_trip(tmp_path: Path) -> None:
@@ -292,7 +400,7 @@ def test_additive_upgrade_preserves_task2_rows_and_adds_runtime_schema(
             "recovered_count",
         } <= {column["name"] for column in inspector.get_columns("stage_runs")}
         assert {
-            "runtime_assets", "runtime_cleanup_events", "resource_leases",
+            "cloud_submissions", "runtime_assets", "runtime_cleanup_events", "resource_leases",
             "worker_heartbeats",
         } <= set(inspector.get_table_names())
         assert task2_tables <= set(inspector.get_table_names())

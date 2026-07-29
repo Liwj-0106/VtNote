@@ -5,14 +5,24 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Connection, Engine, create_engine, event
+from sqlalchemy import Connection, Engine, create_engine, event, select
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, selectinload
 
-from vtnote.models import Base
+from vtnote.models import (
+    Base,
+    DefaultSettingsRecord,
+    ItemRecord,
+    ProcessorProfileRecord,
+    ProviderConnectionRecord,
+    StageRunRecord,
+    TaskRecord,
+)
 from vtnote.sensitive_text import (
     SensitiveTextProtector,
     migrate_sensitive_text,
@@ -106,6 +116,97 @@ def _initialize_schema(engine: Engine) -> None:
         connection.commit()
 
 
+def _contains_legacy_cloud_snapshot(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("protocol") == "volc_bigasr_flash":
+            return True
+        return any(_contains_legacy_cloud_snapshot(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_legacy_cloud_snapshot(item) for item in value)
+    return False
+
+
+def _migrate_legacy_cloud_provider(engine: Engine) -> None:
+    """Retire Volc configuration and stop active snapshots before execution."""
+
+    now = datetime.now(timezone.utc)
+    reason = "legacy_provider_requires_reconfiguration"
+    with Session(engine) as session:
+        legacy_connections = session.scalars(
+            select(ProviderConnectionRecord).where(
+                ProviderConnectionRecord.protocol == "volc_bigasr_flash"
+            )
+        ).all()
+        if not legacy_connections:
+            return
+        legacy_connection_ids = {row.id for row in legacy_connections}
+        legacy_profiles = session.scalars(
+            select(ProcessorProfileRecord).where(
+                ProcessorProfileRecord.connection_id.in_(legacy_connection_ids)
+            )
+        ).all()
+        legacy_profile_ids = {row.id for row in legacy_profiles}
+
+        for row in legacy_connections:
+            row.archived_at = row.archived_at or now
+            row.test_ok = None
+            row.tested_revision = None
+            row.test_message = None
+            row.tested_at = None
+        for row in legacy_profiles:
+            row.archived_at = row.archived_at or now
+            row.test_ok = None
+            row.tested_revision = None
+            row.tested_connection_revision = None
+            row.test_message = None
+            row.tested_at = None
+            row.upload_authorized_revision = None
+            row.upload_authorized_connection_revision = None
+
+        defaults = session.get(DefaultSettingsRecord, 1)
+        if (
+            defaults is not None
+            and defaults.cloud_asr_profile_id in legacy_profile_ids
+        ):
+            defaults.cloud_asr_profile_id = None
+            if defaults.asr_mode == "cloud":
+                defaults.asr_mode = "auto"
+
+        active_tasks = session.scalars(
+            select(TaskRecord)
+            .where(TaskRecord.status.in_(("queued", "running")))
+            .options(
+                selectinload(TaskRecord.items).selectinload(ItemRecord.stage_runs)
+            )
+        ).all()
+        for task in active_tasks:
+            if not _contains_legacy_cloud_snapshot(task.pipeline_snapshot_json):
+                continue
+            task.status = "failed"
+            task.terminal_reason_code = reason
+            for item in task.items:
+                transcribe_runs = [
+                    run
+                    for run in item.stage_runs
+                    if run.stage == "transcribe"
+                    and run.status in {"queued", "running"}
+                ]
+                if not transcribe_runs:
+                    continue
+                item.status = "failed"
+                for run in transcribe_runs:
+                    run.status = "failed"
+                    run.error_code = reason
+                    run.error_message = (
+                        "Cloud ASR provider changed; reconfigure or retry locally"
+                    )
+                    run.finished_at = now
+                    run.lease_owner = None
+                    run.lease_expires_at = None
+                    run.heartbeat_at = None
+        session.commit()
+
+
 def initialize_database(
     database_path: Path,
     *,
@@ -127,6 +228,7 @@ def initialize_database(
             _initialize_wal(engine)
             _initialize_schema(engine)
             migrate_sensitive_text(engine, sensitive_text_protector)
+            _migrate_legacy_cloud_provider(engine)
     except Exception:
         engine.dispose()
         raise

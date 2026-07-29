@@ -19,13 +19,207 @@ def make_service(tmp_path: Path) -> tuple[ConfigurationService, MemorySecretStor
     return ConfigurationService(session, secrets), secrets, session
 
 
+def test_tencent_connection_forces_canonical_api_and_guangzhou_region(
+    tmp_path: Path,
+) -> None:
+    service, secrets, session = make_service(tmp_path)
+    try:
+        connection = service.create_connection(
+            name="Tencent ASR",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com/",
+            parameters={},
+            credentials={
+                "secret_id": "AKID-example",
+                "secret_key": "secret-key",
+            },
+        )
+
+        assert connection.base_url == "https://asr.tencentcloudapi.com"
+        assert connection.parameters == {
+            "asr_region": "ap-guangzhou",
+            "cos_configured": False,
+        }
+        assert connection.has_secret
+        assert connection.configured_fields == {
+            "secret_id": True,
+            "secret_key": True,
+        }
+        assert "AKID-example" not in repr(connection)
+        assert "secret-key" not in repr(connection)
+        assert secrets.values_count == 1
+
+        with pytest.raises(InvalidConfiguration):
+            service.create_connection(
+                name="Wrong endpoint",
+                protocol="tencent_recording_asr",
+                base_url="https://asr.ap-shanghai.tencentcloudapi.com",
+                parameters={},
+                credentials={
+                    "secret_id": "AKID",
+                    "secret_key": "key",
+                },
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_new_legacy_volc_connections_are_rejected(tmp_path: Path) -> None:
+    service, _, session = make_service(tmp_path)
+    try:
+        with pytest.raises(InvalidConfiguration, match="unsupported"):
+            service.create_connection(
+                name="Legacy Volc",
+                protocol="volc_bigasr_flash",
+                base_url="https://openspeech.bytedance.com",
+                parameters={},
+                secret="legacy-key",
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_tencent_credential_rotation_and_clear_are_atomic(tmp_path: Path) -> None:
+    service, secrets, session = make_service(tmp_path)
+    try:
+        connection = service.create_connection(
+            name="Tencent",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com",
+            parameters={},
+            credentials={"secret_id": "AKID-1", "secret_key": "key-1"},
+        )
+        service.record_connection_test(connection.id, ok=True, message="ready")
+
+        with pytest.raises(InvalidConfiguration):
+            service.update_connection(
+                connection.id,
+                credentials={"secret_id": "AKID-partial"},
+            )
+        unchanged = service.get_connection(connection.id)
+        assert unchanged.revision == 1
+        assert unchanged.tested is True
+        assert secrets.values_count == 1
+
+        rotated = service.update_connection(
+            connection.id,
+            credentials={"secret_id": "AKID-2", "secret_key": "key-2"},
+        )
+        assert rotated.revision == 2
+        assert rotated.tested is False
+        assert rotated.configured_fields == {
+            "secret_id": True,
+            "secret_key": True,
+        }
+        assert secrets.values_count == 1
+
+        cleared = service.update_connection(connection.id, clear_secret=True)
+        assert cleared.revision == 3
+        assert cleared.has_secret is False
+        assert cleared.configured_fields == {
+            "secret_id": False,
+            "secret_key": False,
+        }
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {
+            "cos_bucket": "bucket-1250000000",
+            "cos_region": "ap-shanghai",
+            "cos_prefix": "vtnote-runtime",
+            "cos_private": True,
+        },
+        {
+            "cos_bucket": "INVALID_BUCKET",
+            "cos_region": "ap-guangzhou",
+            "cos_prefix": "vtnote-runtime",
+            "cos_private": True,
+        },
+        {
+            "cos_bucket": "bucket-1250000000",
+            "cos_region": "ap-guangzhou",
+            "cos_prefix": "../escape",
+            "cos_private": True,
+        },
+        {
+            "cos_bucket": "bucket-1250000000",
+            "cos_region": "ap-guangzhou",
+            "cos_prefix": "vtnote-runtime",
+            "cos_private": False,
+        },
+    ],
+)
+def test_cos_config_rejects_public_non_guangzhou_or_malformed_bucket_and_prefix(
+    tmp_path: Path,
+    parameters: dict[str, object],
+) -> None:
+    service, _, session = make_service(tmp_path)
+    try:
+        with pytest.raises(InvalidConfiguration):
+            service.create_connection(
+                name="Invalid COS",
+                protocol="tencent_recording_asr",
+                base_url="https://asr.tencentcloudapi.com",
+                parameters=parameters,
+                credentials={"secret_id": "AKID", "secret_key": "key"},
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_tencent_profile_forces_large_model_2_and_subtitle_format(
+    tmp_path: Path,
+) -> None:
+    service, _, session = make_service(tmp_path)
+    try:
+        connection = service.create_connection(
+            name="Tencent ASR",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com",
+            parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"},
+        )
+        profile = service.create_profile(
+            name="Large model 2",
+            purpose="cloud_asr",
+            connection_id=connection.id,
+            model="16k_zh_en_2.0",
+            options={"language_scope": "zh_en_dialects"},
+        )
+
+        assert profile.model == "16k_zh_en_2.0"
+        assert profile.options == {
+            "language_scope": "zh_en_dialects",
+            "res_text_format": 3,
+            "sentence_max_length": 20,
+        }
+        with pytest.raises(InvalidConfiguration):
+            service.update_profile(profile.id, model="16k_zh")
+        with pytest.raises(InvalidConfiguration):
+            service.update_profile(
+                profile.id,
+                options={"language_scope": "auto"},
+            )
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
 def test_connection_secret_is_external_and_revisions_invalidate_tests(tmp_path: Path) -> None:
     service, secrets, session = make_service(tmp_path)
     try:
         connection = service.create_connection(
-            name="Volc",
-            protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com",
+            name="Chat",
+            protocol="openai_compatible",
+            base_url="https://api.example.com/v1",
             parameters={},
             secret="top-secret",
         )
@@ -39,7 +233,7 @@ def test_connection_secret_is_external_and_revisions_invalidate_tests(tmp_path: 
         assert tested.tested is True
         assert tested.test_message == "credential accepted"
 
-        updated = service.update_connection(connection.id, name="Volc 2", secret="replacement")
+        updated = service.update_connection(connection.id, name="Chat 2", secret="replacement")
         assert updated.revision == 2
         assert updated.tested is False
         assert updated.has_secret is True
@@ -86,10 +280,10 @@ def test_profiles_enforce_protocol_and_upload_consent_revision(tmp_path: Path) -
     try:
         cloud = service.create_connection(
             name="Cloud ASR",
-            protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com",
             parameters={},
-            secret="key",
+            credentials={"secret_id": "AKID", "secret_key": "key"},
         )
         chat = service.create_connection(
             name="Chat",
@@ -107,18 +301,18 @@ def test_profiles_enforce_protocol_and_upload_consent_revision(tmp_path: Path) -
             )
 
         profile = service.create_profile(
-            name="Flash",
+            name="Tencent",
             purpose="cloud_asr",
             connection_id=cloud.id,
-            model="bigmodel",
+            model="16k_zh_en_2.0",
             context_length=8192,
-            options={"language": "zh-CN"},
+            options={"language_scope": "zh_en_dialects"},
         )
         service.record_profile_test(profile.id, ok=True, message="ready")
         authorized = service.authorize_cloud_upload(profile.id)
         assert authorized.upload_authorized is True
 
-        changed = service.update_profile(profile.id, model="bigmodel-v2")
+        changed = service.update_profile(profile.id, context_length=16384)
         assert changed.revision == 2
         assert changed.tested is False
         assert changed.upload_authorized is False
@@ -284,8 +478,8 @@ def test_profile_can_move_only_to_a_compatible_connection(tmp_path: Path) -> Non
             base_url="https://second.example.com/v1", parameters={}
         )
         cloud = service.create_connection(
-            name="Cloud", protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com", parameters={}
+            name="Cloud", protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com", parameters={}
         )
         profile = service.create_profile(
             name="Notes", purpose="notes", connection_id=first.id, model="gpt"

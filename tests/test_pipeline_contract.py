@@ -206,8 +206,9 @@ def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp
     configuration, _, session, _ = make_services(tmp_path)
     try:
         cloud = configuration.create_connection(
-            name="Cloud", protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+            name="Cloud", protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com", parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"}
         )
         chat = configuration.create_connection(
             name="Chat", protocol="openai_compatible",
@@ -221,7 +222,8 @@ def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp
         with pytest.raises(InvalidConfiguration, match="profile option"):
             configuration.create_profile(
                 name="Bad cloud", purpose="cloud_asr", connection_id=cloud.id,
-                model="bigmodel", context_length=8192, options={"temperature": 0.2}
+                model="16k_zh_en_2.0", context_length=8192,
+                options={"temperature": 0.2}
             )
         with pytest.raises(InvalidConfiguration, match="profile option"):
             configuration.create_profile(
@@ -239,22 +241,25 @@ def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp
         session.bind.dispose()
 
 
-def test_volc_resource_is_fixed_and_not_caller_configurable(tmp_path: Path) -> None:
+def test_tencent_contract_is_fixed_and_not_caller_configurable(tmp_path: Path) -> None:
     configuration, tasks, session, _ = make_services(tmp_path)
     try:
         with pytest.raises(InvalidConfiguration, match="parameter"):
             configuration.create_connection(
-                name="Bad Cloud", protocol="volc_bigasr_flash",
-                base_url="https://openspeech.bytedance.com",
-                parameters={"resource_id": "attacker.resource"}, secret="key"
+                name="Bad Cloud", protocol="tencent_recording_asr",
+                base_url="https://asr.tencentcloudapi.com",
+                parameters={"resource_id": "attacker.resource"},
+                credentials={"secret_id": "AKID", "secret_key": "key"}
             )
         connection = configuration.create_connection(
-            name="Cloud", protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+            name="Cloud", protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com", parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"}
         )
         profile = configuration.create_profile(
-            name="Flash", purpose="cloud_asr", connection_id=connection.id,
-            model="bigmodel", context_length=8192, options={"language": "zh-CN"}
+            name="Tencent", purpose="cloud_asr", connection_id=connection.id,
+            model="16k_zh_en_2.0", context_length=8192,
+            options={"language_scope": "zh_en_dialects"}
         )
         configuration.record_profile_test(profile.id, ok=True, message="ok")
         configuration.authorize_cloud_upload(profile.id)
@@ -262,9 +267,11 @@ def test_volc_resource_is_fixed_and_not_caller_configurable(tmp_path: Path) -> N
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
         )
-        assert created.pipeline_snapshot["asr"]["profile"]["resource"] == (
-            "volc.bigasr.auc_turbo"
-        )
+        cloud_snapshot = created.pipeline_snapshot["asr"]["profile"]
+        assert cloud_snapshot["protocol"] == "tencent_recording_asr"
+        assert cloud_snapshot["base_url"] == "https://asr.tencentcloudapi.com"
+        assert cloud_snapshot["parameters"]["asr_region"] == "ap-guangzhou"
+        assert cloud_snapshot["model"] == "16k_zh_en_2.0"
         local_only = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/local"}],
             options={"asr_mode": "local"},
@@ -330,18 +337,20 @@ def test_stale_cloud_falls_back_in_auto_but_forced_cloud_fails(tmp_path: Path) -
     configuration, tasks, session, _ = make_services(tmp_path)
     try:
         connection = configuration.create_connection(
-            name="Cloud", protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+            name="Cloud", protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com", parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"}
         )
         profile = configuration.create_profile(
-            name="Flash", purpose="cloud_asr", connection_id=connection.id,
-            model="bigmodel", context_length=8192
+            name="Tencent", purpose="cloud_asr", connection_id=connection.id,
+            model="16k_zh_en_2.0", context_length=8192
         )
         configuration.record_profile_test(profile.id, ok=True, message="ok")
         configuration.authorize_cloud_upload(profile.id)
         configuration.update_defaults(asr_mode="auto", cloud_asr_profile_id=profile.id)
         configuration.update_connection(
-            connection.id, base_url="https://openspeech-revised.bytedance.com"
+            connection.id,
+            credentials={"secret_id": "AKID", "secret_key": "replacement"},
         )
 
         automatic = tasks.create_task(

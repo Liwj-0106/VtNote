@@ -59,14 +59,15 @@ def assert_no_secret_fields(value: object) -> None:
 
 def configure_profiles(configuration: ConfigurationService) -> tuple[str, str, str]:
     cloud_connection = configuration.create_connection(
-        name="Volc",
-        protocol="volc_bigasr_flash",
-        base_url="https://openspeech.bytedance.com",
+        name="Tencent",
+        protocol="tencent_recording_asr",
+        base_url="https://asr.tencentcloudapi.com",
         parameters={},
-        secret="cloud-secret",
+        credentials={"secret_id": "AKID", "secret_key": "cloud-secret"},
     )
     cloud = configuration.create_profile(
-        name="Flash", purpose="cloud_asr", connection_id=cloud_connection.id, model="bigmodel"
+        name="Tencent ASR", purpose="cloud_asr",
+        connection_id=cloud_connection.id, model="16k_zh_en_2.0"
     )
     configuration.record_profile_test(cloud.id, ok=True, message="ok")
     configuration.authorize_cloud_upload(cloud.id)
@@ -162,11 +163,13 @@ def test_auto_mode_omits_cloud_profile_until_upload_is_authorized(tmp_path: Path
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
         connection = configuration.create_connection(
-            name="Volc", protocol="volc_bigasr_flash",
-            base_url="https://openspeech.bytedance.com", parameters={}, secret="key"
+            name="Tencent", protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com", parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"}
         )
         profile = configuration.create_profile(
-            name="Flash", purpose="cloud_asr", connection_id=connection.id, model="bigmodel"
+            name="Tencent ASR", purpose="cloud_asr",
+            connection_id=connection.id, model="16k_zh_en_2.0"
         )
         configuration.record_profile_test(profile.id, ok=True, message="ok")
         configuration.update_defaults(asr_mode="auto", cloud_asr_profile_id=profile.id)
@@ -872,7 +875,7 @@ def test_retry_serializes_cloud_profile_update_with_final_validation(
                 update_results.append(
                     update_configuration.update_profile(
                         cloud_profile_id,
-                        model="rotated-after-retry",
+                        context_length=16384,
                     )
                 )
             except BaseException as error:
@@ -1073,7 +1076,7 @@ def test_cloud_confirmed_requires_current_tested_authorized_revisions(
                 acknowledge_possible_charge=True,
             )
 
-        configuration.update_profile(cloud_id, model="retry-model")
+        configuration.update_profile(cloud_id, context_length=16384)
         changed = configuration.snapshot_profile(cloud_id)
         with pytest.raises(InvalidTaskOperation, match="successful test"):
             tasks.build_retry_override(
@@ -1114,20 +1117,17 @@ def test_cloud_confirmed_requires_current_tested_authorized_revisions(
             if run.stage == "transcribe" and run.attempt == 2
         )
         evidence = tasks.record_stage_evidence(
-            new_attempt.id, {"model": "retry-model"}
+            new_attempt.id, {"model": "16k_zh_en_2.0"}
         )
-        assert evidence.execution_evidence == {"model": "retry-model"}
+        assert evidence.execution_evidence == {"model": "16k_zh_en_2.0"}
         stored_item = session.get(ItemRecord, item.id)
         assert stored_item is not None
-        for stale_model in (
-            original["model"],
-            stored_item.task.pipeline_snapshot_json["local_whisper"]["model"],
-        ):
-            assert stale_model != "retry-model"
-            with pytest.raises(InvalidTaskOperation, match="model"):
-                tasks.record_stage_evidence(
-                    new_attempt.id, {"model": stale_model}
-                )
+        local_model = stored_item.task.pipeline_snapshot_json["local_whisper"]["model"]
+        assert local_model != "16k_zh_en_2.0"
+        with pytest.raises(InvalidTaskOperation, match="model"):
+            tasks.record_stage_evidence(
+                new_attempt.id, {"model": local_model}
+            )
     finally:
         session.bind.dispose()
         session.close()
@@ -1145,7 +1145,8 @@ def test_retry_override_never_reads_current_defaults(
             name="Explicit retry profile",
             purpose="cloud_asr",
             connection_id=connection_id,
-            model="explicit-retry-model",
+            model="16k_zh_en_2.0",
+            context_length=16384,
         )
         configuration.record_profile_test(selected.id, ok=True, message="ok")
         configuration.authorize_cloud_upload(selected.id)
@@ -1183,7 +1184,7 @@ def test_retry_override_never_reads_current_defaults(
         )
         assert retry.retry_override_json["asr"]["profile"]["id"] == selected.id
         assert retry.retry_override_json["asr"]["profile"]["model"] == (
-            "explicit-retry-model"
+            "16k_zh_en_2.0"
         )
         assert stored.task.pipeline_snapshot_json == original_task_snapshot
     finally:

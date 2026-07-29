@@ -41,6 +41,25 @@ class FakeConnectionTester:
         return ConnectivityResult(ok=True, message="accepted super-secret")
 
 
+class FakeProfileTester:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def test_profile(
+        self,
+        profile,
+        credentials,
+        test_input,
+        *,
+        follow_redirects: bool,
+    ):
+        self.calls.append((profile, credentials, test_input))
+        assert follow_redirects is False
+        assert credentials.secret_id.get_secret_value() == "AKID-example"
+        assert credentials.secret_key.get_secret_value() == "secret-key"
+        return ConnectivityResult(ok=True, message="provider response omitted")
+
+
 class FakeSourceProbe:
     def probe(self, url: str):
         assert url == "https://youtu.be/abc"
@@ -103,6 +122,7 @@ def make_client(
     tmp_path: Path,
     *,
     connection_tester=None,
+    profile_tester=None,
     source_probe=None,
     secret_store=None,
 ) -> tuple[TestClient, object, StoragePaths]:
@@ -115,6 +135,7 @@ def make_client(
         secret_store=secret_store or MemorySecretStore(),
         resolver=PublicResolver(),
         connection_tester=connection_tester,
+        profile_tester=profile_tester,
         source_probe=source_probe,
     )
     return TestClient(app, base_url=BASE_URL), engine, paths
@@ -124,6 +145,128 @@ def csrf(client: TestClient) -> dict[str, str]:
     response = client.get("/api/security/csrf")
     assert response.status_code == 200
     return {"Origin": BASE_URL, "X-CSRF-Token": response.json()["csrf_token"]}
+
+
+def test_tencent_credentials_are_atomic_redacted_and_reject_sts_fields(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        created = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {},
+                "credentials": {
+                    "secret_id": "AKID-example",
+                    "secret_key": "secret-key",
+                },
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["configured_fields"] == {
+            "secret_id": True,
+            "secret_key": True,
+        }
+        assert "AKID-example" not in created.text
+        assert "secret-key" not in created.text
+
+        rejected = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Temporary credential",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {},
+                "credentials": {
+                    "secret_id": "AKID",
+                    "secret_key": "key",
+                    "token": "temporary",
+                },
+            },
+        )
+        assert rejected.status_code == 400
+        assert rejected.json()["error"]["code"] == "invalid_configuration"
+        assert "temporary" not in rejected.text
+    finally:
+        engine.dispose()
+
+
+def test_billable_cloud_profile_test_requires_ack_and_uploaded_speech_sample(
+    tmp_path: Path,
+) -> None:
+    tester = FakeProfileTester()
+    client, engine, _ = make_client(tmp_path, profile_tester=tester)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {},
+                "credentials": {
+                    "secret_id": "AKID-example",
+                    "secret_key": "secret-key",
+                },
+            },
+        ).json()
+        profile = client.post(
+            "/api/profiles",
+            headers=headers,
+            json={
+                "name": "Tencent ASR",
+                "purpose": "cloud_asr",
+                "connection_id": connection["id"],
+                "model": "16k_zh_en_2.0",
+                "options": {"language_scope": "zh_en_dialects"},
+            },
+        ).json()
+
+        no_ack = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={
+                "test_kind": "provider_profile",
+                "speech_sample_upload_id": "sample-1",
+            },
+        )
+        assert no_ack.status_code == 400
+        assert no_ack.json()["error"]["code"] == "billable_test_ack_required"
+        no_sample = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={
+                "test_kind": "provider_profile",
+                "acknowledge_billable_request": True,
+            },
+        )
+        assert no_sample.status_code == 400
+        assert no_sample.json()["error"]["code"] == "speech_test_sample_required"
+
+        tested = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={
+                "test_kind": "provider_profile",
+                "acknowledge_billable_request": True,
+                "speech_sample_upload_id": "sample-1",
+            },
+        )
+        assert tested.status_code == 200
+        assert tested.json()["test_ok"] is True
+        assert len(tester.calls) == 1
+        test_input = tester.calls[0][2]
+        assert test_input.speech_sample_upload_id == "sample-1"
+    finally:
+        engine.dispose()
 
 
 def test_exact_host_origin_and_double_submit_csrf_are_enforced(tmp_path: Path) -> None:
@@ -732,10 +875,13 @@ def test_retry_api_accepts_explicit_local_and_cloud_confirmed_success(
             headers=headers,
             json={
                 "name": "Retry cloud",
-                "protocol": "volc_bigasr_flash",
-                "base_url": "https://openspeech.bytedance.com",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
                 "parameters": {},
-                "secret": "retry-secret",
+                "credentials": {
+                    "secret_id": "AKID",
+                    "secret_key": "retry-secret",
+                },
             },
         ).json()
         profile = client.post(
@@ -745,7 +891,7 @@ def test_retry_api_accepts_explicit_local_and_cloud_confirmed_success(
                 "name": "Explicit cloud retry",
                 "purpose": "cloud_asr",
                 "connection_id": connection["id"],
-                "model": "retry-cloud-model",
+                "model": "16k_zh_en_2.0",
             },
         ).json()
         with Session(engine) as session:

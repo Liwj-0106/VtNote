@@ -152,6 +152,62 @@ class StageRunRecord(Base):
     item: Mapped[ItemRecord] = relationship(back_populates="stage_runs")
 
 
+class CloudSubmissionRecord(Base):
+    """One durable Tencent create/query lifecycle bound to a local stage attempt."""
+
+    __tablename__ = "cloud_submissions"
+    __table_args__ = (
+        Index(
+            "ix_cloud_submissions_due_query",
+            "state",
+            "next_poll_at",
+        ),
+        Index(
+            "ix_cloud_submissions_due_cleanup",
+            "cleanup_due_at",
+            "state",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    stage_run_id: Mapped[str] = mapped_column(
+        ForeignKey("stage_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="tencent_recording_asr"
+    )
+    provider_task_id: Mapped[str | None] = mapped_column(String(20), index=True)
+    provider_request_id: Mapped[str | None] = mapped_column(String(128))
+    provider_submitted_date: Mapped[str | None] = mapped_column(String(10))
+    audio_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    cos_bucket: Mapped[str | None] = mapped_column(String(255))
+    cos_region: Mapped[str | None] = mapped_column(String(32))
+    cos_object_key: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="prepared", index=True
+    )
+    safe_error_code: Mapped[str | None] = mapped_column(String(64))
+    next_poll_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    poll_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_query_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    signed_url_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    cleanup_due_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    remote_terminal_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    result_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
 class RuntimeAssetRecord(Base):
     """An app-owned disposable file below the configured runtime cache."""
 

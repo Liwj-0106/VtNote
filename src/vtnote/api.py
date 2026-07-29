@@ -64,7 +64,12 @@ class ConnectionTester(Protocol):
 
 class ProfileTester(Protocol):
     def test_profile(
-        self, profile: Any, secret: str | None, *, follow_redirects: Literal[False]
+        self,
+        profile: Any,
+        credentials: Any,
+        test_input: "ProfileTestInput",
+        *,
+        follow_redirects: Literal[False],
     ) -> ConnectivityResult: ...
 
 
@@ -78,6 +83,7 @@ class ConnectionCreate(InputModel):
     base_url: str
     parameters: dict[str, Any] = Field(default_factory=dict)
     secret: str | None = Field(default=None, min_length=1)
+    credentials: dict[str, Any] | None = None
 
 
 class ConnectionPatch(InputModel):
@@ -85,13 +91,21 @@ class ConnectionPatch(InputModel):
     base_url: str | None = None
     parameters: dict[str, Any] | None = None
     secret: str | None = Field(default=None, min_length=1)
+    credentials: dict[str, Any] | None = None
     clear_secret: bool = False
 
     @model_validator(mode="before")
     @classmethod
     def reject_explicit_nulls(cls, value: Any) -> Any:
         if isinstance(value, dict):
-            for field in ("name", "base_url", "parameters", "secret", "clear_secret"):
+            for field in (
+                "name",
+                "base_url",
+                "parameters",
+                "secret",
+                "credentials",
+                "clear_secret",
+            ):
                 if field in value and value[field] is None:
                     raise ValueError(f"{field} cannot be null")
         return value
@@ -121,6 +135,16 @@ class ProfilePatch(InputModel):
                 if field in value and value[field] is None:
                     raise ValueError(f"{field} cannot be null")
         return value
+
+
+class ProfileTestInput(InputModel):
+    test_kind: Literal["provider_profile", "cos_sentinel"] = "provider_profile"
+    acknowledge_billable_request: bool = False
+    speech_sample_upload_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
 
 
 class DefaultsPatch(InputModel):
@@ -547,15 +571,47 @@ def create_app(
             session.close()
 
     @app.post("/api/profiles/{profile_id}/test")
-    def test_profile(profile_id: str):
+    def test_profile(profile_id: str, payload: ProfileTestInput):
         session, configuration, _ = services()
         try:
             if profile_tester is None:
                 return _error(501, "adapter_unavailable", "connectivity adapter is not configured")
             profile = configuration.get_profile(profile_id)
-            secret = configuration.secret_for_connection(profile.connection_id)
+            if (
+                payload.test_kind == "provider_profile"
+                and not payload.acknowledge_billable_request
+            ):
+                return _error(
+                    400,
+                    "billable_test_ack_required",
+                    "billable provider test requires explicit acknowledgement",
+                )
+            if (
+                profile.purpose == "cloud_asr"
+                and payload.test_kind == "provider_profile"
+                and payload.speech_sample_upload_id is None
+            ):
+                return _error(
+                    400,
+                    "speech_test_sample_required",
+                    "provider test requires an uploaded speech sample",
+                )
+            if payload.test_kind == "cos_sentinel" and profile.purpose != "cloud_asr":
+                return _error(
+                    400,
+                    "invalid_profile_test_kind",
+                    "COS sentinel test requires a cloud ASR profile",
+                )
+            credentials = configuration.credential_bundle_for_connection(
+                profile.connection_id
+            )
             try:
-                result = profile_tester.test_profile(profile, secret, follow_redirects=False)
+                result = profile_tester.test_profile(
+                    profile,
+                    credentials,
+                    payload,
+                    follow_redirects=False,
+                )
             except Exception:
                 result = ConnectivityResult(False, "Connectivity test failed")
             safe_message = "Profile test succeeded" if result.ok else "Profile test failed"
