@@ -1,8 +1,8 @@
 # VtNote V1 Remaining Development Implementation Plan
 
-> **For Codex:** REQUIRED SUB-SKILLS: use `superpowers:subagent-driven-development`,
-> `superpowers:test-driven-development`, `superpowers:requesting-code-review`, and
-> `superpowers:verification-before-completion`. Execute one implementation task at a time.
+> **For agentic workers:** REQUIRED SUB-SKILL: use `superpowers:executing-plans` to implement this
+> plan task-by-task in the current feature worktree. Use `superpowers:test-driven-development` for
+> behavior changes and `superpowers:verification-before-completion` before completion claims.
 
 **Goal:** Complete the VtNote V1 path from supported URL/local input to immutable transcript,
 optional translation/AI notes, local web UI, supervised worker, safe exports, and release evidence.
@@ -110,8 +110,15 @@ Every task inherits these constraints and must test the ones it touches:
     batching, OCR, screenshots, RAG/chat, player/editor, desktop shell, plugins, auto-updaters,
     foreign model APIs, and unreviewed model relays.
 23. Production changes are test-first: focused RED for the expected reason, minimal GREEN,
-    focused/full verification, independent specification review, independent code/security review,
-    then one intentional commit.
+    then focused verification. Run the complete backend suite at Tasks 16, 21, and 24 and the
+    complete frontend suite at Tasks 20, 21, and 24 instead of repeating both suites after every
+    small change. Finish each task with a specification/code/security self-review and one
+    intentional commit.
+24. The confirmed UI baseline is
+    `docs/superpowers/specs/2026-07-29-vtnote-claude-inspired-ui-design.md`: warm Claude-inspired
+    neutrals, deep-ink primary actions, terracotta only for timeline/focus/selection, a
+    232px-to-64px collapsible modern sidebar, no global top bar, no card grid, no gradients, no
+    remote fonts, and no redundant status or explanatory copy.
 
 ## Shared verification commands
 
@@ -1085,21 +1092,33 @@ class NoteDocument:
 - Create: `frontend/index.html`
 - Create: `frontend/src/main.tsx`
 - Create: `frontend/src/app/App.tsx`
+- Create: `frontend/src/app/AppShell.tsx`
+- Create: `frontend/src/app/Sidebar.tsx`
+- Create: `frontend/src/app/icons.tsx`
 - Create: `frontend/src/app/router.tsx`
 - Create: `frontend/src/api/client.ts`
 - Create: `frontend/src/api/types.ts`
 - Create: `frontend/src/styles/tokens.css`
+- Create: `frontend/src/styles/global.css`
+- Create: `frontend/src/styles/shell.css`
 - Create: `frontend/src/test/setup.ts`
 - Create: `frontend/src/api/client.test.ts`
+- Create: `frontend/src/app/AppShell.test.tsx`
 
 **Steps:**
 
 1. Add failing Vitest tests for CSRF acquisition, `credentials:"same-origin"`, mutation header,
    403 without replay, abort, error mapping, download stream, one in-flight poll, exact ADR-014
-   foreground/background/error schedule, terminal stop, and no storage persistence.
+   foreground/background/error schedule, and terminal stop. Add shell tests for 232px/64px
+   collapse, current-route retention, no network request on collapse, a mobile focus-trapped
+   Escape-close drawer, skip-link focus, and browser persistence containing only the sidebar
+   boolean—not URL, title, task ID, secret, or task state.
 2. Install exact frontend dependencies with npm cache on D and commit `package-lock.json`.
-3. Implement the minimal typed client, router shell, local design tokens, system font stack, skip
-   link, focus outline, reduced-motion base, and no third-party resources.
+3. Implement the minimal typed client and router shell from the confirmed UI specification. Define
+   all color, type, spacing, radius, content-width, sidebar-width, focus, and motion values as
+   semantic CSS tokens. Implement the local 20px/1.75-stroke SVG icon set, 232px-to-64px sidebar,
+   bottom-pinned settings action, at-most-five recent tasks only when expanded, skip link, visible
+   focus, reduced motion, forced-colors behavior, and no third-party resources.
 4. Run all frontend verification and a production build.
 5. Run two reviews.
 6. Commit: `feat: establish vtnote react frontend`.
@@ -1133,8 +1152,10 @@ class NoteDocument:
    custom-prompt replacement/
    `has_custom_prompt`, defaults, storage/trash/audit visibility, restore action, and no permanent
    delete action.
-2. Implement pages from `docs/website-specification.md` using the shared API client and accessible
-   native controls.
+2. Implement pages from `docs/website-specification.md` and the confirmed Claude-inspired UI
+   specification using the shared API client and accessible native controls. Use a quiet single
+   column of divided setting groups—not dashboard cards—and expose technical values only when they
+   help the user decide or recover.
 3. Scan rendered DOM, response mocks, URL, errors, and web storage for credentials. A custom prompt
    may exist only in its active edit control and outgoing create/replace request; assert it is not
    echoed by GET responses or retained in URL, history state, logs, errors, localStorage, or
@@ -1166,7 +1187,10 @@ class NoteDocument:
    acknowledgement, and errors without local absolute path.
 2. Add only the API metadata needed for resumable UI state; do not add resumable uploads or batch
    creation.
-3. Implement the create flow with clear source/ASR/optional-processing review before POST.
+3. Implement the create flow as the visual focal point of the product: one compact source composer,
+   URL/media/subtitle segmented control, progressive processing options only after source readiness,
+   one deep-ink “创建任务” action, and a conditional one-line cloud/cost disclosure. Do not use three
+   source cards, a marketing hero, a card grid, or always-visible provider/model details.
 4. Run frontend/backend verification and two reviews.
 5. Commit: `feat: add safe task creation and uploads`.
 
@@ -1196,13 +1220,19 @@ class NoteDocument:
    generation/review labels, warning isolation, cue citation navigation, execution-summary export,
    safe filenames, terminal polling stop, and empty/error states.
 2. Implement history and detail routes without a global state library. Use URL/search state and
-   request-local state only.
+   request-local state only. History is a divided vertical list rather than a data table or
+   statistics dashboard. Detail uses a transcript-first reading column and a 280px stage inspector;
+   on narrow/zoomed layouts the inspector moves above the reader.
 3. Ensure failed translation/notes never obscure the original transcript.
 4. For long transcripts, use a bounded/virtualized reading view with stable cue anchors and a
-   user-selectable non-virtualized accessible full-text mode. Test focus/scroll position across mode
-   changes and citation jumps.
+   user-selectable non-virtualized accessible full-text mode. Render one continuous hairline beside
+   cue timestamps with terracotta ticks for selection and citations; do not render cue cards or
+   chat bubbles. Test focus/scroll position across mode changes and citation jumps.
 5. Run keyboard/focus/aria-live tests, axe scans, WCAG 2.2 AA contrast evidence, color-not-sole-
-   status checks, reduced motion, 375/768/1024/1440 viewports, and 200% zoom browser checks.
+   status checks, reduced motion, 375/768/1024/1440 viewports, and 200% zoom browser checks. Capture
+   1440px expanded/collapsed, 768px, and 375px screenshots for create, history, running/completed/
+   failed detail, and settings. Audit screenshots for duplicate headings/status, card overuse,
+   blue/gradient remnants, horizontal overflow, and unreadably narrow transcript lines.
 6. Run frontend/backend verification and two reviews.
 7. Commit: `feat: add task history and result views`.
 
