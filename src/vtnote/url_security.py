@@ -30,7 +30,7 @@ _HOST = re.compile(
     r"^(?=.{1,253}\.?$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$"
 )
-_POLICY_PLATFORMS = frozenset({"bilibili", "youtube"})
+_POLICY_PLATFORMS = frozenset({"bilibili", "youtube", "model_assets"})
 _POLICY_STAGES = frozenset({"page", "extractor_aux", "resource"})
 
 
@@ -75,7 +75,7 @@ def public_ip_answers(addresses: list[str]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class UpstreamHostPolicy:
-    platform: Literal["bilibili", "youtube"]
+    platform: Literal["bilibili", "youtube", "model_assets"]
     stage: Literal["page", "extractor_aux", "resource"]
     exact_hosts: frozenset[str]
     allowed_suffixes: frozenset[str]

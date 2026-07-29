@@ -10,7 +10,8 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from collections.abc import Iterator, Mapping
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from sqlalchemy import Engine
@@ -18,6 +19,8 @@ from sqlalchemy.orm import Session
 
 from vtnote.models import ModelInstallRecord
 from vtnote.paths import StoragePaths
+from vtnote.platform_transport import PinnedHttpsTransport, SourceHttpRequest
+from vtnote.url_security import UpstreamHostPolicy
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -31,6 +34,29 @@ _ALLOWED_FILES = frozenset(
         "vocabulary.json",
     }
 )
+_PINNED_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+_PINNED_FILES = {
+    "config.json": (
+        2263,
+        "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+    ),
+    "model.bin": (
+        1617884929,
+        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+    ),
+    "preprocessor_config.json": (
+        340,
+        "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+    ),
+    "tokenizer.json": (
+        2710337,
+        "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+    ),
+    "vocabulary.json": (
+        1068114,
+        "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+    ),
+}
 
 
 class ModelAssetError(ValueError):
@@ -77,7 +103,95 @@ class ModelInstallStatus:
     installed_path: Path | None
 
 
-def load_local_whisper_manifest(path: Path) -> ModelManifest:
+@dataclass(frozen=True, slots=True)
+class ModelDownloadCheckpoint:
+    completed_files: int
+    current_file: str | None
+    current_file_bytes: int
+    current_etag: str | None
+
+
+class ModelDownloadResponse(Protocol):
+    status_code: int
+    headers: Mapping[str, str]
+
+    def __iter__(self) -> Iterator[bytes]: ...
+
+    def close(self) -> None: ...
+
+
+class ModelTransport(Protocol):
+    def get(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        maximum_bytes: int,
+    ) -> ModelDownloadResponse: ...
+
+
+class _PinnedModelResponse:
+    def __init__(self, response: object) -> None:
+        self._response = response
+        self.status_code = response.status  # type: ignore[attr-defined]
+        self.headers = response.headers  # type: ignore[attr-defined]
+
+    def __iter__(self) -> Iterator[bytes]:
+        while True:
+            chunk = self._response.read(1024 * 1024)  # type: ignore[attr-defined]
+            if not chunk:
+                return
+            yield chunk
+
+    def close(self) -> None:
+        self._response.close()  # type: ignore[attr-defined]
+
+
+class HuggingFaceModelTransport:
+    """Use the shared DNS-pinned transport for fixed-revision model files."""
+
+    def __init__(self, transport: PinnedHttpsTransport) -> None:
+        self.transport = transport
+        self.policy = UpstreamHostPolicy(
+            platform="model_assets",
+            stage="extractor_aux",
+            exact_hosts=frozenset({"huggingface.co"}),
+            allowed_suffixes=frozenset(
+                {
+                    "huggingface.co",
+                    "hf.co",
+                    "xethub.hf.co",
+                }
+            ),
+        )
+
+    def get(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        maximum_bytes: int,
+    ) -> ModelDownloadResponse:
+        response = self.transport.request(
+            SourceHttpRequest(
+                url=url,
+                method="GET",
+                headers=headers,
+                max_wire_bytes=maximum_bytes,
+                max_decoded_bytes=maximum_bytes,
+            ),
+            self.policy,
+        )
+        if hasattr(response, "status_code"):
+            return response  # type: ignore[return-value]
+        return _PinnedModelResponse(response)
+
+
+def load_local_whisper_manifest(
+    path: Path,
+    *,
+    allow_test_file_variants: bool = False,
+) -> ModelManifest:
     candidate = Path(path)
     try:
         raw_bytes = candidate.read_bytes()
@@ -116,6 +230,15 @@ def load_local_whisper_manifest(path: Path) -> ModelManifest:
         or len(files) != len(_ALLOWED_FILES)
     ):
         raise ModelAssetError("model_manifest_invalid")
+    if not allow_test_file_variants and (
+        payload["revision"] != _PINNED_REVISION
+        or {
+            item.path: (item.size, item.sha256)
+            for item in files
+        }
+        != _PINNED_FILES
+    ):
+        raise ModelAssetError("model_manifest_invalid")
     return ModelManifest(
         schema_version=1,
         model_name=payload["model_name"],
@@ -134,10 +257,14 @@ class ModelAssetService:
         paths: StoragePaths,
         manifest_path: Path,
         free_bytes: Callable[[Path], int] | None = None,
+        allow_test_manifest: bool = False,
     ) -> None:
         self.engine = engine
         self.paths = paths
-        self.manifest = load_local_whisper_manifest(manifest_path)
+        self.manifest = load_local_whisper_manifest(
+            manifest_path,
+            allow_test_file_variants=allow_test_manifest,
+        )
         self.free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
 
     @property
@@ -336,6 +463,11 @@ class ModelAssetService:
             row = session.get(ModelInstallRecord, self.manifest.model_name)
             if row is None or row.state == "installed":
                 raise ModelAssetError("model_install_not_active")
+            if row.state == "downloading" and row.lease_owner is not None:
+                row.cancel_requested = True
+                row.updated_at = now
+                session.commit()
+                return self._status(row)
             trash = self.paths.runtime(
                 "trash",
                 "model-installs",
@@ -348,6 +480,48 @@ class ModelAssetService:
                 row.trash_relpath = self.paths.runtime_relative(trash)
             row.state = "canceled"
             row.cancel_requested = True
+            row.staging_relpath = None
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            row.updated_at = now
+            session.commit()
+            return self._status(row)
+
+    def cancellation_requested(self, worker_id: str) -> bool:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            return bool(
+                row is not None
+                and row.lease_owner == worker_id
+                and row.cancel_requested
+            )
+
+    def finish_cancel(
+        self,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> ModelInstallStatus:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            if (
+                row is None
+                or row.lease_owner != worker_id
+                or not row.cancel_requested
+            ):
+                raise ModelAssetError("model_install_lease_lost")
+            trash = self.paths.runtime(
+                "trash",
+                "model-installs",
+                str(uuid4()),
+            )
+            if self.staging_root.exists():
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                self.paths.assert_runtime_destination(trash.parent)
+                os.replace(self.staging_root, trash)
+                row.trash_relpath = self.paths.runtime_relative(trash)
+            row.state = "canceled"
             row.staging_relpath = None
             row.lease_owner = None
             row.lease_expires_at = None
@@ -393,6 +567,7 @@ class ModelAssetService:
         file_bytes: int,
         etag: str,
         now: datetime,
+        lease_duration: timedelta = timedelta(minutes=2),
     ) -> ModelInstallStatus:
         expected = next(
             (item for item in self.manifest.files if item.path == file_path),
@@ -403,6 +578,7 @@ class ModelAssetService:
             or file_bytes < 0
             or file_bytes > expected.size
             or not etag
+            or lease_duration <= timedelta(0)
         ):
             raise ModelAssetError("model_progress_invalid")
         with Session(self.engine) as session:
@@ -424,6 +600,171 @@ class ModelAssetService:
             row.current_etag = etag
             row.downloaded_bytes = completed_bytes + file_bytes
             row.heartbeat_at = now
+            row.lease_expires_at = now + lease_duration
+            row.updated_at = now
+            session.commit()
+            return self._status(row)
+
+    def download_checkpoint(
+        self,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> ModelDownloadCheckpoint:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            if (
+                row is None
+                or row.state != "downloading"
+                or row.lease_owner != worker_id
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= now
+            ):
+                raise ModelAssetError("model_install_lease_lost")
+            return ModelDownloadCheckpoint(
+                completed_files=row.completed_files,
+                current_file=row.current_file,
+                current_file_bytes=row.current_file_bytes,
+                current_etag=row.current_etag,
+            )
+
+    def complete_file(
+        self,
+        *,
+        worker_id: str,
+        file_path: str,
+        now: datetime,
+    ) -> ModelInstallStatus:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            expected = (
+                self.manifest.files[row.completed_files]
+                if row is not None
+                and row.completed_files < len(self.manifest.files)
+                else None
+            )
+            if (
+                row is None
+                or row.state != "downloading"
+                or row.lease_owner != worker_id
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= now
+                or expected is None
+                or expected.path != file_path
+                or row.current_file_bytes != expected.size
+            ):
+                raise ModelAssetError("model_install_lease_lost")
+            row.completed_files += 1
+            row.downloaded_bytes = sum(
+                item.size
+                for item in self.manifest.files[: row.completed_files]
+            )
+            row.current_file = None
+            row.current_file_bytes = 0
+            row.current_etag = None
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            row.state = (
+                "verifying"
+                if row.completed_files == len(self.manifest.files)
+                else "queued"
+            )
+            row.updated_at = now
+            session.commit()
+            return self._status(row)
+
+    def release_for_retry(
+        self,
+        *,
+        worker_id: str,
+        safe_code: str,
+        now: datetime,
+    ) -> ModelInstallStatus:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            if (
+                row is None
+                or row.state != "downloading"
+                or row.lease_owner != worker_id
+            ):
+                raise ModelAssetError("model_install_lease_lost")
+            row.state = "queued"
+            row.error_code = safe_code
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            row.updated_at = now
+            session.commit()
+            return self._status(row)
+
+    def discard_partial(
+        self,
+        *,
+        worker_id: str,
+        partial: Path,
+        now: datetime,
+    ) -> None:
+        expected_parent = self.paths.assert_runtime_destination(
+            self.staging_root
+        )
+        candidate = self.paths.assert_runtime_destination(Path(partial))
+        if candidate.parent != expected_parent or not candidate.name.endswith(
+            ".part"
+        ):
+            raise ModelAssetError("model_progress_invalid")
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            if row is None or row.lease_owner != worker_id:
+                raise ModelAssetError("model_install_lease_lost")
+            if candidate.is_file():
+                trash = self.paths.runtime(
+                    "trash",
+                    "model-installs",
+                    str(uuid4()),
+                )
+                trash.mkdir(parents=True, exist_ok=False)
+                destination = trash / candidate.name
+                self.paths.assert_runtime_destination(destination)
+                os.replace(candidate, destination)
+                row.trash_relpath = self.paths.runtime_relative(trash)
+            row.current_file = None
+            row.current_file_bytes = 0
+            row.current_etag = None
+            row.downloaded_bytes = sum(
+                item.size
+                for item in self.manifest.files[: row.completed_files]
+            )
+            row.updated_at = now
+            session.commit()
+
+    def fail_and_trash(
+        self,
+        *,
+        worker_id: str,
+        safe_code: str,
+        now: datetime,
+    ) -> ModelInstallStatus:
+        with Session(self.engine) as session:
+            row = session.get(ModelInstallRecord, self.manifest.model_name)
+            if row is None or row.lease_owner != worker_id:
+                raise ModelAssetError("model_install_lease_lost")
+            trash = self.paths.runtime(
+                "trash",
+                "model-installs",
+                str(uuid4()),
+            )
+            if self.staging_root.exists():
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                self.paths.assert_runtime_destination(trash.parent)
+                os.replace(self.staging_root, trash)
+                row.trash_relpath = self.paths.runtime_relative(trash)
+            row.state = "failed"
+            row.error_code = safe_code
+            row.staging_relpath = None
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
             row.updated_at = now
             session.commit()
             return self._status(row)
@@ -437,3 +778,213 @@ class ModelAssetService:
         ):
             raise ModelAssetError("model_not_installed")
         return status.installed_path
+
+
+class ModelDownloadWorker:
+    def __init__(
+        self,
+        *,
+        service: ModelAssetService,
+        transport: ModelTransport,
+        worker_id: str,
+        clock: Callable[[], datetime],
+        lease_duration: timedelta = timedelta(minutes=2),
+    ) -> None:
+        self.service = service
+        self.transport = transport
+        self.worker_id = worker_id
+        self.clock = clock
+        self.lease_duration = lease_duration
+
+    @staticmethod
+    def _headers(response: ModelDownloadResponse) -> dict[str, str]:
+        return {
+            str(name).casefold(): str(value).strip()
+            for name, value in response.headers.items()
+        }
+
+    @staticmethod
+    def _content_range(
+        value: str | None,
+        *,
+        offset: int,
+        total: int,
+    ) -> bool:
+        if value is None:
+            return False
+        match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", value)
+        return (
+            match is not None
+            and int(match.group(1)) == offset
+            and int(match.group(2)) == total - 1
+            and int(match.group(3)) == total
+        )
+
+    def _download(
+        self,
+        file: ModelFile,
+        checkpoint: ModelDownloadCheckpoint,
+    ) -> None:
+        staging = self.service.staging_root
+        staging.mkdir(parents=True, exist_ok=True)
+        self.service.paths.assert_runtime_destination(staging)
+        partial = staging / f"{file.path}.part"
+        final = staging / file.path
+        offset = 0
+        etag = None
+        if (
+            checkpoint.current_file == file.path
+            and checkpoint.current_etag
+            and partial.is_file()
+            and partial.stat().st_size == checkpoint.current_file_bytes
+        ):
+            offset = checkpoint.current_file_bytes
+            etag = checkpoint.current_etag
+        headers = (
+            {"Range": f"bytes={offset}-", "If-Range": etag}
+            if offset > 0 and etag is not None
+            else {}
+        )
+        response = self.transport.get(
+            url=self.service.download_url(file.path),
+            headers=headers,
+            maximum_bytes=file.size + 1,
+        )
+        try:
+            response_headers = self._headers(response)
+            response_etag = response_headers.get("etag")
+            if not response_etag:
+                raise ModelAssetError("model_download_invalid")
+            if (
+                offset > 0
+                and response.status_code == 206
+                and response_etag == etag
+                and self._content_range(
+                    response_headers.get("content-range"),
+                    offset=offset,
+                    total=file.size,
+                )
+                and response_headers.get("content-length")
+                == str(file.size - offset)
+            ):
+                mode = "ab"
+                written = offset
+            elif (
+                response.status_code == 200
+                and response_headers.get("content-length") == str(file.size)
+            ):
+                mode = "wb"
+                written = 0
+            else:
+                if offset > 0:
+                    self.service.discard_partial(
+                        worker_id=self.worker_id,
+                        partial=partial,
+                        now=self.clock(),
+                    )
+                raise ModelAssetError("model_download_invalid")
+            self.service.record_progress(
+                worker_id=self.worker_id,
+                file_path=file.path,
+                file_bytes=written,
+                etag=response_etag,
+                now=self.clock(),
+                lease_duration=self.lease_duration,
+            )
+            with partial.open(mode) as destination:
+                last_checkpoint = written
+                for chunk in response:
+                    if not isinstance(chunk, bytes) or not chunk:
+                        continue
+                    if self.service.cancellation_requested(self.worker_id):
+                        raise ModelAssetError("model_install_canceled")
+                    written += len(chunk)
+                    if written > file.size:
+                        raise ModelAssetError("model_download_invalid")
+                    destination.write(chunk)
+                    if written - last_checkpoint >= 8 * 1024 * 1024:
+                        self.service.record_progress(
+                            worker_id=self.worker_id,
+                            file_path=file.path,
+                            file_bytes=written,
+                            etag=response_etag,
+                            now=self.clock(),
+                            lease_duration=self.lease_duration,
+                        )
+                        last_checkpoint = written
+                destination.flush()
+                os.fsync(destination.fileno())
+            self.service.record_progress(
+                worker_id=self.worker_id,
+                file_path=file.path,
+                file_bytes=written,
+                etag=response_etag,
+                now=self.clock(),
+                lease_duration=self.lease_duration,
+            )
+        finally:
+            response.close()
+        if written != file.size or self.service._hash(partial) != (
+            file.size,
+            file.sha256,
+        ):
+            raise ModelAssetError("model_hash_mismatch")
+        os.replace(partial, final)
+
+    def run_one(self) -> str | None:
+        now = self.clock()
+        claimed = self.service.claim(
+            self.worker_id,
+            now,
+            self.lease_duration,
+        )
+        if claimed is None:
+            return None
+        checkpoint = self.service.download_checkpoint(
+            worker_id=self.worker_id,
+            now=now,
+        )
+        if self.service.cancellation_requested(self.worker_id):
+            self.service.finish_cancel(worker_id=self.worker_id, now=now)
+            return "canceled"
+        if checkpoint.completed_files >= len(self.service.manifest.files):
+            return None
+        file = self.service.manifest.files[checkpoint.completed_files]
+        try:
+            self._download(file, checkpoint)
+            status = self.service.complete_file(
+                worker_id=self.worker_id,
+                file_path=file.path,
+                now=self.clock(),
+            )
+            if status.state == "verifying":
+                self.service.publish_verified(now=self.clock())
+                return "installed"
+            return "file_completed"
+        except ModelAssetError as error:
+            if error.code == "model_install_canceled":
+                self.service.finish_cancel(
+                    worker_id=self.worker_id,
+                    now=self.clock(),
+                )
+                return "canceled"
+            if error.code == "model_hash_mismatch":
+                self.service.fail_and_trash(
+                    worker_id=self.worker_id,
+                    safe_code=error.code,
+                    now=self.clock(),
+                )
+            else:
+                self.service.release_for_retry(
+                    worker_id=self.worker_id,
+                    safe_code=error.code,
+                    now=self.clock(),
+                )
+            raise
+        except Exception:
+            self.service.release_for_retry(
+                worker_id=self.worker_id,
+                safe_code="model_download_failed",
+                now=self.clock(),
+            )
+            raise ModelAssetError("model_download_failed") from None
