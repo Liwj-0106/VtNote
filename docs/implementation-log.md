@@ -61,6 +61,31 @@
   was deleted. The focused suite passed 38 tests and the full backend suite passed 384 tests;
   `compileall` and `pip check` passed.
 
+### Task 5 completion: controlled yt-dlp bridge and YouTube runtime readiness
+
+- Added immutable runtime manifests and granular offline readiness inspection for pinned
+  `yt-dlp==2026.7.4`, `yt-dlp-ejs==0.8.0`, and Deno 2.8.1. Distribution display versions normalize
+  to numeric triples, while EJS integration, package/executable hashes, D-drive containment,
+  reparse points, executable version, and exact `DENO_DIR` are checked independently.
+- Left release hashes intentionally unconfigured until approved artifacts are recorded. The
+  current machine truthfully reports YouTube unavailable with `ejs_missing`,
+  `manifest_unconfigured`, `deno_missing`, `deno_dir_missing`, and
+  `deno_dir_env_mismatch`, while Bilibili remains available.
+- Added a controlled yt-dlp subclass whose request director contains only
+  `VtNoteRequestHandlerRH`; urllib, requests, websockets, proxy discovery, cookies, browser
+  credentials, client certificates, remote EJS components, system Node fallback, user plugins,
+  external downloaders, postprocessors, and arbitrary option dictionaries are not registered.
+- Bound probe instances to reviewed page/extractor-aux policies and resource instances to one
+  expiring exact-host policy. Request extensions, proxies, authentication headers, policy
+  selection, and unexpected transport exceptions fail with bounded diagnostics.
+- Mapped the Task 4 bounded response into yt-dlp without a second body buffer or limit. All
+  read/line/iteration/context/close paths share the underlying response and close it once.
+  Probing always calls `extract_info(..., download=False)`, and yt-dlp's injected chapter output
+  template is removed after initialization so only the static controlled template remains.
+- Added `yt-dlp-ejs==0.8.0` to both dependency manifests without installing it or downloading
+  Deno. No live platform request or package/runtime download was made. The focused suite passed
+  36 tests and the full backend suite passed 420 tests.
+
 ## 2026-07-28
 
 ### Task 1B concurrency and transaction review follow-up
