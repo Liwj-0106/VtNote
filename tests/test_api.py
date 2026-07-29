@@ -24,6 +24,7 @@ from vtnote.sources import SourceProbeResult, make_subtitle_track
 
 
 BASE_URL = "http://127.0.0.1:8765"
+MODEL_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
 
 
 class PublicResolver:
@@ -318,6 +319,53 @@ def test_default_tencent_tester_does_not_claim_unimplemented_protocols(
 
         assert response.status_code == 501
         assert response.json()["error"]["code"] == "adapter_unavailable"
+    finally:
+        engine.dispose()
+
+
+def test_local_whisper_install_routes_require_ack_queue_and_cancel(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        initial = client.get("/api/assets/local-whisper")
+        assert initial.status_code == 200
+        assert initial.json()["state"] == "not_installed"
+        assert "path" not in initial.text.casefold()
+
+        no_ack = client.post(
+            "/api/assets/local-whisper/install",
+            headers=headers,
+            json={
+                "acknowledge_download": False,
+                "expected_revision": MODEL_REVISION,
+            },
+        )
+        assert no_ack.status_code == 400
+        assert no_ack.json()["error"]["code"] == "download_ack_required"
+
+        queued = client.post(
+            "/api/assets/local-whisper/install",
+            headers=headers,
+            json={
+                "acknowledge_download": True,
+                "expected_revision": MODEL_REVISION,
+            },
+        )
+        assert queued.status_code == 202
+        assert queued.json()["state"] == "queued"
+        assert queued.json()["revision"] == MODEL_REVISION
+        assert "D:\\" not in queued.text
+
+        canceled = client.post(
+            "/api/assets/local-whisper/cancel",
+            headers=headers,
+        )
+        assert canceled.status_code == 200
+        assert canceled.json()["state"] == "canceled"
+        assert canceled.json()["cancel_requested"] is True
+        assert "D:\\" not in canceled.text
     finally:
         engine.dispose()
 

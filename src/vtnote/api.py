@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import secrets as token_secrets
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Request
@@ -20,6 +22,7 @@ from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.exports import ExportFormat
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
+from vtnote.model_assets import ModelAssetError, ModelAssetService
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.platform_sources import build_default_platform_registry
 from vtnote.runtime_assets import RuntimeAssetService
@@ -150,6 +153,11 @@ class ProfileTestInput(InputModel):
         min_length=1,
         max_length=128,
     )
+
+
+class ModelInstallInput(InputModel):
+    acknowledge_download: bool
+    expected_revision: str = Field(min_length=40, max_length=40)
 
 
 class DefaultsPatch(InputModel):
@@ -334,6 +342,16 @@ def create_app(
         connection_tester or default_tencent_tester
     )
     selected_profile_tester = profile_tester or default_tencent_tester
+    model_assets = ModelAssetService(
+        engine=selected_engine,
+        paths=paths,
+        manifest_path=(
+            Path(__file__).resolve().parents[2]
+            / "assets"
+            / "models"
+            / "large-v3-turbo.manifest.json"
+        ),
+    )
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
 
@@ -346,6 +364,20 @@ def create_app(
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     logger = logging.getLogger("vtnote.api")
+
+    def model_status_payload(status: Any) -> dict[str, Any]:
+        return {
+            "model_name": status.model_name,
+            "revision": status.revision,
+            "state": status.state,
+            "total_bytes": status.total_bytes,
+            "downloaded_bytes": status.downloaded_bytes,
+            "completed_files": status.completed_files,
+            "current_file": status.current_file,
+            "current_file_bytes": status.current_file_bytes,
+            "cancel_requested": status.cancel_requested,
+            "error_code": status.error_code,
+        }
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
@@ -461,6 +493,30 @@ def create_app(
             "vtnote_csrf", token, httponly=False, samesite="strict", secure=False, path="/"
         )
         return response
+
+    @app.get("/api/assets/local-whisper")
+    def get_local_whisper_asset():
+        return model_status_payload(model_assets.status())
+
+    @app.post("/api/assets/local-whisper/install", status_code=202)
+    def install_local_whisper_asset(payload: ModelInstallInput):
+        try:
+            status = model_assets.request_install(
+                acknowledge_download=payload.acknowledge_download,
+                expected_revision=payload.expected_revision,
+                now=datetime.now(timezone.utc),
+            )
+        except ModelAssetError as error:
+            return _error(400, error.code, "model installation request rejected")
+        return model_status_payload(status)
+
+    @app.post("/api/assets/local-whisper/cancel")
+    def cancel_local_whisper_asset():
+        try:
+            status = model_assets.cancel(now=datetime.now(timezone.utc))
+        except ModelAssetError as error:
+            return _error(400, error.code, "model installation cancel rejected")
+        return model_status_payload(status)
 
     @app.get("/api/connections")
     def list_connections():

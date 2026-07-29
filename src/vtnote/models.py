@@ -280,6 +280,45 @@ class WorkerHeartbeatRecord(Base):
     )
 
 
+class ModelInstallRecord(Base):
+    """Durable state for the explicitly requested local Whisper model."""
+
+    __tablename__ = "model_installs"
+
+    model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    downloaded_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    completed_files: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    current_file: Mapped[str | None] = mapped_column(Text)
+    current_file_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    current_etag: Mapped[str | None] = mapped_column(Text)
+    staging_relpath: Mapped[str | None] = mapped_column(Text)
+    trash_relpath: Mapped[str | None] = mapped_column(Text)
+    installed_relpath: Mapped[str | None] = mapped_column(Text)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
 class ProviderConnectionRecord(Base):
     __tablename__ = "provider_connections"
     __table_args__ = (
