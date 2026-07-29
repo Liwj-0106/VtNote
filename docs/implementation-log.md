@@ -21,6 +21,25 @@
   deleted. The focused suite passed 19 tests and the full backend suite passed 351 tests;
   `compileall`, `pip check`, and whitespace checks passed.
 
+### Task 3 completion: unified source adapter contracts
+
+- Made `vtnote.sources` the sole owner of source probes, subtitle tracks, adapter outcomes, and
+  candidate-level failures. Removed the duplicate API probe protocol and DTOs.
+- Added runtime validation for six source kinds, non-empty bounded titles, nonnegative durations,
+  remote/local canonical-URL rules, three subtitle kinds, and unique pre-filter candidate
+  ordinals.
+- Opaque `trk_<sha256>` references are derived only from source kind, normalized language,
+  subtitle kind, format, and stable ordinal. Resource URLs, query strings, credentials, and
+  adapter-supplied arbitrary IDs cannot enter the reference generator.
+- API probe responses now use the canonical `subtitle_tracks` schema and never serialize the
+  private redirect trace. The trace remains centrally revalidated by the existing source URL
+  policy for compatibility until pinned transport replaces it.
+- Subtitle fallback now advances only for a bounded `SubtitleCandidateError` or a locally
+  converted subtitle-parse failure. Transport, filesystem, programming, and arbitrary adapter
+  validation errors propagate without silently downloading audio.
+- No network or billable request was made, no dependency changed, and no project or user file was
+  deleted. The focused suite passed 47 tests and the full backend suite passed 364 tests.
+
 ## 2026-07-28
 
 ### Task 1B concurrency and transaction review follow-up

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import secrets as token_secrets
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -23,6 +23,11 @@ from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
+from vtnote.sources import (
+    REMOTE_SOURCE_KINDS,
+    SourceAdapter,
+    SubtitleTrack,
+)
 from vtnote.sensitive_text import (
     SensitiveTextMigrationRequired,
     SensitiveTextProtectionError,
@@ -48,23 +53,6 @@ class ConnectivityResult:
     message: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class SubtitleDescriptor:
-    language: str
-    format: str
-    is_manual: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ProbeResult:
-    canonical_url: str
-    title: str | None
-    platform: str
-    duration_ms: int | None = None
-    subtitles: tuple[SubtitleDescriptor | dict[str, Any], ...] = ()
-    redirect_chain: tuple[str, ...] = ()
-
-
 class ConnectionTester(Protocol):
     def test_connection(
         self, connection: Any, secret: str | None, *, follow_redirects: Literal[False]
@@ -75,14 +63,6 @@ class ProfileTester(Protocol):
     def test_profile(
         self, profile: Any, secret: str | None, *, follow_redirects: Literal[False]
     ) -> ConnectivityResult: ...
-
-
-class SourceProbe(Protocol):
-    """Trusted Task 3 boundary: disable auto-redirects and validate peers before I/O."""
-
-    def probe(
-        self, url: str, validate_redirect: Callable[[str], str]
-    ) -> ProbeResult: ...
 
 
 class InputModel(BaseModel):
@@ -257,12 +237,14 @@ def _dump(value: Any) -> Any:
     return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
 
 
-def _dump_subtitle(value: SubtitleDescriptor | dict[str, Any]) -> dict[str, Any]:
-    track = value if isinstance(value, SubtitleDescriptor) else SubtitleDescriptor(**value)
+def _dump_subtitle(track: SubtitleTrack) -> dict[str, Any]:
     return {
+        "id": track.id,
         "language": track.language,
         "format": track.format,
-        "is_manual": track.is_manual,
+        "kind": track.kind,
+        "is_translated": track.is_translated,
+        "is_live_chat": track.is_live_chat,
     }
 
 
@@ -274,7 +256,7 @@ def create_app(
     resolver: Resolver | None = None,
     connection_tester: ConnectionTester | None = None,
     profile_tester: ProfileTester | None = None,
-    source_probe: SourceProbe | None = None,
+    source_probe: SourceAdapter | None = None,
     local_source_validator: LocalSourceValidator | None = None,
     upload_limits: UploadLimits | None = None,
     sensitive_text_protector: SensitiveTextProtector | None = None,
@@ -586,24 +568,24 @@ def create_app(
 
     @app.post("/api/sources/probe")
     def probe_source(payload: ProbeInput):
-        source_policy.validate(payload.url)
+        canonical_source = source_policy.validate(payload.url)
         if source_probe is None:
             return _error(501, "adapter_unavailable", "source probe adapter is not configured")
-        result = source_probe.probe(payload.url, source_policy.validate)
-        redirect_targets = list(result.redirect_chain)
+        result = source_probe.probe(canonical_source)
+        if result.source_kind not in REMOTE_SOURCE_KINDS or result.canonical_url is None:
+            raise ValueError("URL probe returned a non-remote source")
+        redirect_targets = list(result.redirect_trace)
         if not redirect_targets or redirect_targets[-1] != result.canonical_url:
             redirect_targets.append(result.canonical_url)
         source_policy.validate_redirect_chain(payload.url, redirect_targets)
-        if result.duration_ms is not None and result.duration_ms < 0:
-            raise ValueError("probe returned a negative duration")
-        subtitles = [_dump_subtitle(track) for track in result.subtitles]
         return {
+            "source_kind": result.source_kind,
             "canonical_url": result.canonical_url,
             "title": result.title,
-            "platform": result.platform,
             "duration_ms": result.duration_ms,
-            "subtitles": subtitles,
-            "redirect_chain": list(result.redirect_chain),
+            "subtitle_tracks": [
+                _dump_subtitle(track) for track in result.subtitle_tracks
+            ],
         }
 
     @app.get("/api/tasks")

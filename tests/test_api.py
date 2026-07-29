@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from vtnote.api import ConnectivityResult, ProbeResult, create_app
+import vtnote.api as api_module
+from vtnote.api import ConnectivityResult, create_app
 from vtnote.artifacts import write_transcript_json
 from vtnote.config import Settings
 from vtnote.database import initialize_database
@@ -17,6 +18,7 @@ from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
 from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
 from vtnote.secrets import MemorySecretStore
+from vtnote.sources import SourceProbeResult, make_subtitle_track
 
 
 BASE_URL = "http://127.0.0.1:8765"
@@ -39,34 +41,49 @@ class FakeConnectionTester:
 
 
 class FakeSourceProbe:
-    def probe(self, url: str, validate_redirect):
+    def probe(self, url: str):
         assert url == "https://youtu.be/abc"
-        validate_redirect("https://www.youtube.com/watch?v=abc")
-        return ProbeResult(
+        return SourceProbeResult(
+            source_kind="youtube",
             canonical_url="https://www.youtube.com/watch?v=abc",
             title="Example",
-            platform="youtube",
             duration_ms=12_345,
-            subtitles=(
-                {"language": "zh-Hans", "format": "vtt", "is_manual": True},
-                {"language": "en", "format": "vtt", "is_manual": False},
+            subtitle_tracks=(
+                make_subtitle_track(
+                    source_kind="youtube",
+                    language="zh-Hans",
+                    format="vtt",
+                    kind="manual",
+                    stable_ordinal=0,
+                ),
+                make_subtitle_track(
+                    source_kind="youtube",
+                    language="en",
+                    format="vtt",
+                    kind="automatic",
+                    stable_ordinal=1,
+                ),
             ),
-            redirect_chain=("https://www.youtube.com/watch?v=abc",),
+            redirect_trace=(
+                "https://www.youtube.com/watch?v=abc&token=private-trace",
+            ),
         )
 
 
 class ExplodingSourceProbe:
-    def probe(self, url: str, validate_redirect):
+    def probe(self, url: str):
         raise RuntimeError("Authorization: super-secret")
 
 
 class UnsafeReportedRedirectProbe:
-    def probe(self, url: str, validate_redirect):
-        return ProbeResult(
+    def probe(self, url: str):
+        return SourceProbeResult(
+            source_kind="youtube",
             canonical_url="https://www.youtube.com/watch?v=abc",
             title="Unsafe",
-            platform="youtube",
-            redirect_chain=("https://127.0.0.1/internal",),
+            duration_ms=None,
+            subtitle_tracks=(),
+            redirect_trace=("https://127.0.0.1/internal",),
         )
 
 
@@ -420,6 +437,8 @@ def test_defaults_patch_allows_null_only_for_nullable_fields(
 
 
 def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_path: Path) -> None:
+    assert not hasattr(api_module, "ProbeResult")
+    assert not hasattr(api_module, "SourceProbe")
     client, engine, _ = make_client(tmp_path)
     try:
         response = client.post(
@@ -439,17 +458,45 @@ def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_pa
             json={"url": "https://youtu.be/abc"},
         )
         assert response.status_code == 200
+        manual = make_subtitle_track(
+            source_kind="youtube",
+            language="zh-Hans",
+            format="vtt",
+            kind="manual",
+            stable_ordinal=0,
+        )
+        automatic = make_subtitle_track(
+            source_kind="youtube",
+            language="en",
+            format="vtt",
+            kind="automatic",
+            stable_ordinal=1,
+        )
         assert response.json() == {
+            "source_kind": "youtube",
             "canonical_url": "https://www.youtube.com/watch?v=abc",
             "title": "Example",
-            "platform": "youtube",
             "duration_ms": 12_345,
-            "subtitles": [
-                {"language": "zh-Hans", "format": "vtt", "is_manual": True},
-                {"language": "en", "format": "vtt", "is_manual": False},
+            "subtitle_tracks": [
+                {
+                    "id": manual.id,
+                    "language": "zh-hans",
+                    "format": "vtt",
+                    "kind": "manual",
+                    "is_translated": False,
+                    "is_live_chat": False,
+                },
+                {
+                    "id": automatic.id,
+                    "language": "en",
+                    "format": "vtt",
+                    "kind": "automatic",
+                    "is_translated": False,
+                    "is_live_chat": False,
+                },
             ],
-            "redirect_chain": ["https://www.youtube.com/watch?v=abc"],
         }
+        assert "private-trace" not in response.text
     finally:
         engine.dispose()
 
