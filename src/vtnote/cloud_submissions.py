@@ -190,10 +190,19 @@ class CloudSubmissionStore:
             raise CloudSubmissionError("submission_conflict") from None
         return self._view(row)
 
-    def mark_sending(self, submission_id: str) -> CloudSubmission:
+    def mark_sending(
+        self,
+        submission_id: str,
+        *,
+        signed_url_expires_at: datetime | None = None,
+    ) -> CloudSubmission:
         row = self._load(submission_id)
         if row.state != "prepared":
             raise CloudSubmissionError("invalid_submission_transition")
+        if signed_url_expires_at is not None:
+            if row.cos_object_key is None:
+                raise CloudSubmissionError("invalid_submission_timestamp")
+            row.signed_url_expires_at = _utc(signed_url_expires_at)
         row.state = "sending"
         row.safe_error_code = None
         self.session.commit()
@@ -245,6 +254,25 @@ class CloudSubmissionStore:
             _utc(marked_at)
         row.state = "submission_unknown"
         row.safe_error_code = safe_code
+        row.next_poll_at = None
+        if row.signed_url_expires_at is not None:
+            row.cleanup_due_at = (
+                row.signed_url_expires_at + timedelta(minutes=30)
+            )
+        self.session.commit()
+        return self._view(row)
+
+    def schedule_cancel_cleanup(
+        self,
+        submission_id: str,
+        canceled_at: datetime,
+    ) -> CloudSubmission:
+        row = self._load(submission_id)
+        timestamp = _utc(canceled_at)
+        if row.state != "prepared" or row.cos_object_key is None:
+            raise CloudSubmissionError("invalid_submission_transition")
+        row.state = "canceled"
+        row.cleanup_due_at = timestamp
         row.next_poll_at = None
         self.session.commit()
         return self._view(row)

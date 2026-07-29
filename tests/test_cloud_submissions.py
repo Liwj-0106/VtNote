@@ -173,6 +173,46 @@ def test_possible_send_without_task_id_becomes_unknown_and_never_submitted(
         engine.dispose()
 
 
+def test_unknown_cos_submission_defers_cleanup_until_signed_url_expiry_plus_grace(
+    tmp_path: Path,
+) -> None:
+    engine, session, store = seeded(tmp_path)
+    try:
+        expires_at = NOW + timedelta(hours=6)
+        sending = store.mark_sending(
+            store.prepare(STAGE_ID, AUDIO_HASH, locator()).id,
+            signed_url_expires_at=expires_at,
+        )
+        unknown = store.mark_unknown(
+            sending.id,
+            "create_response_lost",
+            marked_at=NOW,
+        )
+
+        assert unknown.signed_url_expires_at == expires_at
+        assert unknown.cleanup_due_at == expires_at + timedelta(minutes=30)
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_cancel_before_send_schedules_immediate_cos_cleanup(
+    tmp_path: Path,
+) -> None:
+    engine, session, store = seeded(tmp_path)
+    try:
+        prepared = store.prepare(STAGE_ID, AUDIO_HASH, locator())
+
+        canceled = store.schedule_cancel_cleanup(prepared.id, NOW)
+
+        assert canceled.state == "canceled"
+        assert canceled.cleanup_due_at == NOW
+        assert canceled.cos_locator == locator()
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_schema_has_due_indexes_and_no_signed_url_or_raw_payload_columns(
     tmp_path: Path,
 ) -> None:

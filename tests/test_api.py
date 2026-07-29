@@ -17,6 +17,7 @@ from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
+from vtnote.provider_credentials import TencentCredentialBundle
 from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
 from vtnote.secrets import MemorySecretStore
 from vtnote.sources import SourceProbeResult, make_subtitle_track
@@ -39,6 +40,23 @@ class FakeConnectionTester:
         assert secret == "super-secret"
         assert follow_redirects is False
         return ConnectivityResult(ok=True, message="accepted super-secret")
+
+
+class TencentConnectionTester:
+    def __init__(self) -> None:
+        self.credentials = None
+
+    def test_connection(
+        self,
+        connection,
+        credentials,
+        *,
+        follow_redirects: bool,
+    ):
+        self.credentials = credentials
+        assert connection.protocol == "tencent_recording_asr"
+        assert follow_redirects is False
+        return ConnectivityResult(ok=True, message="validated")
 
 
 class FakeProfileTester:
@@ -193,6 +211,113 @@ def test_tencent_credentials_are_atomic_redacted_and_reject_sts_fields(
         assert rejected.status_code == 400
         assert rejected.json()["error"]["code"] == "invalid_configuration"
         assert "temporary" not in rejected.text
+    finally:
+        engine.dispose()
+
+
+def test_tencent_connection_test_receives_an_atomic_typed_bundle(
+    tmp_path: Path,
+) -> None:
+    tester = TencentConnectionTester()
+    client, engine, _ = make_client(tmp_path, connection_tester=tester)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent typed test",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {},
+                "credentials": {
+                    "secret_id": "AKID-example",
+                    "secret_key": "secret-key",
+                },
+            },
+        ).json()
+
+        response = client.post(
+            f"/api/connections/{connection['id']}/test",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["test_ok"] is True
+        assert isinstance(tester.credentials, TencentCredentialBundle)
+        assert (
+            tester.credentials.secret_id.get_secret_value()
+            == "AKID-example"
+        )
+        assert (
+            tester.credentials.secret_key.get_secret_value()
+            == "secret-key"
+        )
+        assert "AKID-example" not in response.text
+        assert "secret-key" not in response.text
+    finally:
+        engine.dispose()
+
+
+def test_default_production_composition_wires_tencent_connection_policy_test(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent default adapter",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {},
+                "credentials": {
+                    "secret_id": "AKID-example",
+                    "secret_key": "secret-key",
+                },
+            },
+        ).json()
+
+        response = client.post(
+            f"/api/connections/{connection['id']}/test",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["test_ok"] is True
+        assert "AKID-example" not in response.text
+        assert "secret-key" not in response.text
+    finally:
+        engine.dispose()
+
+
+def test_default_tencent_tester_does_not_claim_unimplemented_protocols(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Future domestic chat",
+                "protocol": "openai_compatible",
+                "base_url": "https://api.example.com/v1",
+                "parameters": {},
+                "secret": "domestic-key",
+            },
+        ).json()
+
+        response = client.post(
+            f"/api/connections/{connection['id']}/test",
+            headers=headers,
+        )
+
+        assert response.status_code == 501
+        assert response.json()["error"]["code"] == "adapter_unavailable"
     finally:
         engine.dispose()
 

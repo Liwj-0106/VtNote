@@ -20,6 +20,7 @@ dependencies = [
   "python-multipart==0.0.32",
   "faster-whisper==1.2.1",
   "ctranslate2==4.8.1",
+  "cos-python-sdk-v5==1.9.44",
 ]
 
 [project.optional-dependencies]

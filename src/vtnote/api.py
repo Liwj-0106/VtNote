@@ -39,6 +39,11 @@ from vtnote.sensitive_text import (
     migrate_sensitive_text,
 )
 from vtnote.tasks import InvalidTaskOperation, LocalSourceValidator, TaskService
+from vtnote.tencent_asr import (
+    TencentConnectivityTester,
+    TencentRecordingClient,
+    UploadedSpeechSampleResolver,
+)
 from vtnote.uploads import (
     LocalSourceFiles,
     MultipartUploadStager,
@@ -58,7 +63,7 @@ class ConnectivityResult:
 
 class ConnectionTester(Protocol):
     def test_connection(
-        self, connection: Any, secret: str | None, *, follow_redirects: Literal[False]
+        self, connection: Any, credentials: Any, *, follow_redirects: Literal[False]
     ) -> ConnectivityResult: ...
 
 
@@ -318,6 +323,17 @@ def create_app(
         resolver=selected_resolver,
         session_factory=sessions,
     )
+    default_tencent_tester = TencentConnectivityTester(
+        client=TencentRecordingClient(),
+        sample_resolver=UploadedSpeechSampleResolver(
+            engine=selected_engine,
+            paths=paths,
+        ),
+    )
+    selected_connection_tester = (
+        connection_tester or default_tencent_tester
+    )
+    selected_profile_tester = profile_tester or default_tencent_tester
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
 
@@ -508,12 +524,25 @@ def create_app(
     def test_connection(connection_id: str):
         session, configuration, _ = services()
         try:
-            if connection_tester is None:
-                return _error(501, "adapter_unavailable", "connectivity adapter is not configured")
             view = configuration.get_connection(connection_id)
-            secret = configuration.secret_for_connection(connection_id)
+            if (
+                connection_tester is None
+                and view.protocol != "tencent_recording_asr"
+            ):
+                return _error(
+                    501,
+                    "adapter_unavailable",
+                    "connectivity adapter is not configured",
+                )
+            credentials = configuration.credential_bundle_for_connection(
+                connection_id
+            )
             try:
-                result = connection_tester.test_connection(view, secret, follow_redirects=False)
+                result = selected_connection_tester.test_connection(
+                    view,
+                    credentials,
+                    follow_redirects=False,
+                )
             except Exception:
                 result = ConnectivityResult(False, "Connectivity test failed")
             safe_message = (
@@ -574,9 +603,16 @@ def create_app(
     def test_profile(profile_id: str, payload: ProfileTestInput):
         session, configuration, _ = services()
         try:
-            if profile_tester is None:
-                return _error(501, "adapter_unavailable", "connectivity adapter is not configured")
             profile = configuration.get_profile(profile_id)
+            if (
+                profile_tester is None
+                and profile.protocol != "tencent_recording_asr"
+            ):
+                return _error(
+                    501,
+                    "adapter_unavailable",
+                    "connectivity adapter is not configured",
+                )
             if (
                 payload.test_kind == "provider_profile"
                 and not payload.acknowledge_billable_request
@@ -606,7 +642,7 @@ def create_app(
                 profile.connection_id
             )
             try:
-                result = profile_tester.test_profile(
+                result = selected_profile_tester.test_profile(
                     profile,
                     credentials,
                     payload,

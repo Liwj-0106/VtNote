@@ -6,7 +6,10 @@ import re
 from collections.abc import Iterable
 
 
-_KEY = r"(?:access[_-]?token|api[_-]?key|authorization|token|secret)"
+_KEY = (
+    r"(?:access[_-]?token|api[_-]?key|authorization|token|"
+    r"secret(?:[_-]?(?:id|key))?|data|url)"
+)
 _QUOTED_VALUE = re.compile(
     rf"(?i)([\"']?{_KEY}[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)"
 )
