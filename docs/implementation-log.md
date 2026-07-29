@@ -510,3 +510,22 @@
 - Focused logging, rotation, redaction, diagnostics, maintenance lease, provider worker, and
   launcher checks passed. Frontend lint and the production build also passed; no live provider
   request was sent.
+
+### Task 23: reproducible dependencies and release evidence
+
+- Added an exact verified Python environment lock alongside the native Conda pins, plus installation,
+  backup/restore/removal guidance, a release checklist, and a third-party component/license register.
+- Froze the YouTube runtime evidence for `yt-dlp-ejs 0.8.0` and the official Deno 2.8.1 Windows x64
+  artifact. Added a user-acknowledged installer that accepts only the official zip/executable
+  hashes, extracts only `deno.exe`, and writes it below the D-drive managed runtime root.
+- Installed the pinned EJS package and verified official Deno runtime on this development machine.
+  The launcher selects the exact managed `DENO_DIR`; offline readiness now reports YouTube available
+  with no remote EJS components or system Node fallback.
+- Added deterministic release-evidence collection for source revision, Python/frontend locks,
+  FFmpeg version/build flags/binary, Deno/EJS, and the local-model manifest. Absolute paths are
+  rejected from the output. The current Conda FFmpeg is truthfully classified
+  `development_gpl_only` because its build contains `--enable-gpl`; it cannot be labeled an LGPL
+  release candidate.
+- Focused YouTube/runtime tests passed with 71 checks, and the release-evidence test passed. The Deno
+  archive and checksum evidence remain in the task-specific D-drive cache and are not committed or
+  redistributed.

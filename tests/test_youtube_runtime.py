@@ -99,6 +99,10 @@ def configured_manifest() -> YoutubeRuntimeManifest:
         ("2026.7.4", (2026, 7, 4)),
         ("2026.07.04", (2026, 7, 4)),
         ("deno 2.8.1", (2, 8, 1)),
+        (
+            "deno 2.8.1 (stable, release, x86_64-pc-windows-msvc)",
+            (2, 8, 1),
+        ),
         ("0.8.0", (0, 8, 0)),
     ],
 )
@@ -146,7 +150,6 @@ def test_current_partial_install_is_youtube_only_and_bilibili_remains_ready(
     assert status.deno_dir == runtime_root / "deno-cache" / "2.8.1"
     assert status.codes == (
         "ejs_missing",
-        "manifest_unconfigured",
         "deno_missing",
         "deno_dir_missing",
         "deno_dir_env_mismatch",
@@ -159,9 +162,13 @@ def test_current_partial_install_is_youtube_only_and_bilibili_remains_ready(
     assert all(call[0] not in {"which", "node", "npm", "npx"} for call in inventory.calls)
 
 
-def test_manifest_is_immutable_and_unconfigured_hashes_never_claim_ready() -> None:
-    assert DEFAULT_YOUTUBE_RUNTIME_MANIFEST.ejs_package_sha256 is None
-    assert DEFAULT_YOUTUBE_RUNTIME_MANIFEST.deno_executable_sha256 is None
+def test_release_manifest_is_immutable_and_contains_reviewed_hashes() -> None:
+    assert DEFAULT_YOUTUBE_RUNTIME_MANIFEST.ejs_package_sha256 == (
+        "ff4842afba40d40e34c37184543d15ae036d171dd525863f7835af557600402a"
+    )
+    assert DEFAULT_YOUTUBE_RUNTIME_MANIFEST.deno_executable_sha256 == (
+        "a8afddac131261dc9e085c6a1a79544f0567bd09e481034b5d1533588cba9b30"
+    )
     with pytest.raises(FrozenInstanceError):
         DEFAULT_YOUTUBE_RUNTIME_MANIFEST.deno_version = (9, 9, 9)  # type: ignore[misc]
 

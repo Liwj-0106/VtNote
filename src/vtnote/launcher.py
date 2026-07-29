@@ -43,6 +43,7 @@ from vtnote.transcribe_stage import (
 from vtnote.url_security import SocketResolver
 from vtnote.worker import Worker, build_model_installer_loop
 from vtnote.worker_store import WorkerStore
+from vtnote.youtube_runtime import configure_managed_runtime_environment
 
 
 class LauncherError(RuntimeError):
@@ -165,6 +166,7 @@ def run_api(settings: Settings) -> int:
     production_settings = settings.model_copy(update={"enable_dev_docs": False})
     paths = StoragePaths.from_settings(production_settings)
     paths.ensure_roots()
+    configure_managed_runtime_environment(production_settings)
     configure_logging(paths.runtime("logs"), process_name="api")
     uvicorn.run(
         create_app(settings=production_settings),
@@ -188,6 +190,7 @@ def _manifest_path() -> Path:
 def run_worker(settings: Settings) -> int:
     paths = StoragePaths.from_settings(settings)
     paths.ensure_roots()
+    configure_managed_runtime_environment(settings)
     configure_logging(paths.runtime("logs"), process_name="worker")
     protector = WindowsDpapiSensitiveTextProtector()
     engine = initialize_database(

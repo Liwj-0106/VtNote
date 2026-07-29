@@ -15,7 +15,10 @@ from typing import Protocol
 from vtnote.config import Settings
 
 
-_VERSION = re.compile(r"^(?:deno )?([0-9]+)\.([0-9]+)\.([0-9]+)$")
+_VERSION = re.compile(
+    r"^(?:deno )?([0-9]+)\.([0-9]+)\.([0-9]+)"
+    r"(?: \([A-Za-z0-9_,. -]{1,96}\))?$"
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REPARSE_POINT = 0x400
 
@@ -61,8 +64,12 @@ DEFAULT_YOUTUBE_RUNTIME_MANIFEST = YoutubeRuntimeManifest(
     yt_dlp_version=(2026, 7, 4),
     ejs_version=(0, 8, 0),
     deno_version=(2, 8, 1),
-    ejs_package_sha256=None,
-    deno_executable_sha256=None,
+    ejs_package_sha256=(
+        "ff4842afba40d40e34c37184543d15ae036d171dd525863f7835af557600402a"
+    ),
+    deno_executable_sha256=(
+        "a8afddac131261dc9e085c6a1a79544f0567bd09e481034b5d1533588cba9b30"
+    ),
 )
 
 
@@ -256,6 +263,18 @@ def _runtime_paths(
     executable = root / "deno" / version / "deno.exe"
     deno_dir = root / "deno-cache" / version
     return root, executable, deno_dir
+
+
+def configure_managed_runtime_environment(settings: Settings) -> Path:
+    """Select the pinned D-drive Deno cache for launcher-owned processes."""
+
+    _, _, deno_dir = _runtime_paths(
+        settings,
+        DEFAULT_YOUTUBE_RUNTIME_MANIFEST,
+    )
+    deno_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["DENO_DIR"] = str(deno_dir)
+    return deno_dir
 
 
 def inspect_youtube_runtime(
