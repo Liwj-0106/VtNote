@@ -576,3 +576,19 @@
   trash by the lease-guarded maintenance pass.
 - Focused API, task-history, maintenance, and runtime-asset lifecycle coverage passed with 51
   checks. Frontend lint and production build passed after the file-picker integration.
+
+### Final offline verification
+
+- The complete backend suite passed: 739 tests in 31.81 seconds. The only warning is the known
+  pytest `cache_dir` notice caused by intentionally disabling the cache provider for that run; it
+  is unrelated to application behavior.
+- Frontend verification passed with six Vitest files/eight tests, ESLint, a production Vite build,
+  and three single-worker Playwright journeys in installed Chrome. The initial aggregate command
+  exposed that Vitest also collected `e2e/*.spec.ts`; the Vitest include boundary now explicitly
+  contains only `src/**/*.test.{ts,tsx}`, after which the full frontend sequence passed.
+- `pip check` reported no broken requirements and `npm audit --audit-level=high` reported zero
+  vulnerabilities. Python bytecode compilation, `git diff --check`, and a credential-pattern scan
+  over runtime, frontend, and tooling sources passed.
+- A real production API process started with isolated D-drive data/runtime roots on loopback,
+  returned `status=ok` from `/api/health`, served the built SPA root with HTTP 200, and was then
+  stopped. No provider request was sent.
