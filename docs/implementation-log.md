@@ -1,5 +1,26 @@
 # VtNote implementation log
 
+## 2026-07-29
+
+### Task 2 completion: durable worker leases and stage transitions
+
+- Added a SQLite-backed worker store whose claim, heartbeat, terminal transition, recovery, and
+  resource-lease operations each own a short `BEGIN IMMEDIATE` transaction. Handler execution
+  occurs only after the claim transaction commits.
+- Claims select only the latest stage attempt, enforce the shared dependency graph, and use stable
+  task-created/stage/item/attempt ordering. Completion, failure, heartbeat, and cancellation are
+  guarded by owner, attempt, recovery generation, unexpired lease, and active task/item state.
+- Added at-least-once crash recovery, cooperative cancellation checkpoints, immutable retry
+  overrides, worker heartbeat records, bounded idle backoff, and claim-owned generic resource
+  leases. Resource ownership survives heartbeat renewal and is released on every terminal or
+  recovery path.
+- Added real file-backed, independent-engine concurrency coverage plus dependency, stale-owner,
+  cancellation-race, recovery, resource, aggregation, worker-loop, and immutable-context tests.
+  Both requirements and code-quality reviews found no remaining Critical or Important issue.
+- No network or billable request was made, no dependency changed, and no project or user file was
+  deleted. The focused suite passed 19 tests and the full backend suite passed 351 tests;
+  `compileall`, `pip check`, and whitespace checks passed.
+
 ## 2026-07-28
 
 ### Task 1B concurrency and transaction review follow-up
