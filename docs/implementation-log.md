@@ -545,3 +545,20 @@
   tertiary-text contrast defect before passing.
 - The three backend E2E tests and three browser journeys passed. They use only local fixtures and
   did not send a provider request or modify a user-owned source file.
+
+### Task 25: guarded live-POC harness
+
+- Added a versioned manifest contract for 30–50 explicitly authorized samples. Validation enforces
+  minimum Bilibili, YouTube, local-media, Mandarin, English, and mixed-language counts plus complete
+  duration, subtitle, audio-condition, provider-route, and recovery coverage.
+- Live initialization requires independent `--allow-network` and `--allow-billing` switches, an
+  owner-approved CNY ceiling, current Tencent upload and Bailian text-consent revision attestations,
+  the official Bailian Beijing region, direct-only network evidence, and a dedicated D-drive output.
+- Added a resumable atomic evidence journal tied to a SHA-256 of the exact manifest and its
+  authorized sample IDs. Completed or possibly submitted billable stages cannot be recorded twice;
+  cumulative recorded billing cannot exceed the approved ceiling.
+- Raw numeric measurements remain available for deterministic aggregates. Credential-shaped fields,
+  prompts, URLs, source paths, tokens, and raw responses are excluded or redacted from results.
+- Four offline harness tests passed. No live POC was run because no user-authorized 30–50-sample
+  corpus, provider credentials, or billing approval was supplied in this implementation session.
+  The honest release state remains: implementation complete; live release qualification pending.
