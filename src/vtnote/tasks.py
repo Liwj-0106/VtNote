@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
@@ -844,9 +845,10 @@ class TaskService:
             raise InvalidTaskOperation("terminal task cannot be canceled")
         if task.status == "cancel_requested":
             return self._view(task)
-        running = task.status == "running" or any(
-            item.status == "running" or any(run.status == "running" for run in item.stage_runs)
+        running = any(
+            run.status == "running"
             for item in task.items
+            for run in item.stage_runs
         )
         target = "cancel_requested" if running else "canceled"
         expected_status = task.status
@@ -904,6 +906,21 @@ class TaskService:
                 StageRunRecord.status == "queued",
             )
             .values(status="canceled")
+            .execution_options(synchronize_session=False)
+        )
+        self.session.execute(
+            update(StageRunRecord)
+            .where(
+                StageRunRecord.item_id.in_(item_ids),
+                StageRunRecord.status == "waiting_external",
+            )
+            .values(
+                status="canceled",
+                finished_at=datetime.now(timezone.utc),
+                lease_owner=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+            )
             .execution_options(synchronize_session=False)
         )
         self.session.commit()

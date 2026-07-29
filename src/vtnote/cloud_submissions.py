@@ -77,6 +77,7 @@ class CloudSubmission:
     remote_terminal_at: datetime | None
     submitted_at: datetime | None
     result_expires_at: datetime | None
+    normalized_result: dict[str, object] | None = None
 
 
 class CloudSubmissionStore:
@@ -114,6 +115,11 @@ class CloudSubmissionStore:
             remote_terminal_at=row.remote_terminal_at,
             submitted_at=row.submitted_at,
             result_expires_at=row.result_expires_at,
+            normalized_result=(
+                dict(row.normalized_result_json)
+                if row.normalized_result_json is not None
+                else None
+            ),
         )
 
     def _load(self, submission_id: str) -> CloudSubmissionRecord:
@@ -255,10 +261,35 @@ class CloudSubmissionStore:
         row.state = "submission_unknown"
         row.safe_error_code = safe_code
         row.next_poll_at = None
+        stage = self.session.get(StageRunRecord, row.stage_run_id)
+        if stage is not None:
+            stage.external_submission_state = "submission_unknown"
         if row.signed_url_expires_at is not None:
             row.cleanup_due_at = (
                 row.signed_url_expires_at + timedelta(minutes=30)
             )
+        self.session.commit()
+        return self._view(row)
+
+    def mark_failed_before_submit(
+        self,
+        submission_id: str,
+        safe_code: str,
+        *,
+        failed_at: datetime,
+    ) -> CloudSubmission:
+        row = self._load(submission_id)
+        if row.state not in {"prepared", "sending"}:
+            raise CloudSubmissionError("invalid_submission_transition")
+        if not isinstance(safe_code, str) or _SAFE_CODE.fullmatch(safe_code) is None:
+            raise CloudSubmissionError("invalid_submission_error_code")
+        timestamp = _utc(failed_at)
+        row.state = "failed"
+        row.safe_error_code = safe_code
+        row.remote_terminal_at = timestamp
+        row.next_poll_at = None
+        if row.cos_object_key is not None:
+            row.cleanup_due_at = timestamp
         self.session.commit()
         return self._view(row)
 

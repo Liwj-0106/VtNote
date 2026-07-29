@@ -218,6 +218,41 @@ def transcript_from_source_subtitle(
     )
 
 
+def transcript_from_timed_text(
+    cues: tuple[tuple[int, int, str], ...],
+    *,
+    language: str,
+    duration_ms: int,
+    method: ProvenanceMethod,
+    provider: str,
+    model: str,
+) -> Transcript:
+    """Build a canonical transcript from already validated ASR sentence cues."""
+
+    if not cues:
+        raise ValueError("ASR result contains no timed text")
+    segments: list[TranscriptSegment] = []
+    for index, (start_ms, end_ms, text) in enumerate(cues, start=1):
+        segments.append(
+            TranscriptSegment(
+                id=f"seg_{index:06d}",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                text=text,
+            )
+        )
+    return Transcript(
+        language=language,
+        duration_ms=max(duration_ms, max(segment.end_ms for segment in segments)),
+        provenance=Provenance(
+            method=method,
+            provider=provider,
+            model=model,
+        ),
+        segments=tuple(segments),
+    )
+
+
 def write_note_markdown(
     paths: StoragePaths, item_id: str, note_id: str, markdown: str
 ) -> Path:
@@ -246,6 +281,21 @@ def ensure_transcript_json(
 
     return _ensure_immutable(
         paths, paths.transcript(item_id), canonical_transcript_bytes(transcript)
+    )
+
+
+def ensure_transcription_recovery(
+    paths: StoragePaths,
+    item_id: str,
+    stage_run_id: str,
+    transcript: Transcript,
+) -> Path:
+    """Persist the normalized ASR result before its final publication boundary."""
+
+    return _ensure_immutable(
+        paths,
+        paths.transcription_recovery(item_id, stage_run_id),
+        canonical_transcript_bytes(transcript),
     )
 
 

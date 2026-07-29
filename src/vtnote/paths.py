@@ -137,6 +137,18 @@ class StoragePaths:
     def transcript(self, item_id: str | UUID) -> Path:
         return self.durable("items", _uuid_component(item_id), "transcript.json")
 
+    def transcription_recovery(
+        self,
+        item_id: str | UUID,
+        stage_run_id: str | UUID,
+    ) -> Path:
+        return self.durable(
+            "items",
+            _uuid_component(item_id),
+            "recovery",
+            f"{_uuid_component(stage_run_id)}.json",
+        )
+
     def translation(self, item_id: str | UUID, language: str) -> Path:
         return self.durable(
             "items",

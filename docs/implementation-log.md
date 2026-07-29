@@ -388,3 +388,13 @@
 - Kept typed owned paths lexical until every ancestor has been checked for symlink/junction/reparse substitution; resolved containment is now only the final check. A cross-item audio junction can no longer alias one item's registered media to another item's file.
 - Made due purge authorization and deletion one SQLite-linearizable operation. The service rejects caller-pending Session mutations, clears harmless read autobegins, acquires `BEGIN IMMEDIATE` before loading status, expires cached ORM state, and retains the write reservation through runtime-file unlink and asset-row/event commit.
 - Added deterministic two-Session race coverage proving a competing queued transition cannot execute between purge authorization and file deletion, while an active transition that commits first is observed and causes purge refusal. No Task 3B behavior or project files were removed.
+
+### Tasks 10-11: GPU-only local ASR and durable cloud/local routing
+
+- Added a lazy `faster-whisper` adapter fixed to the managed `large-v3-turbo` revision, CUDA, `int8_float16`, VAD, segment timestamps, and `local_files_only=True`. It never selects CPU, reports CUDA absence explicitly, checks cancellation between lazy segments, and records model-file and CUDA-library provenance.
+- Migrated only the mutable default from `device=auto` to `device=cuda`. Historical task snapshots remain immutable and fail with `legacy_local_asr_snapshot_requires_retry`.
+- Added snapshot-only ASR routing for local, cloud, and auto modes. Tencent create is attempted at most once; known auto-mode failures and unknown outcomes can fall back locally, while unknown outcomes retain a possible-charge warning and are never blindly resubmitted.
+- Added an explicit `waiting_external` stage state so cloud polling is handled by the durable Tencent reconciler without occupying the main worker. Parsed sentence results, not raw provider responses, are persisted for query-only crash recovery and immutable publication.
+- Added private-COS routing, deterministic object reuse after a crash, provider-terminal cleanup scheduling, cancellation that stops the local stage without abandoning remote cleanup, and a global GPU lease.
+- Added a compact normalized local-ASR recovery artifact before final transcript publication. A process loss after inference or file publication resumes without repeating inference, while conflicting pre-existing content remains immutable.
+- Added end-to-end coverage for local/cloud/auto routing, inline/COS submission, known/unknown fallback, provider expiry, cancellation, main-loop fairness, exact snapshot credential revisions, crash windows, and publication races. No user-owned media is modified or deleted.

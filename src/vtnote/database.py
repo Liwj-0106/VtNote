@@ -51,6 +51,9 @@ _ADDITIVE_COLUMNS = {
     "default_settings": {
         "notes_custom_prompt_envelope_json": "JSON",
     },
+    "cloud_submissions": {
+        "normalized_result_json": "JSON",
+    },
 }
 
 

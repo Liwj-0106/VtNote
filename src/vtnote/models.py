@@ -200,6 +200,9 @@ class CloudSubmissionRecord(Base):
     remote_terminal_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     result_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    normalized_result_json: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, nullable=False
     )

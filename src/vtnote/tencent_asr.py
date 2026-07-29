@@ -23,7 +23,11 @@ from vtnote.media import (
     FfmpegMediaProcessor,
     PreparedAudio,
 )
-from vtnote.models import CloudSubmissionRecord, ResourceLeaseRecord
+from vtnote.models import (
+    CloudSubmissionRecord,
+    ResourceLeaseRecord,
+    StageRunRecord,
+)
 from vtnote.paths import StoragePaths
 from vtnote.provider_credentials import TencentCredentialBundle
 from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
@@ -558,6 +562,33 @@ class TencentSubmissionReconciler:
             else:
                 session.rollback()
 
+    @staticmethod
+    def _wake_transcribe_stage(
+        session: Session,
+        submission: CloudSubmissionRecord,
+        *,
+        terminal_state: str,
+        now: datetime,
+    ) -> None:
+        stage = session.get(StageRunRecord, submission.stage_run_id)
+        if stage is None or stage.status != "waiting_external":
+            return
+        stage.external_submission_state = terminal_state
+        stage.provider_status_code = (
+            "success" if terminal_state == "succeeded" else "failed"
+        )
+        stage.progress_json = None
+        canceled = (
+            stage.item.status in {"cancel_requested", "canceled"}
+            or stage.item.task.status in {"cancel_requested", "canceled"}
+        )
+        if canceled:
+            stage.status = "canceled"
+            stage.finished_at = now
+        else:
+            stage.status = "queued"
+            stage.finished_at = None
+
     def _expire(self, claim: _ReconcileClaim, now: datetime) -> ReconcileResult:
         with Session(self.engine) as session:
             self._begin(session)
@@ -572,6 +603,12 @@ class TencentSubmissionReconciler:
             row.remote_terminal_at = now
             if row.cos_object_key is not None:
                 row.cleanup_due_at = now
+            self._wake_transcribe_stage(
+                session,
+                row,
+                terminal_state="failed",
+                now=now,
+            )
             session.delete(lease)
             session.commit()
         return ReconcileResult(claim.submission_id, "provider_result_expired")
@@ -673,10 +710,31 @@ class TencentSubmissionReconciler:
                     if outcome.kind == CloudAsrOutcomeKind.SUCCESS
                     else "failed"
                 )
+                row.normalized_result_json = (
+                    {
+                        "language": "zh-Hans",
+                        "sentences": [
+                            {
+                                "start_ms": sentence.start_ms,
+                                "end_ms": sentence.end_ms,
+                                "text": sentence.text,
+                            }
+                            for sentence in outcome.sentences
+                        ],
+                    }
+                    if outcome.kind == CloudAsrOutcomeKind.SUCCESS
+                    else None
+                )
                 if outcome.request_id is not None:
                     row.provider_request_id = outcome.request_id
                 if row.cos_object_key is not None:
                     row.cleanup_due_at = now
+                self._wake_transcribe_stage(
+                    session,
+                    row,
+                    terminal_state=row.state,
+                    now=now,
+                )
                 action = (
                     "provider_succeeded"
                     if outcome.kind == CloudAsrOutcomeKind.SUCCESS

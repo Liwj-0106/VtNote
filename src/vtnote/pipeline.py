@@ -11,7 +11,9 @@ TERMINAL_STATUSES = frozenset(
     {"canceled", "completed", "completed_with_warnings", "failed"}
 )
 RETRYABLE_STAGE_STATUSES = frozenset({"failed", "canceled"})
-ACTIVE_STAGE_STATUSES = frozenset({"running", "cancel_requested"})
+ACTIVE_STAGE_STATUSES = frozenset(
+    {"running", "waiting_external", "cancel_requested"}
+)
 SUCCESSFUL_STAGE_STATUSES = frozenset({"completed", "skipped"})
 STAGE_ORDER = {"source": 0, "transcribe": 1, "translate": 2, "notes": 3}
 STAGE_DEPENDENCIES = {
@@ -28,7 +30,16 @@ RETRY_ACTIVE_CONFLICTS = {
 }
 
 _KNOWN_STAGE_STATUSES = frozenset(
-    {"queued", "running", "cancel_requested", "canceled", "failed", "completed", "skipped"}
+    {
+        "queued",
+        "running",
+        "waiting_external",
+        "cancel_requested",
+        "canceled",
+        "failed",
+        "completed",
+        "skipped",
+    }
 )
 _CORE_STAGES = ("source", "transcribe")
 _PROGRESS_KEYS = frozenset({"current", "total", "unit", "message_code"})
@@ -217,7 +228,10 @@ def aggregate_item_status(
         raise ValueError("unknown pipeline stage status")
     if any(status == "cancel_requested" for status in latest_status_by_stage.values()):
         return "cancel_requested"
-    if any(status == "running" for status in latest_status_by_stage.values()):
+    if any(
+        status in {"running", "waiting_external"}
+        for status in latest_status_by_stage.values()
+    ):
         return "running"
 
     core_statuses = [latest_status_by_stage.get(stage) for stage in _CORE_STAGES]

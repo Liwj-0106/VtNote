@@ -89,7 +89,15 @@ class StageResult:
         ):
             raise ValueError("invalid stage result skip stages")
         if self.execution_evidence is not None:
-            normalized = validate_execution_evidence(self.execution_evidence)
+            selected_model = self.execution_evidence.get("model")
+            normalized = validate_execution_evidence(
+                self.execution_evidence,
+                allowed_models=(
+                    (selected_model,)
+                    if isinstance(selected_model, str)
+                    else ()
+                ),
+            )
             object.__setattr__(
                 self,
                 "execution_evidence",
@@ -107,6 +115,40 @@ class StageFailure:
     def __post_init__(self) -> None:
         if _ERROR_CODE.fullmatch(self.error_code) is None:
             raise ValueError("invalid stage error code")
+
+
+class StageDeferred(RuntimeError):
+    """Yield a claimed stage while a durable external request is pending."""
+
+    def __init__(
+        self,
+        *,
+        external_submission_state: str,
+        execution_evidence: Mapping[str, str],
+        warning: str | None = None,
+    ) -> None:
+        if external_submission_state not in {"submitted", "waiting"}:
+            raise ValueError("invalid external submission state")
+        self.external_submission_state = external_submission_state
+        selected_model = execution_evidence.get("model")
+        self.execution_evidence = MappingProxyType(
+            dict(
+                validate_execution_evidence(
+                    execution_evidence,
+                    allowed_models=(
+                        (selected_model,)
+                        if isinstance(selected_model, str)
+                        else ()
+                    ),
+                )
+            )
+        )
+        self.warning = sanitize_diagnostic(warning)
+        super().__init__("stage_waiting_external")
+
+
+class StageRequeue(RuntimeError):
+    """Release a claim back to the durable queue without recording failure."""
 
 
 class WorkerStore:
@@ -128,6 +170,48 @@ class WorkerStore:
             if current is None or row.attempt > current.attempt:
                 latest[row.stage] = row
         return latest
+
+    @staticmethod
+    def _allowed_stage_models(row: StageRunRecord) -> tuple[str, ...]:
+        snapshot = row.item.task.pipeline_snapshot_json
+        if not isinstance(snapshot, dict):
+            return ()
+        local = snapshot.get("local_whisper")
+        local_model = (
+            local.get("model")
+            if isinstance(local, dict) and isinstance(local.get("model"), str)
+            else None
+        )
+        override = row.retry_override_json
+        if isinstance(override, dict):
+            strategy = override.get("strategy")
+            if strategy == "local":
+                return (local_model,) if isinstance(local_model, str) else ()
+            override_asr = override.get("asr")
+            override_profile = (
+                override_asr.get("profile")
+                if isinstance(override_asr, dict)
+                else None
+            )
+            if (
+                strategy == "cloud_confirmed"
+                and isinstance(override_profile, dict)
+                and isinstance(override_profile.get("model"), str)
+            ):
+                return (override_profile["model"],)
+        values: list[str] = []
+        asr = snapshot.get("asr")
+        mode = asr.get("mode") if isinstance(asr, dict) else None
+        profile = asr.get("profile") if isinstance(asr, dict) else None
+        if mode in {"local", "auto"} and isinstance(local_model, str):
+            values.append(local_model)
+        if (
+            mode in {"cloud", "auto"}
+            and isinstance(profile, dict)
+            and isinstance(profile.get("model"), str)
+        ):
+            values.append(profile["model"])
+        return tuple(dict.fromkeys(values))
 
     @classmethod
     def _recalculate_item_and_task(
@@ -387,7 +471,12 @@ class WorkerStore:
             if result.item_title is not None:
                 row.item.title = result.item_title
             if result.execution_evidence is not None:
-                row.execution_evidence_json = dict(result.execution_evidence)
+                row.execution_evidence_json = dict(
+                    validate_execution_evidence(
+                        result.execution_evidence,
+                        allowed_models=self._allowed_stage_models(row),
+                    )
+                )
             if result.skip_stages:
                 if row.stage != "source" or result.skip_stages != ("transcribe",):
                     session.rollback()
@@ -400,6 +489,64 @@ class WorkerStore:
                 transcribe.status = "skipped"
                 transcribe.finished_at = now
             row.finished_at = now
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            self._release_resources(session, claim)
+            self._recalculate_item_and_task(session, row.item)
+            session.commit()
+            return True
+
+    def defer_external(
+        self,
+        claim: StageClaim,
+        deferred: StageDeferred,
+        *,
+        now: datetime,
+    ) -> bool:
+        now = _utc(now)
+        if not isinstance(deferred, StageDeferred):
+            raise TypeError("deferred stage result is required")
+        with Session(self.engine) as session:
+            self._begin_immediate(session)
+            row = session.get(StageRunRecord, claim.stage_run_id)
+            if not self._claim_matches(row, claim, now):
+                session.rollback()
+                return False
+            assert row is not None
+            row.status = "waiting_external"
+            row.warning = deferred.warning
+            row.execution_evidence_json = dict(
+                validate_execution_evidence(
+                    deferred.execution_evidence,
+                    allowed_models=self._allowed_stage_models(row),
+                )
+            )
+            row.external_submission_state = deferred.external_submission_state
+            row.progress_json = {
+                "current": None,
+                "total": None,
+                "unit": None,
+                "message_code": "waiting_cloud_asr",
+            }
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            self._release_resources(session, claim)
+            self._recalculate_item_and_task(session, row.item)
+            session.commit()
+            return True
+
+    def requeue(self, claim: StageClaim, *, now: datetime) -> bool:
+        now = _utc(now)
+        with Session(self.engine) as session:
+            self._begin_immediate(session)
+            row = session.get(StageRunRecord, claim.stage_run_id)
+            if not self._claim_matches(row, claim, now):
+                session.rollback()
+                return False
+            assert row is not None
+            row.status = "queued"
             row.lease_owner = None
             row.lease_expires_at = None
             row.heartbeat_at = None

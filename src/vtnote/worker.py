@@ -21,7 +21,14 @@ from vtnote.model_assets import (
 from vtnote.paths import StoragePaths
 from vtnote.platform_transport import PinnedHttpsTransport
 from vtnote.url_security import Resolver
-from vtnote.worker_store import StageClaim, StageFailure, StageResult, WorkerStore
+from vtnote.worker_store import (
+    StageClaim,
+    StageDeferred,
+    StageFailure,
+    StageRequeue,
+    StageResult,
+    WorkerStore,
+)
 
 
 class StageCancelled(RuntimeError):
@@ -185,6 +192,14 @@ class Worker:
                 result = handler.run(context)
             except StageCancelled:
                 continue
+            except StageDeferred as deferred:
+                self.store.defer_external(
+                    claim,
+                    deferred,
+                    now=self.clock(),
+                )
+            except StageRequeue:
+                self.store.requeue(claim, now=self.clock())
             except StageExecutionError as error:
                 self.store.fail(
                     claim,
