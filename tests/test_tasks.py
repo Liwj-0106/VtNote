@@ -512,23 +512,12 @@ def test_retry_real_two_session_cas_creates_only_one_attempt(
     try:
         _, item, _ = _prepare_failed_transcribe(tasks, first_session)
         barrier = Barrier(2)
-        event.listen(
-            first_session,
-            "before_flush",
-            lambda *_: barrier.wait(timeout=5),
-            once=True,
-        )
-        event.listen(
-            second_session,
-            "before_flush",
-            lambda *_: barrier.wait(timeout=5),
-            once=True,
-        )
         outcomes: list[str] = []
         unexpected: list[BaseException] = []
 
         def retry(service: TaskService) -> None:
             try:
+                barrier.wait(timeout=5)
                 service.retry_stage(
                     item.id,
                     "transcribe",
@@ -584,6 +573,356 @@ def _prepare_failed_transcribe(
         transcribe.external_submission_state = "submission_unknown"
     session.commit()
     return task, item, transcribe
+
+
+@pytest.mark.parametrize(
+    "sqlite_errorcode",
+    [
+        getattr(sqlite3, "SQLITE_BUSY_RECOVERY", sqlite3.SQLITE_BUSY | (1 << 8)),
+        getattr(sqlite3, "SQLITE_BUSY_TIMEOUT", sqlite3.SQLITE_BUSY | (3 << 8)),
+        getattr(
+            sqlite3,
+            "SQLITE_LOCKED_SHAREDCACHE",
+            sqlite3.SQLITE_LOCKED | (1 << 8),
+        ),
+    ],
+)
+def test_sqlite_retry_conflict_masks_extended_busy_locked_codes(
+    sqlite_errorcode: int,
+) -> None:
+    original = sqlite3.OperationalError("extended sqlite retry conflict")
+    original.sqlite_errorcode = sqlite_errorcode
+
+    assert TaskService._is_sqlite_retry_conflict(
+        OperationalError("retry", {}, original)
+    )
+
+
+def test_retry_reraises_unrelated_sqlite_operational_error(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+        original = sqlite3.OperationalError("disk I/O error")
+        original.sqlite_errorcode = sqlite3.SQLITE_IOERR
+
+        def fail_commit(_: Session) -> None:
+            raise OperationalError("retry", {}, original)
+
+        event.listen(session, "before_commit", fail_commit, once=True)
+        with pytest.raises(OperationalError, match="disk I/O error"):
+            tasks.retry_stage(
+                item.id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+    finally:
+        session.rollback()
+        session.bind.dispose()
+        session.close()
+
+
+@pytest.mark.parametrize("pending_state", ["new", "dirty", "deleted"])
+def test_retry_rejects_session_with_pending_writes_without_discarding_them(
+    tmp_path: Path,
+    pending_state: str,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+        item_id = item.id
+        unrelated = TaskRecord()
+        if pending_state != "new":
+            session.add(unrelated)
+            session.commit()
+
+        if pending_state == "new":
+            session.add(unrelated)
+        elif pending_state == "dirty":
+            unrelated.status = "running"
+        else:
+            session.delete(unrelated)
+
+        with pytest.raises(InvalidTaskOperation, match="clean session"):
+            tasks.retry_stage(
+                item_id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+
+        pending_collection = {
+            "new": session.new,
+            "dirty": session.dirty,
+            "deleted": session.deleted,
+        }[pending_state]
+        assert unrelated in pending_collection
+
+        session.rollback()
+        stored = session.get(ItemRecord, item_id)
+        assert stored is not None
+        assert [
+            run.attempt for run in stored.stage_runs if run.stage == "transcribe"
+        ] == [1]
+    finally:
+        session.rollback()
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_rejects_already_flushed_write_transaction_without_rollback(
+    tmp_path: Path,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+        item_id = item.id
+        unrelated = TaskRecord()
+        session.add(unrelated)
+        session.flush()
+        unrelated_id = unrelated.id
+
+        assert not session.new
+        assert session.in_transaction()
+
+        with pytest.raises(InvalidTaskOperation, match="clean session"):
+            tasks.retry_stage(
+                item_id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+
+        assert session.in_transaction()
+        assert session.get(TaskRecord, unrelated_id) is unrelated
+    finally:
+        session.rollback()
+        session.bind.dispose()
+        session.close()
+
+
+def test_retry_discards_clean_read_transaction_then_begins_immediate(
+    tmp_path: Path,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    engine = session.bind
+    assert engine is not None
+    try:
+        task, item, _ = _prepare_failed_transcribe(tasks, session)
+        task_id = task.id
+        item_id = item.id
+        session.rollback()
+
+        tasks.get_task(task_id)
+        assert session.in_transaction()
+
+        statements: list[str] = []
+
+        def capture_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(statement.strip().upper())
+
+        event.listen(engine, "before_cursor_execute", capture_statement)
+        try:
+            tasks.retry_stage(
+                item_id,
+                "transcribe",
+                expected_attempt=1,
+                override={"schema_version": 1, "strategy": "same"},
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_statement)
+
+        assert statements
+        assert statements[0] == "BEGIN IMMEDIATE"
+    finally:
+        session.rollback()
+        session.close()
+        engine.dispose()
+
+
+def test_retry_maps_begin_immediate_extended_busy_to_refresh_conflict(
+    tmp_path: Path,
+) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    engine = session.bind
+    assert engine is not None
+    try:
+        _, item, _ = _prepare_failed_transcribe(tasks, session)
+        original = sqlite3.OperationalError("database is locked")
+        original.sqlite_errorcode = getattr(
+            sqlite3,
+            "SQLITE_BUSY_RECOVERY",
+            sqlite3.SQLITE_BUSY | (1 << 8),
+        )
+
+        def block_begin(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if statement.strip().upper() == "BEGIN IMMEDIATE":
+                raise OperationalError("BEGIN IMMEDIATE", {}, original)
+
+        event.listen(engine, "before_cursor_execute", block_begin)
+        try:
+            with pytest.raises(InvalidTaskOperation, match="conflicted"):
+                tasks.retry_stage(
+                    item.id,
+                    "transcribe",
+                    expected_attempt=1,
+                    override={"schema_version": 1, "strategy": "same"},
+                )
+        finally:
+            event.remove(engine, "before_cursor_execute", block_begin)
+    finally:
+        session.rollback()
+        session.close()
+        engine.dispose()
+
+
+def test_retry_serializes_cloud_profile_update_with_final_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks, configuration, retry_session, paths = make_services(tmp_path)
+    engine = retry_session.bind
+    assert engine is not None
+    update_session = Session(engine)
+    update_configuration = ConfigurationService(
+        update_session,
+        MemorySecretStore(),
+        paths=paths,
+    )
+    try:
+        cloud_profile_id, _, _ = configure_profiles(configuration)
+        _, item, _ = _prepare_failed_transcribe(
+            tasks,
+            retry_session,
+            unknown=True,
+        )
+        old_profile = configuration.snapshot_profile(cloud_profile_id)
+        override = tasks.build_retry_override(
+            strategy="cloud_confirmed",
+            cloud_profile_id=cloud_profile_id,
+            connection_revision=old_profile["connection_revision"],
+            profile_revision=old_profile["profile_revision"],
+            acknowledge_possible_charge=True,
+        )
+
+        final_validation_started = Event()
+        release_retry = Event()
+        update_started = Event()
+        update_finished = Event()
+        retry_results: list[object] = []
+        update_results: list[object] = []
+        unexpected: list[BaseException] = []
+        original_validation = (
+            configuration.snapshot_current_cloud_asr_retry_profile
+        )
+
+        def pause_final_validation(
+            profile_id: str,
+            *,
+            connection_revision: int,
+            profile_revision: int,
+        ) -> dict[str, object]:
+            snapshot = original_validation(
+                profile_id,
+                connection_revision=connection_revision,
+                profile_revision=profile_revision,
+            )
+            final_validation_started.set()
+            if not release_retry.wait(timeout=5):
+                raise AssertionError("timed out waiting to release retry")
+            return snapshot
+
+        monkeypatch.setattr(
+            configuration,
+            "snapshot_current_cloud_asr_retry_profile",
+            pause_final_validation,
+        )
+
+        def retry() -> None:
+            try:
+                retry_results.append(
+                    tasks.retry_stage(
+                        item.id,
+                        "transcribe",
+                        expected_attempt=1,
+                        override=override,
+                        acknowledge_possible_charge=True,
+                    )
+                )
+            except BaseException as error:
+                unexpected.append(error)
+
+        def update_profile() -> None:
+            update_started.set()
+            try:
+                update_results.append(
+                    update_configuration.update_profile(
+                        cloud_profile_id,
+                        model="rotated-after-retry",
+                    )
+                )
+            except BaseException as error:
+                unexpected.append(error)
+            finally:
+                update_finished.set()
+
+        retry_thread = Thread(target=retry)
+        retry_thread.start()
+        assert final_validation_started.wait(timeout=5)
+
+        update_thread = Thread(target=update_profile)
+        update_thread.start()
+        assert update_started.wait(timeout=5)
+        update_was_serialized = not update_finished.wait(timeout=0.25)
+
+        release_retry.set()
+        retry_thread.join(timeout=10)
+        update_thread.join(timeout=10)
+
+        assert update_was_serialized
+        assert not retry_thread.is_alive()
+        assert not update_thread.is_alive()
+        assert unexpected == []
+        assert len(retry_results) == 1
+        assert len(update_results) == 1
+
+        retry_session.expire_all()
+        stored = retry_session.get(ItemRecord, item.id)
+        assert stored is not None
+        retry_attempt = next(
+            run
+            for run in stored.stage_runs
+            if run.stage == "transcribe" and run.attempt == 2
+        )
+        persisted_profile = retry_attempt.retry_override_json["asr"]["profile"]
+        assert persisted_profile["model"] == old_profile["model"]
+        assert persisted_profile["profile_revision"] == old_profile["profile_revision"]
+
+        current_profile = update_configuration.get_profile(cloud_profile_id)
+        assert current_profile.revision == old_profile["profile_revision"] + 1
+        assert current_profile.tested is False
+        assert current_profile.upload_authorized is False
+    finally:
+        release_retry.set()
+        update_session.rollback()
+        retry_session.rollback()
+        update_session.close()
+        retry_session.close()
+        engine.dispose()
 
 
 def test_retry_rejects_stale_expected_attempt(tmp_path: Path) -> None:

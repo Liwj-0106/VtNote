@@ -152,18 +152,37 @@ class TaskService:
         if not isinstance(original, sqlite3.OperationalError):
             return False
         code = getattr(original, "sqlite_errorcode", None)
-        busy_codes = {
+        if isinstance(code, int) and (code & 0xFF) in {
             sqlite3.SQLITE_BUSY,
             sqlite3.SQLITE_LOCKED,
-            getattr(sqlite3, "SQLITE_BUSY_SNAPSHOT", 517),
-        }
-        if code in busy_codes:
+        }:
             return True
         return str(original).casefold() in {
             "database is busy",
             "database is locked",
             "database table is locked",
         }
+
+    def _reserve_retry_transaction(self) -> None:
+        if self.session.new or self.session.dirty or self.session.deleted:
+            raise InvalidTaskOperation("stage retry requires a clean session")
+        if self.session.in_transaction():
+            connection = self.session.connection()
+            driver_connection = connection.connection.driver_connection
+            if driver_connection.in_transaction:
+                raise InvalidTaskOperation("stage retry requires a clean session")
+            self.session.rollback()
+        connection = self.session.connection()
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        except OperationalError as error:
+            self.session.rollback()
+            if self._is_sqlite_retry_conflict(error):
+                raise InvalidTaskOperation(
+                    "stage retry conflicted; refresh and retry"
+                ) from None
+            raise
+        self.session.expire_all()
 
     def build_retry_override(
         self,
@@ -904,93 +923,107 @@ class TaskService:
             raise InvalidTaskOperation("expected_attempt must be a positive integer")
         if type(acknowledge_possible_charge) is not bool:
             raise InvalidTaskOperation("invalid possible-charge acknowledgement")
-        normalized_override = self._validate_retry_override(override)
-        strategy = normalized_override["strategy"]
-        if strategy == "cloud_confirmed":
-            if acknowledge_possible_charge is not True:
-                raise InvalidTaskOperation(
-                    "cloud retry requires acknowledging the possible charge"
-                )
-        elif acknowledge_possible_charge:
-            raise InvalidTaskOperation(
-                "possible-charge acknowledgement is valid only for cloud_confirmed"
-            )
-        if strategy in {"local", "cloud_confirmed"} and stage != "transcribe":
-            raise InvalidTaskOperation(
-                "ASR retry strategies are valid only for transcribe"
-            )
-        item = self.session.scalar(
-            select(ItemRecord)
-            .where(ItemRecord.id == item_id)
-            .options(selectinload(ItemRecord.stage_runs), selectinload(ItemRecord.task))
-        )
-        if item is None:
-            raise KeyError(item_id)
-        if item.status == "cancel_requested" or item.task.status == "cancel_requested":
-            raise InvalidTaskOperation("cannot retry while cancellation is active")
-        if stage not in _STAGE_DEPENDENCIES:
-            raise InvalidTaskOperation("unknown pipeline stage")
-        if any(
-            run.status in _ACTIVE
-            and run.stage in _RETRY_ACTIVE_CONFLICTS[stage]
-            for run in item.stage_runs
-        ):
-            raise InvalidTaskOperation(
-                "cannot retry while a conflicting stage is active"
-            )
-        attempts = [run for run in item.stage_runs if run.stage == stage]
-        latest_attempt = (
-            max(attempts, key=lambda run: run.attempt) if attempts else None
-        )
-        if latest_attempt is None or latest_attempt.status not in _RETRYABLE:
-            raise InvalidTaskOperation("only a failed or canceled stage can be retried")
-        submission_unknown = (
-            stage == "transcribe"
-            and latest_attempt.external_submission_state == "submission_unknown"
-        )
-        if submission_unknown and strategy == "same":
-            raise InvalidTaskOperation(
-                "submission_unknown requires an explicit local or "
-                "cloud_confirmed retry"
-            )
-        if strategy == "cloud_confirmed" and not submission_unknown:
-            raise InvalidTaskOperation(
-                "cloud_confirmed is valid only for submission_unknown"
-            )
-        latest_by_stage: dict[str, StageRunRecord] = {}
-        for run in item.stage_runs:
-            previous = latest_by_stage.get(run.stage)
-            if previous is None or run.attempt > previous.attempt:
-                latest_by_stage[run.stage] = run
-        for prerequisite in _STAGE_DEPENDENCIES[stage]:
-            latest = latest_by_stage.get(prerequisite)
-            if latest is None or latest.status not in _SUCCESSFUL_PREREQUISITE:
-                raise InvalidTaskOperation("stage prerequisite has not succeeded")
-        item_has_active_work = any(
-            run.status in _ACTIVE for run in item.stage_runs
-        )
-        task_has_active_work = self.session.scalar(
-            select(StageRunRecord.id)
-            .join(ItemRecord, StageRunRecord.item_id == ItemRecord.id)
-            .where(
-                ItemRecord.task_id == item.task_id,
-                StageRunRecord.status.in_(_ACTIVE),
-            )
-            .limit(1)
-        ) is not None
-        if latest_attempt.attempt != expected_attempt:
-            raise InvalidTaskOperation(
-                "stage retry conflicted; refresh and retry"
-            )
-        next_attempt = latest_attempt.attempt + 1
-        retry = StageRunRecord(
-            stage=stage,
-            attempt=next_attempt,
-            status="queued",
-            retry_override_json=dict(normalized_override),
-        )
-        item.stage_runs.append(retry)
+        self._reserve_retry_transaction()
         try:
+            normalized_override = self._validate_retry_override(override)
+            strategy = normalized_override["strategy"]
+            if strategy == "cloud_confirmed":
+                if acknowledge_possible_charge is not True:
+                    raise InvalidTaskOperation(
+                        "cloud retry requires acknowledging the possible charge"
+                    )
+            elif acknowledge_possible_charge:
+                raise InvalidTaskOperation(
+                    "possible-charge acknowledgement is valid only for cloud_confirmed"
+                )
+            if strategy in {"local", "cloud_confirmed"} and stage != "transcribe":
+                raise InvalidTaskOperation(
+                    "ASR retry strategies are valid only for transcribe"
+                )
+            item = self.session.scalar(
+                select(ItemRecord)
+                .where(ItemRecord.id == item_id)
+                .options(
+                    selectinload(ItemRecord.stage_runs),
+                    selectinload(ItemRecord.task),
+                )
+            )
+            if item is None:
+                raise KeyError(item_id)
+            if (
+                item.status == "cancel_requested"
+                or item.task.status == "cancel_requested"
+            ):
+                raise InvalidTaskOperation("cannot retry while cancellation is active")
+            if stage not in _STAGE_DEPENDENCIES:
+                raise InvalidTaskOperation("unknown pipeline stage")
+            if any(
+                run.status in _ACTIVE
+                and run.stage in _RETRY_ACTIVE_CONFLICTS[stage]
+                for run in item.stage_runs
+            ):
+                raise InvalidTaskOperation(
+                    "cannot retry while a conflicting stage is active"
+                )
+            attempts = [run for run in item.stage_runs if run.stage == stage]
+            latest_attempt = (
+                max(attempts, key=lambda run: run.attempt) if attempts else None
+            )
+            if latest_attempt is None:
+                raise InvalidTaskOperation(
+                    "only a failed or canceled stage can be retried"
+                )
+            if latest_attempt.attempt != expected_attempt:
+                raise InvalidTaskOperation(
+                    "stage retry conflicted; refresh and retry"
+                )
+            if latest_attempt.status not in _RETRYABLE:
+                raise InvalidTaskOperation(
+                    "only a failed or canceled stage can be retried"
+                )
+            submission_unknown = (
+                stage == "transcribe"
+                and latest_attempt.external_submission_state == "submission_unknown"
+            )
+            if submission_unknown and strategy == "same":
+                raise InvalidTaskOperation(
+                    "submission_unknown requires an explicit local or "
+                    "cloud_confirmed retry"
+                )
+            if strategy == "cloud_confirmed" and not submission_unknown:
+                raise InvalidTaskOperation(
+                    "cloud_confirmed is valid only for submission_unknown"
+                )
+            latest_by_stage: dict[str, StageRunRecord] = {}
+            for run in item.stage_runs:
+                previous = latest_by_stage.get(run.stage)
+                if previous is None or run.attempt > previous.attempt:
+                    latest_by_stage[run.stage] = run
+            for prerequisite in _STAGE_DEPENDENCIES[stage]:
+                latest = latest_by_stage.get(prerequisite)
+                if latest is None or latest.status not in _SUCCESSFUL_PREREQUISITE:
+                    raise InvalidTaskOperation(
+                        "stage prerequisite has not succeeded"
+                    )
+            item_has_active_work = any(
+                run.status in _ACTIVE for run in item.stage_runs
+            )
+            task_has_active_work = self.session.scalar(
+                select(StageRunRecord.id)
+                .join(ItemRecord, StageRunRecord.item_id == ItemRecord.id)
+                .where(
+                    ItemRecord.task_id == item.task_id,
+                    StageRunRecord.status.in_(_ACTIVE),
+                )
+                .limit(1)
+            ) is not None
+            retry = StageRunRecord(
+                stage=stage,
+                attempt=latest_attempt.attempt + 1,
+                status="queued",
+                retry_override_json=dict(normalized_override),
+            )
+            item.stage_runs.append(retry)
             self.session.flush()
             item.status = "running" if item_has_active_work else "queued"
             item.task.status = "running" if task_has_active_work else "queued"
@@ -1005,6 +1038,9 @@ class TaskService:
                 raise InvalidTaskOperation(
                     "stage retry conflicted; refresh and retry"
                 ) from None
+            raise
+        except Exception:
+            self.session.rollback()
             raise
         self.session.refresh(item)
         return self._view_item(item)

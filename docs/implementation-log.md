@@ -2,6 +2,25 @@
 
 ## 2026-07-28
 
+### Task 1B concurrency and transaction review follow-up
+
+- Serialized stage retry validation and insertion with SQLite `BEGIN IMMEDIATE`, so the
+  expected-attempt check and final cloud-profile revision/authorization validation operate under
+  one write reservation. A concurrent profile update cannot invalidate the snapshot between final
+  validation and attempt persistence.
+- Reject retry calls made through a Session with pending or already-flushed unrelated writes
+  without rolling those writes back. Harmless read-only autobegin transactions are discarded
+  before acquiring the retry reservation.
+- Classified SQLite extended BUSY/LOCKED result codes by their primary code while continuing to
+  re-raise unrelated operational failures. A competing retry now receives the stable refresh
+  conflict instead of a misleading non-retryable-stage error.
+- Added deterministic two-Session, profile-update serialization, pending-write preservation,
+  `BEGIN IMMEDIATE`, extended-result-code, and unrelated-I/O regression coverage. The expanded
+  focused suite passed 149 tests and the full backend suite passed 332 tests; `compileall`,
+  `pip check`, and `git diff --check` passed.
+- No network or billable request was made, no dependency changed, and no project or user file was
+  deleted.
+
 ### Task 1 completion: lifecycle and execution-evidence contracts
 
 - Added a task-level terminal-reason code and made repeated cancellation idempotent only for a
