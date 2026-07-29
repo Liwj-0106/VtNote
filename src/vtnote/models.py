@@ -447,7 +447,7 @@ class DefaultSettingsRecord(Base):
         nullable=False,
         default=lambda: {
             "model": "large-v3-turbo",
-            "device": "auto",
+            "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
             "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",

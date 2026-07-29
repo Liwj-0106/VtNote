@@ -120,7 +120,7 @@ def test_enqueue_creates_durable_rows_and_immutable_redacted_snapshot(tmp_path: 
         assert task.pipeline_snapshot["notes"]["profile"]["id"] == notes_id
         assert task.pipeline_snapshot["local_whisper"] == {
             "model": "large-v3-turbo",
-            "device": "auto",
+            "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
             "model_root": str(paths.durable("models", "faster-whisper")),

@@ -185,7 +185,7 @@ def test_fixed_local_whisper_defaults_use_d_drive_roots(tmp_path: Path) -> None:
         local = configuration.get_defaults().local_whisper_options
         assert local == {
             "model": "large-v3-turbo",
-            "device": "auto",
+            "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
             "model_root": str(paths.durable("models", "faster-whisper")),

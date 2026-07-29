@@ -279,6 +279,18 @@ def _validate_local_whisper_options(options: dict[str, Any]) -> None:
         for key, value in options.items()
     ) or ("vad_filter" in options and not isinstance(options["vad_filter"], bool)):
         raise InvalidConfiguration("local Whisper options must be non-empty strings")
+    if any(
+        options.get(name) != expected
+        for name, expected in {
+            "model": "large-v3-turbo",
+            "device": "cuda",
+            "compute_type": "int8_float16",
+            "vad_filter": True,
+        }.items()
+    ):
+        raise InvalidConfiguration(
+            "local Whisper is GPU-only with fixed model and runtime settings"
+        )
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -346,7 +358,7 @@ class ConfigurationService:
         )
         self.local_whisper_defaults = {
             "model": "large-v3-turbo",
-            "device": "auto",
+            "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
             "model_root": str(data_root / "models" / "faster-whisper"),

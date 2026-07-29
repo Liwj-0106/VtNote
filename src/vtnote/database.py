@@ -116,6 +116,22 @@ def _initialize_schema(engine: Engine) -> None:
         connection.commit()
 
 
+def _migrate_default_local_whisper_device(engine: Engine) -> None:
+    """Move the mutable default to GPU-only without rewriting task history."""
+
+    with Session(engine) as session:
+        defaults = session.get(DefaultSettingsRecord, 1)
+        if defaults is None:
+            return
+        options = defaults.local_whisper_options
+        if not isinstance(options, dict) or options.get("device") != "auto":
+            return
+        migrated = dict(options)
+        migrated["device"] = "cuda"
+        defaults.local_whisper_options = migrated
+        session.commit()
+
+
 def _contains_legacy_cloud_snapshot(value: object) -> bool:
     if isinstance(value, dict):
         if value.get("protocol") == "volc_bigasr_flash":
@@ -229,6 +245,7 @@ def initialize_database(
             _initialize_schema(engine)
             migrate_sensitive_text(engine, sensitive_text_protector)
             _migrate_legacy_cloud_provider(engine)
+            _migrate_default_local_whisper_device(engine)
     except Exception:
         engine.dispose()
         raise

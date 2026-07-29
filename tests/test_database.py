@@ -103,6 +103,50 @@ def test_sqlite_initialization_creates_tables_and_enables_wal(tmp_path: Path) ->
         engine.dispose()
 
 
+def test_existing_default_device_auto_migrates_to_cuda(tmp_path: Path) -> None:
+    database_path = tmp_path / "device-migration.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        defaults = DefaultSettingsRecord(
+            id=1,
+            local_whisper_options={
+                "model": "large-v3-turbo",
+                "device": "auto",
+                "compute_type": "int8_float16",
+                "vad_filter": True,
+                "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",
+                "cache_root": r"D:\Workspace\Codex\cache\VtNote-runtime\models\faster-whisper",
+            },
+        )
+        task = TaskRecord(
+            pipeline_snapshot_json={
+                "local_whisper": {
+                    "model": "large-v3-turbo",
+                    "device": "auto",
+                }
+            }
+        )
+        session.add_all([defaults, task])
+        session.commit()
+        task_id = task.id
+    engine.dispose()
+
+    migrated = initialize_database(database_path)
+    try:
+        with Session(migrated) as session:
+            defaults = session.get(DefaultSettingsRecord, 1)
+            task = session.get(TaskRecord, task_id)
+            assert defaults is not None
+            assert defaults.local_whisper_options["device"] == "cuda"
+            assert task is not None
+            assert (
+                task.pipeline_snapshot_json["local_whisper"]["device"]
+                == "auto"
+            )
+    finally:
+        migrated.dispose()
+
+
 def test_startup_archives_volc_configuration_and_fails_active_snapshots_closed(
     tmp_path: Path,
 ) -> None:

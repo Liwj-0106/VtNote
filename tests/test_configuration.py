@@ -554,6 +554,8 @@ def test_nested_or_secret_shaped_whitelisted_options_are_rejected(tmp_path: Path
             )
         with pytest.raises(InvalidConfiguration, match="local Whisper"):
             service.update_defaults(local_whisper_options={"api_key": "leak"})
+        with pytest.raises(InvalidConfiguration, match="GPU-only"):
+            service.update_defaults(local_whisper_options={"device": "cpu"})
     finally:
         session.bind.dispose()
         session.close()
