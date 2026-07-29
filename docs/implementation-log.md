@@ -529,3 +529,19 @@
 - Focused YouTube/runtime tests passed with 71 checks, and the release-evidence test passed. The Deno
   archive and checksum evidence remain in the task-specific D-drive cache and are not committed or
   redistributed.
+
+### Task 24: offline release qualification
+
+- Added an offline API-to-worker fixture for uploaded SRT files. It creates a durable task through
+  the real multipart API, claims the source stage from SQLite, publishes the immutable normalized
+  transcript and source copy, and regenerates Markdown through the public export endpoint.
+- Added a process-loss recovery fixture proving that an expired lease is reclaimed on the same
+  stage-run ID and attempt, with one incremented recovery generation instead of a duplicated run.
+- Added a combined security fixture for exact Host, Origin, double-submit CSRF, SSRF/private-address
+  rejection, hostile upload filenames, and diagnostic-bundle path exclusion.
+- Added Playwright journeys for the Claude-inspired shell, sidebar-only browser persistence, mobile
+  focus trapping and Escape behavior, horizontal-overflow prevention, domestic-only provider
+  labels, diagnostics download, and automated WCAG checks. The checks found and corrected a
+  tertiary-text contrast defect before passing.
+- The three backend E2E tests and three browser journeys passed. They use only local fixtures and
+  did not send a provider request or modify a user-owned source file.
