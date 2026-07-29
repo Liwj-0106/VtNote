@@ -17,6 +17,7 @@ from vtnote.models import (
     ItemRecord,
     RuntimeAssetRecord,
     RuntimeCleanupEventRecord,
+    TaskRecord,
 )
 from vtnote.paths import StoragePaths, UnsafePathError
 
@@ -292,6 +293,34 @@ class RuntimeAssetService:
             raise RuntimeAssetError("ambiguous_role_assets")
         self.resolve(rows[0].id)
         return self._view(rows[0])
+
+    def trash_abandoned_profile_test_samples(
+        self,
+        *,
+        now: datetime,
+        available_for: timedelta = timedelta(hours=1),
+    ) -> tuple[str, ...]:
+        """Move unused one-shot test samples into the normal recoverable trash."""
+
+        timestamp = now.astimezone(timezone.utc)
+        if available_for <= timedelta(0):
+            raise RuntimeAssetError("invalid_retention")
+        cutoff = timestamp - available_for
+        rows = tuple(
+            self.session.scalars(
+                select(RuntimeAssetRecord)
+                .join(ItemRecord, RuntimeAssetRecord.item_id == ItemRecord.id)
+                .join(TaskRecord, ItemRecord.task_id == TaskRecord.id)
+                .where(
+                    TaskRecord.terminal_reason_code == "profile_test_sample",
+                    RuntimeAssetRecord.state == "active",
+                    RuntimeAssetRecord.role.in_(("uploaded_source", "cloud_audio")),
+                    RuntimeAssetRecord.created_at <= cutoff,
+                )
+                .order_by(RuntimeAssetRecord.created_at, RuntimeAssetRecord.id)
+            ).all()
+        )
+        return tuple(self.trash(row.id, now=timestamp).id for row in rows)
 
     def recover_downloaded_audio(
         self,

@@ -40,6 +40,10 @@ def _utc(value: datetime) -> datetime:
 
 
 class RuntimeAssets(Protocol):
+    def trash_abandoned_profile_test_samples(
+        self, *, now: datetime
+    ) -> tuple[str, ...]: ...
+
     def purge_due(self, *, now: datetime) -> tuple[str, ...]: ...
 
 
@@ -104,6 +108,7 @@ class MaintenanceLease:
 @dataclass(frozen=True, slots=True)
 class MaintenanceResult:
     acquired: bool
+    trashed_asset_ids: tuple[str, ...] = ()
     purged_asset_ids: tuple[str, ...] = ()
     external_action: str | None = None
 
@@ -125,6 +130,9 @@ class MaintenanceService:
         if not self.lease.acquire(timestamp):
             return MaintenanceResult(acquired=False)
         try:
+            trashed = self.runtime_assets.trash_abandoned_profile_test_samples(
+                now=timestamp
+            )
             purged = self.runtime_assets.purge_due(now=timestamp)
             external = (
                 self.reconciler.reconcile_one_due(timestamp)
@@ -133,6 +141,7 @@ class MaintenanceService:
             )
             return MaintenanceResult(
                 acquired=True,
+                trashed_asset_ids=trashed,
                 purged_asset_ids=purged,
                 external_action=(
                     str(external.action)

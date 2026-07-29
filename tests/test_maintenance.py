@@ -16,6 +16,14 @@ NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
 class _RuntimeAssets:
     def __init__(self) -> None:
         self.calls = 0
+        self.trash_calls = 0
+
+    def trash_abandoned_profile_test_samples(
+        self, *, now: datetime
+    ) -> tuple[str, ...]:
+        assert now == NOW
+        self.trash_calls += 1
+        return ("sample-asset-1",)
 
     def purge_due(self, *, now: datetime) -> tuple[str, ...]:
         assert now == NOW
@@ -66,8 +74,10 @@ def test_one_maintenance_pass_purges_local_trash_and_runs_one_external_action(
     result = service.run_once(NOW)
 
     assert result.acquired is True
+    assert result.trashed_asset_ids == ("sample-asset-1",)
     assert result.purged_asset_ids == ("asset-1",)
     assert result.external_action == "query_scheduled"
     assert assets.calls == 1
+    assert assets.trash_calls == 1
     assert reconciler.calls == 1
     engine.dispose()

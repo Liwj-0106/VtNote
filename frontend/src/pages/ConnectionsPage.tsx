@@ -4,6 +4,7 @@ import type {
   ConnectionView,
   ModelStatus,
   ProfileView,
+  SpeechTestSample,
 } from "../api/types";
 import { formatBytes } from "../app/format";
 import { AppLink } from "../app/router";
@@ -159,9 +160,33 @@ export function ConnectionsPage() {
     form.reset();
   };
 
+  const uploadTestSample = async (profileId: string, file: File) => {
+    setBusy(`sample-${profileId}`);
+    setError(null);
+    setMessage(null);
+    try {
+      const sample = await api.uploadTestSample<SpeechTestSample>(file);
+      setTestSamples((current) => ({
+        ...current,
+        [profileId]: sample.id,
+      }));
+      setMessage(
+        `短语音已校验（${(sample.duration_ms / 1_000).toFixed(1)} 秒），可运行能力测试。`,
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? caught.message
+          : "短语音上传失败，请确认文件包含 2–10 秒有声内容。",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const testProfile = (profile: ProfileView) => {
     const tencent = profile.protocol === "tencent_recording_asr";
-    return runAction(
+    const action = runAction(
       `test-${profile.id}`,
       () =>
         api.request(`/api/profiles/${profile.id}/test`, {
@@ -179,6 +204,15 @@ export function ConnectionsPage() {
         }),
       "能力测试已完成。",
     );
+    return action.finally(() => {
+      if (tencent) {
+        setTestSamples((current) => {
+          const next = { ...current };
+          delete next[profile.id];
+          return next;
+        });
+      }
+    });
   };
 
   const authorizeProfile = (profile: ProfileView) =>
@@ -418,19 +452,24 @@ export function ConnectionsPage() {
                       className="field-label"
                       htmlFor={`sample-${profile.id}`}
                     >
-                      已上传的短语音样本 ID
+                      2–10 秒有声样本
                     </label>
                     <input
                       id={`sample-${profile.id}`}
-                      className="text-input mono"
-                      value={testSamples[profile.id] ?? ""}
-                      onChange={(event) =>
-                        setTestSamples({
-                          ...testSamples,
-                          [profile.id]: event.target.value,
-                        })
-                      }
+                      className="file-input"
+                      type="file"
+                      accept="audio/*,video/*"
+                      disabled={busy !== null}
+                      onChange={(event) => {
+                        const file = event.currentTarget.files?.[0];
+                        if (file) void uploadTestSample(profile.id, file);
+                      }}
                     />
+                    <span className="field-hint">
+                      {testSamples[profile.id]
+                        ? "样本已就绪；测试结束后自动进入 24 小时回收区。"
+                        : "仅用于一次腾讯云能力测试，可能产生少量费用。"}
+                    </span>
                   </div>
                 )}
                 <label className="rights-check">

@@ -129,6 +129,35 @@ def test_register_resolve_hash_and_idempotency(tmp_path: Path) -> None:
         close_session(session)
 
 
+def test_abandoned_profile_sample_moves_to_recoverable_trash(
+    tmp_path: Path,
+) -> None:
+    service, session, paths, item = make_service(tmp_path)
+    item.task.terminal_reason_code = "profile_test_sample"
+    item.source_kind = "uploaded_media"
+    item.status = "canceled"
+    source = paths.uploaded_source(item.id, "wav")
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"speech")
+    asset = service.register_staged(
+        item_id=item.id,
+        role="uploaded_source",
+        relative_path=paths.runtime_relative(source),
+    )
+    row = session.get(RuntimeAssetRecord, asset.id)
+    assert row is not None
+    row.created_at = NOW - timedelta(hours=2)
+    session.commit()
+    try:
+        trashed = service.trash_abandoned_profile_test_samples(now=NOW)
+
+        assert trashed == (asset.id,)
+        assert not source.exists()
+        assert service.restore(asset.id).state == "active"
+    finally:
+        close_session(session)
+
+
 def test_zero_byte_conversion_discard_is_exact_typed_and_audited(
     tmp_path: Path,
 ) -> None:

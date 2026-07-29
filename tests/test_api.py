@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from vtnote.artifacts import (
 from vtnote.config import Settings
 from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
+from vtnote.media import MediaInfo
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
 from vtnote.provider_credentials import BailianCredentialBundle, TencentCredentialBundle
@@ -112,6 +114,21 @@ class FakeProfileTester:
         return ConnectivityResult(ok=True, message="provider response omitted")
 
 
+class SpeechSampleFiles:
+    def validate_media(self, path: Path) -> MediaInfo:
+        return MediaInfo(
+            duration_ms=5_000,
+            size_bytes=path.stat().st_size,
+            format_name="wav",
+            audio_codec="pcm_s16le",
+            sample_rate=16_000,
+            channels=1,
+        )
+
+    def validate_subtitle(self, path: Path) -> None:
+        raise AssertionError("speech sample must be media")
+
+
 class FakeBailianProfileTester:
     def __init__(self) -> None:
         self.calls = []
@@ -197,6 +214,7 @@ def make_client(
     profile_tester=None,
     source_probe=None,
     secret_store=None,
+    local_source_validator=None,
 ) -> tuple[TestClient, object, StoragePaths]:
     settings = Settings(data_root=tmp_path / "data", runtime_cache_root=tmp_path / "cache")
     paths = StoragePaths.from_settings(settings)
@@ -209,6 +227,7 @@ def make_client(
         connection_tester=connection_tester,
         profile_tester=profile_tester,
         source_probe=source_probe,
+        local_source_validator=local_source_validator,
     )
     return TestClient(app, base_url=BASE_URL), engine, paths
 
@@ -422,7 +441,11 @@ def test_billable_cloud_profile_test_requires_ack_and_uploaded_speech_sample(
     tmp_path: Path,
 ) -> None:
     tester = FakeProfileTester()
-    client, engine, _ = make_client(tmp_path, profile_tester=tester)
+    client, engine, paths = make_client(
+        tmp_path,
+        profile_tester=tester,
+        local_source_validator=SpeechSampleFiles(),
+    )
     headers = csrf(client)
     try:
         connection = client.post(
@@ -472,20 +495,48 @@ def test_billable_cloud_profile_test_requires_ack_and_uploaded_speech_sample(
         assert no_sample.status_code == 400
         assert no_sample.json()["error"]["code"] == "speech_test_sample_required"
 
+        sample = client.post(
+            "/api/test-samples",
+            headers=headers,
+            files=[
+                (
+                    "metadata",
+                    (
+                        None,
+                        json.dumps({"kind": "media"}),
+                        "application/json",
+                    ),
+                ),
+                ("file", ("sample.wav", b"speech-bytes", "audio/wav")),
+            ],
+        )
+        assert sample.status_code == 201
+        sample_id = sample.json()["id"]
+        assert sample.json()["duration_ms"] == 5_000
+        assert client.get("/api/tasks").json() == []
+
         tested = client.post(
             f"/api/profiles/{profile['id']}/test",
             headers=headers,
             json={
                 "test_kind": "provider_profile",
                 "acknowledge_billable_request": True,
-                "speech_sample_upload_id": "sample-1",
+                "speech_sample_upload_id": sample_id,
             },
         )
         assert tested.status_code == 200
         assert tested.json()["test_ok"] is True
         assert len(tester.calls) == 1
         test_input = tester.calls[0][2]
-        assert test_input.speech_sample_upload_id == "sample-1"
+        assert test_input.speech_sample_upload_id == sample_id
+        with Session(engine) as session:
+            assert (
+                RuntimeAssetService(session, paths).active_for_role(
+                    item_id=sample_id,
+                    role="uploaded_source",
+                )
+                is None
+            )
     finally:
         engine.dispose()
 

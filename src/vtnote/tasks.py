@@ -51,6 +51,9 @@ class InvalidTaskOperation(ValueError):
     pass
 
 
+_PROFILE_TEST_SAMPLE_REASON = "profile_test_sample"
+
+
 class RetryOverrideSnapshot(TypedDict, total=False):
     schema_version: Literal[1]
     strategy: Literal["same", "local", "cloud_confirmed"]
@@ -811,7 +814,10 @@ class TaskService:
 
     def list_tasks(self) -> list[TaskView]:
         ids = self.session.scalars(
-            select(TaskRecord.id).order_by(
+            select(TaskRecord.id).where(
+                (TaskRecord.terminal_reason_code.is_(None))
+                | (TaskRecord.terminal_reason_code != _PROFILE_TEST_SAMPLE_REASON)
+            ).order_by(
                 TaskRecord.created_at.desc(),
                 TaskRecord.id.desc(),
             )
@@ -827,7 +833,10 @@ class TaskService:
     ) -> tuple[list[TaskView], str | None]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise InvalidTaskOperation("task page limit must be between 1 and 100")
-        query = select(TaskRecord.id)
+        query = select(TaskRecord.id).where(
+            (TaskRecord.terminal_reason_code.is_(None))
+            | (TaskRecord.terminal_reason_code != _PROFILE_TEST_SAMPLE_REASON)
+        )
         if status is not None:
             if not status or len(status) > 32:
                 raise InvalidTaskOperation("invalid task status filter")
@@ -859,6 +868,29 @@ class TaskService:
 
     def get_task(self, task_id: str) -> TaskView:
         return self._view(self._load_task(task_id))
+
+    def finalize_profile_test_sample(self, task_id: str) -> ItemView:
+        """Hide a validated short sample from the work queue and task history."""
+
+        task = self._load_task(task_id)
+        if len(task.items) != 1 or task.items[0].source_kind != "uploaded_media":
+            raise InvalidTaskOperation("invalid profile test sample")
+        if task.status not in _TERMINAL:
+            self.cancel_task(task_id)
+            task = self._load_task(task_id)
+        task.terminal_reason_code = _PROFILE_TEST_SAMPLE_REASON
+        self.session.commit()
+        return self._view_item(task.items[0])
+
+    def require_profile_test_sample(self, item_id: str) -> ItemRecord:
+        item = self._require_item(item_id)
+        if (
+            item.task.terminal_reason_code != _PROFILE_TEST_SAMPLE_REASON
+            or item.status != "canceled"
+            or item.source_kind != "uploaded_media"
+        ):
+            raise InvalidTaskOperation("profile test sample is unavailable")
+        return item
 
     def _require_item(self, item_id: str) -> ItemRecord:
         item = self.session.scalar(

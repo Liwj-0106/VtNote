@@ -25,7 +25,7 @@ from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.diagnostics import diagnostic_bundle_bytes
 from vtnote.exports import ExportFormat, render_execution_summary
-from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
+from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor, MediaError
 from vtnote.model_assets import ModelAssetError, ModelAssetService
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.platform_sources import build_default_platform_registry
@@ -521,6 +521,21 @@ def create_app(
         )
         return session, configuration, tasks
 
+    def cleanup_profile_test_sample(item_id: str) -> None:
+        cleanup_session = sessions()
+        try:
+            cleanup_assets = RuntimeAssetService(cleanup_session, paths)
+            for role in ("uploaded_source", "cloud_audio"):
+                active = cleanup_assets.active_for_role(item_id=item_id, role=role)
+                if active is not None:
+                    cleanup_assets.trash(active.id)
+        except (OSError, RuntimeAssetError):
+            logging.getLogger("vtnote").warning(
+                "profile test sample cleanup will be retried by retention maintenance"
+            )
+        finally:
+            cleanup_session.close()
+
     @app.get("/api/health")
     def health():
         return {"status": "ok", "service": "vtnote", "version": "0.1.0"}
@@ -721,7 +736,8 @@ def create_app(
 
     @app.post("/api/profiles/{profile_id}/test")
     def test_profile(profile_id: str, payload: ProfileTestInput):
-        session, configuration, _ = services()
+        session, configuration, tasks = services()
+        sample_to_cleanup: str | None = None
         try:
             profile = configuration.get_profile(profile_id)
             if profile.protocol == "aliyun_bailian":
@@ -774,6 +790,20 @@ def create_app(
                     "speech_test_sample_required",
                     "provider test requires an uploaded speech sample",
                 )
+            if (
+                profile.purpose == "cloud_asr"
+                and payload.test_kind == "provider_profile"
+                and payload.speech_sample_upload_id is not None
+            ):
+                try:
+                    tasks.require_profile_test_sample(payload.speech_sample_upload_id)
+                except (InvalidTaskOperation, KeyError):
+                    return _error(
+                        400,
+                        "speech_test_sample_unavailable",
+                        "speech test sample is unavailable",
+                    )
+                sample_to_cleanup = payload.speech_sample_upload_id
             if payload.test_kind == "cos_sentinel" and profile.purpose != "cloud_asr":
                 return _error(
                     400,
@@ -806,6 +836,8 @@ def create_app(
             ))
         finally:
             session.close()
+            if sample_to_cleanup is not None:
+                cleanup_profile_test_sample(sample_to_cleanup)
 
     @app.post("/api/profiles/{profile_id}/authorize-upload")
     def authorize_upload(profile_id: str):
@@ -891,6 +923,105 @@ def create_app(
                 _dump_subtitle(track) for track in result.subtitle_tracks
             ],
         }
+
+    @app.post("/api/test-samples", status_code=201)
+    async def upload_profile_test_sample(request: Request):
+        session, _, tasks = services()
+        try:
+            content_type = request.headers.get("content-type", "")
+            if content_type.split(";", 1)[0].strip().casefold() != "multipart/form-data":
+                return _error(
+                    415,
+                    "unsupported_media_type",
+                    "speech sample must be a multipart media upload",
+                )
+            raw_length = request.headers.get("content-length")
+            try:
+                content_length = int(raw_length) if raw_length is not None else None
+            except ValueError:
+                return _error(400, "invalid_content_length", "invalid Content-Length")
+            sample_limits = UploadLimits(max_media_bytes=32 * 1024 * 1024)
+            uploads = UploadService(
+                session=session,
+                paths=paths,
+                tasks=tasks,
+                assets=RuntimeAssetService(session, paths),
+                local_sources=selected_local_sources,
+            )
+
+            def accept_metadata(
+                metadata: dict[str, Any], upload_id: str
+            ) -> UploadTaskContext:
+                payload = UploadTaskMetadata.model_validate(metadata)
+                if payload.model_dump(exclude_none=True) != {"kind": "media"}:
+                    raise ValueError("test sample accepts media only")
+                created = tasks.create_upload_task(
+                    upload_kind="media",
+                    upload_id=upload_id,
+                    options={
+                        "asr_mode": "local",
+                        "translation_enabled": False,
+                        "notes_enabled": False,
+                    },
+                )
+                return UploadTaskContext(
+                    task_id=created.id,
+                    item_id=created.items[0].id,
+                )
+
+            try:
+                state = await MultipartUploadStager(paths, sample_limits).consume(
+                    request.stream(),
+                    content_type=content_type,
+                    content_length=content_length,
+                    accept_metadata=accept_metadata,
+                )
+                if state.incoming_path is None:
+                    raise UploadError(
+                        "upload_file_missing",
+                        status_code=400,
+                        state=state,
+                    )
+                media_info = selected_local_sources.validate_media(state.incoming_path)
+                if not 2_000 <= media_info.duration_ms <= 10_000:
+                    raise UploadError(
+                        "speech_sample_duration",
+                        status_code=400,
+                        state=state,
+                    )
+                created = uploads.complete(state)
+                sample = tasks.finalize_profile_test_sample(created.id)
+                return {
+                    "id": sample.id,
+                    "duration_ms": media_info.duration_ms,
+                    "size_bytes": media_info.size_bytes,
+                    "available_for_minutes": 60,
+                }
+            except UploadError as error:
+                uploads.fail(error.state, code=error.code)
+                if error.state.context is not None:
+                    tasks.finalize_profile_test_sample(
+                        error.state.context.task_id
+                    )
+                return _error(
+                    error.status_code,
+                    error.code,
+                    "speech sample upload failed",
+                )
+            except (MediaError, OSError, ValueError):
+                if "state" in locals():
+                    uploads.fail(state, code="invalid_media")
+                    if state.context is not None:
+                        tasks.finalize_profile_test_sample(
+                            state.context.task_id
+                        )
+                return _error(
+                    400,
+                    "invalid_media",
+                    "speech sample is not valid media",
+                )
+        finally:
+            session.close()
 
     @app.get("/api/tasks")
     def list_tasks(

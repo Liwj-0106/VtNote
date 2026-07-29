@@ -562,3 +562,17 @@
 - Four offline harness tests passed. No live POC was run because no user-authorized 30–50-sample
   corpus, provider credentials, or billing approval was supplied in this implementation session.
   The honest release state remains: implementation complete; live release qualification pending.
+
+### Tencent capability-test sample lifecycle
+
+- Replaced the manual sample-ID field with a native 2–10 second audio/video picker. The browser
+  streams the sample through the same bounded multipart, filename, media-probe, and D-drive
+  ownership boundary as normal uploads, then receives only an opaque one-shot item ID.
+- Capability-test samples are represented by hidden canceled tasks so they cannot be claimed by a
+  worker or clutter task history. The profile-test endpoint accepts only those dedicated items;
+  passing an ordinary task item cannot trigger its media cleanup.
+- After the Tencent test attempt, source and converted test audio move into the existing 24-hour
+  recoverable trash. Unused samples remain available for one hour and are then moved to the same
+  trash by the lease-guarded maintenance pass.
+- Focused API, task-history, maintenance, and runtime-asset lifecycle coverage passed with 51
+  checks. Frontend lint and production build passed after the file-picker integration.

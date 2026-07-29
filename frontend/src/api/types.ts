@@ -147,6 +147,13 @@ export interface ProfileView {
   chat_data_authorized: boolean;
 }
 
+export interface SpeechTestSample {
+  id: string;
+  duration_ms: number;
+  size_bytes: number;
+  available_for_minutes: number;
+}
+
 export interface DefaultsView {
   asr_mode: "auto" | "cloud" | "local";
   cloud_asr_profile_id: string | null;

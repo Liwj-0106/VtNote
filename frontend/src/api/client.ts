@@ -187,6 +187,34 @@ export class ApiClient {
       onProgress?: (loaded: number, total: number) => void;
     } = {},
   ): Promise<T> {
+    return this.uploadMultipart("/api/tasks", file, metadata, options);
+  }
+
+  async uploadTestSample<T>(
+    file: File,
+    options: {
+      signal?: AbortSignal;
+      onProgress?: (loaded: number, total: number) => void;
+    } = {},
+  ): Promise<T> {
+    return this.uploadMultipart(
+      "/api/test-samples",
+      file,
+      { kind: "media" },
+      options,
+    );
+  }
+
+  private async uploadMultipart<T>(
+    path: string,
+    file: File,
+    metadata: Record<string, unknown>,
+    options: {
+      signal?: AbortSignal;
+      onProgress?: (loaded: number, total: number) => void;
+    },
+  ): Promise<T> {
+    assertApiPath(path);
     const token = await this.csrf(options.signal);
     const safeName = file.name.normalize("NFKC");
     if (
@@ -212,7 +240,7 @@ export class ApiClient {
 
     return new Promise<T>((resolve, reject) => {
       const request = new XMLHttpRequest();
-      request.open("POST", "/api/tasks");
+      request.open("POST", path);
       request.withCredentials = true;
       request.responseType = "json";
       request.setRequestHeader("Content-Type", `multipart/form-data; boundary=${boundary}`);
