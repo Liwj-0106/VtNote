@@ -23,6 +23,9 @@ dependencies = [
   "cos-python-sdk-v5==1.9.44",
 ]
 
+[project.scripts]
+vtnote = "vtnote.launcher:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
 

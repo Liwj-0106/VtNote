@@ -466,3 +466,31 @@
   `RuntimeAssetService` boundary and writes its cleanup audit event.
 - Added focused API/readiness tests and ran the complete backend suite: 720 tests passed. No cloud
   request was sent and no user file was modified or deleted.
+
+### Tasks 17-20: Claude-inspired local web interface
+
+- Added a React/TypeScript/Vite interface with a warm paper-and-ink palette, restrained terracotta
+  accents, local SVG icons, and no third-party web resources. The desktop navigation collapses
+  from 232px to 64px; mobile uses a focus-trapped drawer with Escape close and a skip link.
+- Implemented compact task creation, probe/upload progress, domestic-only Tencent ASR and Aliyun
+  Bailian configuration, readiness/setup, defaults, storage recovery, task history, durable stage
+  inspection, transcript-first results, translation, cited Markdown notes, and safe exports.
+- Kept browser persistence to one sidebar boolean. Credentials, source URLs, task identifiers,
+  custom prompts, and processing state are not persisted in web storage.
+- Verified the real interface at 1440px expanded/collapsed and 375px with a headless Chromium
+  session. Fixed a native browser `fetch` binding defect and a collapsed-brand overlap found by
+  that inspection. Frontend lint, eight focused tests, and the production build passed.
+
+### Task 21: production SPA serving and process supervision
+
+- FastAPI now serves the built SPA and hashed assets only when a valid frontend build exists.
+  Explicit UI routes receive GET/HEAD fallback, while API, disabled documentation, unknown paths,
+  and mutation methods retain JSON 404/405 security boundaries.
+- Added `python -m vtnote` and the `vtnote` console entry point. The loopback-only supervisor starts
+  explicit API and worker argv without a shell, checks port conflicts before spawn, performs
+  bounded child restarts, and terminates then kills only unresponsive children during shutdown.
+- Added production construction for source, Tencent/local ASR, Aliyun translation/notes, and the
+  managed local-model installer. Production API docs remain disabled.
+- Backed up and removed generated TypeScript build metadata/emitted config files from source
+  control; the source tree now ignores those build products. The API/static/launcher focused suite
+  passed with 44 tests and no cloud request.

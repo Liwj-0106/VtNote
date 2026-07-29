@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import secrets as token_secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,11 +12,12 @@ from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 
 from vtnote.config import Settings
 from vtnote.chat import BailianProfileTester
@@ -315,6 +317,7 @@ def create_app(
     local_source_validator: LocalSourceValidator | None = None,
     upload_limits: UploadLimits | None = None,
     sensitive_text_protector: SensitiveTextProtector | None = None,
+    frontend_dist: Path | None = None,
 ) -> FastAPI:
     selected_settings = settings or Settings()
     paths = StoragePaths.from_settings(selected_settings)
@@ -332,6 +335,13 @@ def create_app(
     selected_resolver = resolver or SocketResolver()
     source_policy = SourceUrlPolicy(selected_resolver)
     selected_upload_limits = upload_limits or UploadLimits()
+    selected_frontend_dist = (
+        Path(frontend_dist)
+        if frontend_dist is not None
+        else Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    )
+    frontend_index = selected_frontend_dist / "index.html"
+    frontend_available = frontend_index.is_file()
     selected_local_sources = local_source_validator or LocalSourceFiles(
         FfmpegMediaProcessor(
             runner=CommandRunner(),
@@ -527,6 +537,7 @@ def create_app(
             "max_media_bytes": selected_upload_limits.max_media_bytes,
             "max_subtitle_bytes": selected_upload_limits.max_subtitle_bytes,
         }
+        payload["ui"] = {"available": frontend_available}
         return payload
 
     @app.get("/api/security/csrf")
@@ -1172,5 +1183,49 @@ def create_app(
             }
         finally:
             session.close()
+
+    if frontend_available:
+        @app.api_route(
+            "/api/{unknown_api_path:path}",
+            methods=["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            include_in_schema=False,
+        )
+        def unknown_api_route(unknown_api_path: str):
+            del unknown_api_path
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
+
+        frontend_assets = selected_frontend_dist / "assets"
+        if frontend_assets.is_dir():
+            app.mount(
+                "/assets",
+                StaticFiles(directory=frontend_assets, check_dir=True),
+                name="frontend-assets",
+            )
+
+        task_detail_route = re.compile(
+            r"^tasks/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+        spa_routes = {
+            "",
+            "tasks",
+            "settings",
+            "settings/setup",
+            "settings/connections",
+            "settings/storage",
+        }
+
+        @app.api_route(
+            "/{frontend_path:path}",
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+        )
+        def serve_frontend(frontend_path: str):
+            normalized = frontend_path.strip("/")
+            if normalized not in spa_routes and task_detail_route.fullmatch(
+                normalized
+            ) is None:
+                raise StarletteHTTPException(status_code=404, detail="Not Found")
+            return FileResponse(frontend_index, media_type="text/html")
 
     return app
