@@ -415,3 +415,11 @@
 - Translation responses must contain one exact ordered cue-ID set, nonempty text, and no unknown fields. A structurally invalid batch receives one retry round only, split into no more than two 15-cue subbatches; transport, filtering, truncation, oversized-response, and unknown-submission errors are not replayed.
 - Added cancellation checks before and after each remote call and before publication. All batches are validated in memory before one source-hash-bound translation is atomically published, so a failed or canceled attempt leaves no partial artifact.
 - Added focused coverage for target propagation, UTF-8 request sizing, order/ID/schema failures, retry bounds, response bounds, static-instruction isolation, cancellation, source hashing, and atomic publication. The full suite passed with 686 tests; no real model request was sent.
+
+### Task 14: cited AI note generation
+
+- Added summary, key-point, and custom-prompt note templates with explicit output-language data. Fixed system instructions remain separate from transcript/custom-prompt JSON; the plaintext custom prompt is held only for the active calls and is not added to the note document or provenance.
+- Map inputs are ordered transcript cues bounded by both 48 KiB of canonical cue JSON and the complete 64-KiB chat request. Generation stops before any call when one cue cannot fit or more than 24 initial chunks would be required.
+- Added deterministic reduce grouping with a four-level maximum. Every map citation must exactly match a cue in its source chunk; every reduce citation must also descend from a child citation, preventing a later model call from inventing unrelated transcript evidence.
+- Added a strict note schema with task/transcript hash, template/language, requested and actual model, cited summary, and cited key points. Markdown is rendered locally with stable cue IDs, human-readable time ranges, AI provenance, and a warning to verify names, numbers, terminology, and citations.
+- Cancellation and all schema/filter/truncation/unknown-submission/oversize failures stop without replay or partial publication. Only a fully validated document is atomically written. The full suite passed with 708 tests; no real model request was sent.
