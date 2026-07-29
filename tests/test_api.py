@@ -16,6 +16,7 @@ from vtnote.config import Settings
 from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
+from vtnote.platform_sources import PlatformSourceRegistry
 from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
 from vtnote.secrets import MemorySecretStore
 from vtnote.sources import SourceProbeResult, make_subtitle_track
@@ -436,9 +437,21 @@ def test_defaults_patch_allows_null_only_for_nullable_fields(
         engine.dispose()
 
 
-def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_path: Path) -> None:
+def test_default_registry_reports_youtube_runtime_and_probe_injection_revalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert not hasattr(api_module, "ProbeResult")
     assert not hasattr(api_module, "SourceProbe")
+    monkeypatch.setattr(
+        api_module,
+        "build_default_platform_registry",
+        lambda **_: PlatformSourceRegistry(
+            bilibili=None,
+            youtube=None,
+            youtube_unavailable_code="youtube_runtime_unavailable",
+        ),
+    )
     client, engine, _ = make_client(tmp_path)
     try:
         response = client.post(
@@ -446,7 +459,8 @@ def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_pa
             headers=csrf(client),
             json={"url": "https://youtu.be/abc"},
         )
-        assert response.status_code == 501
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "youtube_runtime_unavailable"
     finally:
         engine.dispose()
 
@@ -483,6 +497,7 @@ def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_pa
                     "language": "zh-hans",
                     "format": "vtt",
                     "kind": "manual",
+                    "ui_label": "人工字幕",
                     "is_translated": False,
                     "is_live_chat": False,
                 },
@@ -491,6 +506,7 @@ def test_missing_real_adapters_return_501_and_probe_injection_revalidates(tmp_pa
                     "language": "en",
                     "format": "vtt",
                     "kind": "automatic",
+                    "ui_label": "自动字幕",
                     "is_translated": False,
                     "is_live_chat": False,
                 },

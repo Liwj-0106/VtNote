@@ -268,12 +268,9 @@ class VtNoteYoutubeDL(yt_dlp.YoutubeDL):
         return director
 
     def probe(self, url: str) -> dict[str, Any]:
-        try:
-            result = self.extract_info(url, download=False)
-        except Exception:
-            raise RuntimeError("controlled YouTube probe failed") from None
+        result = self.extract_info(url, download=False)
         if not isinstance(result, dict):
-            raise RuntimeError("controlled YouTube probe returned invalid data")
+            raise RuntimeError("controlled platform probe returned invalid data")
         return result
 
 
@@ -358,7 +355,25 @@ def build_controlled_ytdlp(
     *,
     scope: BoundTransportScope,
 ) -> VtNoteYoutubeDL:
-    _validate_managed_runtime(runtime)
+    return build_controlled_platform_ytdlp(
+        transport,
+        output_root,
+        scope=scope,
+        runtime=runtime,
+    )
+
+
+def build_controlled_platform_ytdlp(
+    transport: PinnedHttpsTransport,
+    output_root: Path,
+    *,
+    scope: BoundTransportScope,
+    runtime: YoutubeRuntime | None = None,
+) -> VtNoteYoutubeDL:
+    """Build the same controlled bridge with optional YouTube JS support."""
+
+    if runtime is not None:
+        _validate_managed_runtime(runtime)
     selected_output = _validate_output_root(output_root)
     _disable_default_plugin_discovery()
     params: dict[str, Any] = {
@@ -366,9 +381,6 @@ def build_controlled_ytdlp(
         "cookiefile": None,
         "cookiesfrombrowser": None,
         "http_headers": {},
-        "js_runtimes": {
-            "deno": {"path": str(runtime.deno_executable)}
-        },
         "noplaylist": True,
         "outtmpl": {
             "default": str(selected_output / "source.%(ext)s")
@@ -385,6 +397,12 @@ def build_controlled_ytdlp(
         "writesubtitles": False,
         "writeautomaticsub": False,
     }
+    if runtime is not None:
+        params["js_runtimes"] = {
+            "deno": {"path": str(runtime.deno_executable)}
+        }
+    else:
+        params["js_runtimes"] = {}
     return VtNoteYoutubeDL(
         transport=transport,
         scope=scope,

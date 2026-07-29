@@ -46,6 +46,17 @@ _CANDIDATE_ERROR_CODES = frozenset(
         "subtitle_unavailable",
     }
 )
+_PLATFORM_SOURCE_ERROR_CODES = frozenset(
+    {
+        "removed",
+        "temporary",
+        "auth_required",
+        "region_restricted",
+        "unsupported",
+        "adapter_drift",
+        "invalid_content",
+    }
+)
 
 
 def _normalize_source_kind(value: object) -> SourceKind:
@@ -127,6 +138,14 @@ class SubtitleTrack:
         object.__setattr__(self, "language", language)
         object.__setattr__(self, "format", format)
         object.__setattr__(self, "kind", kind)
+
+    @property
+    def ui_label(self) -> str:
+        return {
+            "manual": "人工字幕",
+            "automatic": "自动字幕",
+            "unconfirmed": "字幕类型待确认",
+        }[self.kind]
 
 
 def make_subtitle_track(
@@ -230,6 +249,26 @@ class AudioOutcome:
 
 class SourceError(RuntimeError):
     """Base class for typed, adapter-safe source failures."""
+
+
+class PlatformSourceError(SourceError):
+    """A closed, non-sensitive platform extraction failure."""
+
+    def __init__(self, code: str) -> None:
+        if code not in _PLATFORM_SOURCE_ERROR_CODES:
+            raise ValueError("invalid platform source error code")
+        self.code = code
+        super().__init__(code)
+
+
+class SourceCapabilityError(SourceError):
+    """A source adapter is intentionally unavailable in this installation."""
+
+    def __init__(self, code: str) -> None:
+        if code not in {"adapter_unavailable", "youtube_runtime_unavailable"}:
+            raise ValueError("invalid source capability error code")
+        self.code = code
+        super().__init__(code)
 
 
 class SubtitleCandidateError(SourceError):

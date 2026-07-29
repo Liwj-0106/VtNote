@@ -21,11 +21,14 @@ from vtnote.database import initialize_database
 from vtnote.exports import ExportFormat
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.paths import StoragePaths, UnsafePathError
+from vtnote.platform_sources import build_default_platform_registry
 from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
 from vtnote.sources import (
     REMOTE_SOURCE_KINDS,
+    PlatformSourceError,
     SourceAdapter,
+    SourceCapabilityError,
     SubtitleTrack,
 )
 from vtnote.sensitive_text import (
@@ -243,6 +246,7 @@ def _dump_subtitle(track: SubtitleTrack) -> dict[str, Any]:
         "language": track.language,
         "format": track.format,
         "kind": track.kind,
+        "ui_label": track.ui_label,
         "is_translated": track.is_translated,
         "is_live_chat": track.is_live_chat,
     }
@@ -274,7 +278,8 @@ def create_app(
     if engine is not None:
         migrate_sensitive_text(selected_engine, selected_protector)
     selected_secrets = secret_store or KeyringSecretStore()
-    source_policy = SourceUrlPolicy(resolver or SocketResolver())
+    selected_resolver = resolver or SocketResolver()
+    source_policy = SourceUrlPolicy(selected_resolver)
     selected_upload_limits = upload_limits or UploadLimits()
     selected_local_sources = local_source_validator or LocalSourceFiles(
         FfmpegMediaProcessor(
@@ -284,6 +289,11 @@ def create_app(
         max_subtitle_bytes=selected_upload_limits.max_subtitle_bytes,
     )
     sessions = sessionmaker(selected_engine, expire_on_commit=False)
+    selected_source_probe = source_probe or build_default_platform_registry(
+        settings=selected_settings,
+        resolver=selected_resolver,
+        session_factory=sessions,
+    )
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
 
@@ -364,6 +374,27 @@ def create_app(
 
     for operation_exception in (InvalidTaskOperation, UnsafeSourceUrl, UnsafePathError):
         app.add_exception_handler(operation_exception, operation_error)
+
+    @app.exception_handler(SourceCapabilityError)
+    async def source_capability_error(_: Request, error: SourceCapabilityError):
+        return _error(
+            503,
+            error.code,
+            "source capability is unavailable",
+        )
+
+    @app.exception_handler(PlatformSourceError)
+    async def platform_source_error(_: Request, error: PlatformSourceError):
+        status = {
+            "removed": 404,
+            "temporary": 503,
+            "auth_required": 403,
+            "region_restricted": 451,
+            "unsupported": 400,
+            "adapter_drift": 502,
+            "invalid_content": 422,
+        }[error.code]
+        return _error(status, error.code, "platform source request failed")
 
     def services() -> tuple[Session, ConfigurationService, TaskService]:
         session = sessions()
@@ -569,9 +600,7 @@ def create_app(
     @app.post("/api/sources/probe")
     def probe_source(payload: ProbeInput):
         canonical_source = source_policy.validate(payload.url)
-        if source_probe is None:
-            return _error(501, "adapter_unavailable", "source probe adapter is not configured")
-        result = source_probe.probe(canonical_source)
+        result = selected_source_probe.probe(canonical_source)
         if result.source_kind not in REMOTE_SOURCE_KINDS or result.canonical_url is None:
             raise ValueError("URL probe returned a non-remote source")
         redirect_targets = list(result.redirect_trace)
