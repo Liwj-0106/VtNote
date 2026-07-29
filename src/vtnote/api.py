@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vtnote.config import Settings
+from vtnote.chat import BailianProfileTester
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.exports import ExportFormat
@@ -88,7 +89,7 @@ class InputModel(BaseModel):
 class ConnectionCreate(InputModel):
     name: str = Field(min_length=1, max_length=128)
     protocol: str
-    base_url: str
+    base_url: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
     secret: str | None = Field(default=None, min_length=1)
     credentials: dict[str, Any] | None = None
@@ -124,7 +125,7 @@ class ProfileCreate(InputModel):
     purpose: str
     connection_id: str
     model: str = Field(min_length=1)
-    context_length: int = Field(default=8192, gt=0)
+    context_length: int = Field(default=32768, gt=0)
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -146,13 +147,22 @@ class ProfilePatch(InputModel):
 
 
 class ProfileTestInput(InputModel):
-    test_kind: Literal["provider_profile", "cos_sentinel"] = "provider_profile"
+    test_kind: Literal[
+        "provider_profile",
+        "cos_sentinel",
+        "connection_policy_validated",
+        "profile_capability_tested",
+    ] = "provider_profile"
     acknowledge_billable_request: bool = False
     speech_sample_upload_id: str | None = Field(
         default=None,
         min_length=1,
         max_length=128,
     )
+
+
+class ChatDataAuthorizationInput(InputModel):
+    acknowledge_chat_data_upload: bool
 
 
 class ModelInstallInput(InputModel):
@@ -341,7 +351,7 @@ def create_app(
     selected_connection_tester = (
         connection_tester or default_tencent_tester
     )
-    selected_profile_tester = profile_tester or default_tencent_tester
+    default_bailian_tester = BailianProfileTester()
     model_assets = ModelAssetService(
         engine=selected_engine,
         paths=paths,
@@ -581,6 +591,14 @@ def create_app(
         session, configuration, _ = services()
         try:
             view = configuration.get_connection(connection_id)
+            if view.protocol == "aliyun_bailian":
+                return _dump(
+                    configuration.record_connection_test(
+                        connection_id,
+                        ok=True,
+                        message="Connection policy validated",
+                    )
+                )
             if (
                 connection_tester is None
                 and view.protocol != "tencent_recording_asr"
@@ -660,9 +678,28 @@ def create_app(
         session, configuration, _ = services()
         try:
             profile = configuration.get_profile(profile_id)
+            if profile.protocol == "aliyun_bailian":
+                if payload.test_kind == "connection_policy_validated":
+                    return _dump(profile)
+                if payload.test_kind != "profile_capability_tested":
+                    return _error(
+                        400,
+                        "invalid_profile_test_kind",
+                        "Bailian profile requires a capability test",
+                    )
+            elif payload.test_kind in {
+                "connection_policy_validated",
+                "profile_capability_tested",
+            }:
+                return _error(
+                    400,
+                    "invalid_profile_test_kind",
+                    "profile test kind does not match provider",
+                )
             if (
                 profile_tester is None
-                and profile.protocol != "tencent_recording_asr"
+                and profile.protocol
+                not in {"tencent_recording_asr", "aliyun_bailian"}
             ):
                 return _error(
                     501,
@@ -670,7 +707,10 @@ def create_app(
                     "connectivity adapter is not configured",
                 )
             if (
-                payload.test_kind == "provider_profile"
+                payload.test_kind in {
+                    "provider_profile",
+                    "profile_capability_tested",
+                }
                 and not payload.acknowledge_billable_request
             ):
                 return _error(
@@ -697,6 +737,14 @@ def create_app(
             credentials = configuration.credential_bundle_for_connection(
                 profile.connection_id
             )
+            selected_profile_tester = (
+                profile_tester
+                or (
+                    default_bailian_tester
+                    if profile.protocol == "aliyun_bailian"
+                    else default_tencent_tester
+                )
+            )
             try:
                 result = selected_profile_tester.test_profile(
                     profile,
@@ -718,6 +766,39 @@ def create_app(
         session, configuration, _ = services()
         try:
             return _dump(configuration.authorize_cloud_upload(profile_id))
+        finally:
+            session.close()
+
+    @app.post("/api/profiles/{profile_id}/authorize-chat-data")
+    def authorize_chat_data(
+        profile_id: str,
+        payload: ChatDataAuthorizationInput,
+    ):
+        if not payload.acknowledge_chat_data_upload:
+            return _error(
+                400,
+                "chat_data_consent_required",
+                "chat data upload requires explicit acknowledgement",
+            )
+        session, configuration, _ = services()
+        try:
+            response = _dump(configuration.authorize_chat_data(profile_id))
+            response["chat_data_scope"] = {
+                "subtitle_cues": True,
+                "title_and_metadata": True,
+                "target_or_output_language": True,
+                "custom_prompt": True,
+                "audio": False,
+            }
+            return response
+        finally:
+            session.close()
+
+    @app.post("/api/profiles/{profile_id}/revoke-chat-data")
+    def revoke_chat_data(profile_id: str):
+        session, configuration, _ = services()
+        try:
+            return _dump(configuration.revoke_chat_data(profile_id))
         finally:
             session.close()
 

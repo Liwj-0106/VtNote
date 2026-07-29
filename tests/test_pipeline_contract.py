@@ -179,6 +179,26 @@ def make_services(tmp_path: Path):
     return configuration, tasks, session, paths
 
 
+def create_chat_connection(
+    configuration: ConfigurationService,
+    *,
+    name: str = "Chat",
+    workspace_id: str = "ws-1234",
+    api_key: str | None = None,
+):
+    credentials = {"api_key": api_key} if api_key is not None else None
+    return configuration.create_connection(
+        name=name,
+        protocol="aliyun_bailian",
+        base_url=(
+            f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        parameters={"workspace_id": workspace_id},
+        credentials=credentials,
+    )
+
+
 def test_fixed_local_whisper_defaults_use_d_drive_roots(tmp_path: Path) -> None:
     configuration, _, session, paths = make_services(tmp_path)
     try:
@@ -210,14 +230,11 @@ def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp
             base_url="https://asr.tencentcloudapi.com", parameters={},
             credentials={"secret_id": "AKID", "secret_key": "key"}
         )
-        chat = configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example.com/v1", parameters={}, secret="key"
-        )
+        chat = create_chat_connection(configuration, api_key="key")
         with pytest.raises(InvalidConfiguration, match="context_length"):
             configuration.create_profile(
                 name="Bad context", purpose="notes", connection_id=chat.id,
-                model="gpt", context_length=0
+                model="qwen-plus", context_length=0
             )
         with pytest.raises(InvalidConfiguration, match="profile option"):
             configuration.create_profile(
@@ -228,11 +245,13 @@ def test_profile_context_length_is_positive_and_options_are_purpose_specific(tmp
         with pytest.raises(InvalidConfiguration, match="profile option"):
             configuration.create_profile(
                 name="Bad notes", purpose="notes", connection_id=chat.id,
-                model="gpt", context_length=8192, options={"language": "zh-CN"}
+                model="qwen-plus", context_length=32768,
+                options={"language": "zh-CN"},
             )
         valid = configuration.create_profile(
             name="Notes", purpose="notes", connection_id=chat.id,
-            model="gpt", context_length=32768, options={"temperature": 0.2}
+            model="qwen-plus", context_length=32768,
+            options={"temperature": 0.2, "max_tokens": 4096},
         )
         assert valid.context_length == 32768
         assert "context" not in valid.model_dump()
@@ -285,20 +304,20 @@ def test_tencent_contract_is_fixed_and_not_caller_configurable(tmp_path: Path) -
 def test_task_overrides_snapshot_all_pipeline_choices_and_fixed_item_path(tmp_path: Path) -> None:
     configuration, tasks, session, _, = make_services(tmp_path)
     try:
-        chat = configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example.com/v1", parameters={}, secret="key"
-        )
+        chat = create_chat_connection(configuration, api_key="key")
         translation = configuration.create_profile(
             name="Translation", purpose="translation", connection_id=chat.id,
-            model="translate", context_length=16384, options={"temperature": 0.1}
+            model="qwen-plus", context_length=32768,
+            options={"temperature": 0.1, "max_tokens": 4096},
         )
         notes = configuration.create_profile(
             name="Notes", purpose="notes", connection_id=chat.id,
-            model="notes", context_length=32768, options={"max_tokens": 2048}
+            model="qwen-max", context_length=32768, options={"max_tokens": 2048}
         )
         configuration.record_profile_test(translation.id, ok=True, message="ok")
         configuration.record_profile_test(notes.id, ok=True, message="ok")
+        configuration.authorize_chat_data(translation.id)
+        configuration.authorize_chat_data(notes.id)
 
         task = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
@@ -371,14 +390,12 @@ def test_stale_cloud_falls_back_in_auto_but_forced_cloud_fails(tmp_path: Path) -
 def test_names_are_unique_case_insensitively(tmp_path: Path) -> None:
     configuration, _, session, _ = make_services(tmp_path)
     try:
-        configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example.com/v1", parameters={}
-        )
+        create_chat_connection(configuration)
         with pytest.raises(InvalidConfiguration, match="name"):
-            configuration.create_connection(
-                name="chat", protocol="openai_compatible",
-                base_url="https://other.example.com/v1", parameters={}
+            create_chat_connection(
+                configuration,
+                name="chat",
+                workspace_id="ws-other",
             )
     finally:
         session.close()

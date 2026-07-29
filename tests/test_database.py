@@ -45,6 +45,10 @@ _TASK3_COLUMNS = {
         "provider_status_code",
         "retry_override_json",
     },
+    "processor_profiles": {
+        "capability_fingerprint_json",
+        "chat_data_authorized_fingerprint",
+    },
 }
 
 
@@ -247,6 +251,98 @@ def test_startup_archives_volc_configuration_and_fails_active_snapshots_closed(
                 == "legacy_provider_requires_reconfiguration"
             )
             assert transcribe.lease_owner is None
+    finally:
+        migrated.dispose()
+
+
+def test_startup_archives_arbitrary_chat_and_fails_active_snapshots_closed(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-chat.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        connection = ProviderConnectionRecord(
+            name="Legacy relay",
+            protocol="openai_compatible",
+            base_url="https://relay.example/v1",
+            parameters={},
+            credential_ref="connection:legacy-chat",
+            test_ok=True,
+            tested_revision=1,
+        )
+        profile = ProcessorProfileRecord(
+            name="Legacy notes",
+            purpose="notes",
+            connection=connection,
+            model="legacy-model",
+            context_length=32768,
+            options={"temperature": 0.2, "max_tokens": 4096},
+            test_ok=True,
+            tested_revision=1,
+            tested_connection_revision=1,
+            capability_fingerprint_json={"unsafe": True},
+            chat_data_authorized_fingerprint="a" * 64,
+        )
+        session.add(profile)
+        session.flush()
+        defaults = DefaultSettingsRecord(
+            id=1,
+            notes_enabled=True,
+            notes_profile_id=profile.id,
+            translation_enabled=False,
+        )
+        task = TaskRecord(
+            status="running",
+            pipeline_snapshot_json={
+                "notes": {
+                    "enabled": True,
+                    "profile": {
+                        "protocol": "openai_compatible",
+                        "connection_id": connection.id,
+                    },
+                }
+            },
+        )
+        item = ItemRecord(
+            task=task,
+            position=0,
+            source_kind="local_media",
+            source_locator="sample.mp4",
+            status="running",
+        )
+        notes = StageRunRecord(
+            item=item,
+            stage="notes",
+            status="running",
+            lease_owner="worker-1",
+        )
+        session.add_all([defaults, notes])
+        session.commit()
+        ids = (connection.id, profile.id, task.id, notes.id)
+    engine.dispose()
+
+    migrated = initialize_database(database_path)
+    try:
+        with Session(migrated) as session:
+            connection = session.get(ProviderConnectionRecord, ids[0])
+            profile = session.get(ProcessorProfileRecord, ids[1])
+            task = session.get(TaskRecord, ids[2])
+            notes = session.get(StageRunRecord, ids[3])
+            defaults = session.get(DefaultSettingsRecord, 1)
+            assert connection is not None and connection.archived_at is not None
+            assert connection.test_ok is None
+            assert profile is not None and profile.archived_at is not None
+            assert profile.test_ok is None
+            assert profile.capability_fingerprint_json is None
+            assert profile.chat_data_authorized_fingerprint is None
+            assert defaults is not None
+            assert defaults.notes_enabled is False
+            assert defaults.notes_profile_id is None
+            assert task is not None and task.status == "failed"
+            assert task.terminal_reason_code == "legacy_chat_endpoint_blocked"
+            assert notes is not None and notes.status == "failed"
+            assert notes.error_code == "legacy_chat_endpoint_blocked"
+            assert notes.lease_owner is None
     finally:
         migrated.dispose()
 

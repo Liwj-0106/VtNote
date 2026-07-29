@@ -506,6 +506,10 @@ class TaskService:
         profile = self.configuration.get_profile(profile_id)
         if profile.purpose != purpose or not profile.tested or profile.test_ok is not True:
             raise InvalidConfiguration(f"{purpose} profile must have a current successful test")
+        if purpose in {"translation", "notes"} and not profile.chat_data_authorized:
+            raise InvalidConfiguration(
+                f"{purpose} profile requires current chat data authorization"
+            )
         return self.configuration.snapshot_profile(profile_id)
 
     def _pipeline_snapshot(

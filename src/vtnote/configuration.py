@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-import ipaddress
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -23,6 +23,11 @@ from vtnote.models import (
     ProcessorProfileRecord,
     ProviderConnectionRecord,
     TaskRecord,
+)
+from vtnote.chat import (
+    bailian_base_url,
+    bailian_chat_endpoint,
+    validate_chat_model,
 )
 from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
@@ -92,6 +97,8 @@ class ProfileView(PublicModel):
     test_ok: bool | None
     test_message: str | None
     upload_authorized: bool
+    capability_fingerprint: dict[str, Any] | None
+    chat_data_authorized: bool
 
 
 class DefaultsView(PublicModel):
@@ -120,26 +127,29 @@ _PROTOCOL_PARAMETERS = {
             "cos_configured",
         }
     ),
-    "openai_compatible": frozenset({"api_version", "organization"}),
+    "aliyun_bailian": frozenset({"workspace_id"}),
 }
-_ACTIVE_PROTOCOLS = frozenset({"tencent_recording_asr", "openai_compatible"})
+_ACTIVE_PROTOCOLS = frozenset({"tencent_recording_asr", "aliyun_bailian"})
 _PURPOSE_PROTOCOL = {
     "cloud_asr": "tencent_recording_asr",
-    "translation": "openai_compatible",
-    "notes": "openai_compatible",
+    "translation": "aliyun_bailian",
+    "notes": "aliyun_bailian",
 }
 _PURPOSE_OPTIONS = {
     "cloud_asr": frozenset(
         {"language_scope", "res_text_format", "sentence_max_length"}
     ),
-    "translation": frozenset({"temperature", "max_tokens"}),
-    "notes": frozenset({"temperature", "max_tokens"}),
+    "translation": frozenset({"temperature", "max_tokens", "enable_thinking"}),
+    "notes": frozenset({"temperature", "max_tokens", "enable_thinking"}),
 }
 _TERMINAL_TASK_STATUSES = frozenset(
     {"canceled", "completed", "completed_with_warnings", "failed"}
 )
 _RETRYABLE_STAGE_STATUSES = frozenset({"failed", "canceled"})
 _ARCHIVED_NAME_PREFIX = "__vtnote_archived__:"
+_CHAT_PURPOSES = frozenset({"translation", "notes"})
+_MIN_CHAT_CONTEXT_LENGTH = 32_768
+_MIN_CHAT_MAX_TOKENS = 1_024
 
 
 def _reject_reserved_name(value: str) -> None:
@@ -199,6 +209,13 @@ def _normalize_connection_parameters(
             "asr_region": TENCENT_ASR_REGION,
             "cos_configured": False,
         }
+    if protocol == "aliyun_bailian":
+        workspace_id = parameters.get("workspace_id")
+        try:
+            bailian_base_url(workspace_id)
+        except ValueError:
+            raise InvalidConfiguration("invalid Bailian workspace_id") from None
+        return {"workspace_id": workspace_id}
     if any(not isinstance(value, str) or not value.strip() for value in parameters.values()):
         raise InvalidConfiguration("connection parameter values must be non-empty strings")
     return dict(parameters)
@@ -221,6 +238,9 @@ def _validate_profile_options(purpose: str, options: dict[str, Any]) -> None:
     if max_tokens is not None and (
         isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
     ):
+        raise InvalidConfiguration("invalid profile option value")
+    enable_thinking = options.get("enable_thinking")
+    if enable_thinking is not None and not isinstance(enable_thinking, bool):
         raise InvalidConfiguration("invalid profile option value")
 
 
@@ -260,12 +280,53 @@ def _normalize_profile_contract(
             "res_text_format": 3,
             "sentence_max_length": 20,
         }
+    if protocol != "aliyun_bailian":
+        raise InvalidConfiguration(
+            "profile purpose is incompatible with connection protocol"
+        )
     _validate_profile_options(purpose, options)
-    return cleaned_model, dict(options)
+    try:
+        cleaned_model = validate_chat_model(cleaned_model)
+    except ValueError:
+        raise InvalidConfiguration("invalid Bailian model") from None
+    normalized = {
+        "temperature": options.get("temperature", 0.2),
+        "max_tokens": options.get("max_tokens", 4096),
+        "enable_thinking": options.get("enable_thinking", False),
+    }
+    if normalized["max_tokens"] < _MIN_CHAT_MAX_TOKENS:
+        raise InvalidConfiguration(
+            f"max_tokens must be at least {_MIN_CHAT_MAX_TOKENS}"
+        )
+    return cleaned_model, normalized
 
 
 def _purpose_protocol_is_compatible(purpose: str, protocol: str) -> bool:
     return _PURPOSE_PROTOCOL.get(purpose) == protocol
+
+
+def _validate_profile_capacity(
+    purpose: str,
+    context_length: int,
+    options: dict[str, Any],
+) -> None:
+    if purpose not in _CHAT_PURPOSES:
+        return
+    if context_length < _MIN_CHAT_CONTEXT_LENGTH:
+        raise InvalidConfiguration(
+            f"chat context_length must be at least {_MIN_CHAT_CONTEXT_LENGTH}"
+        )
+    max_tokens = options.get("max_tokens")
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens < _MIN_CHAT_MAX_TOKENS
+        or max_tokens >= context_length
+    ):
+        raise InvalidConfiguration(
+            f"max_tokens must be at least {_MIN_CHAT_MAX_TOKENS} "
+            "and smaller than context_length"
+        )
 
 
 def _validate_local_whisper_options(options: dict[str, Any]) -> None:
@@ -293,16 +354,21 @@ def _validate_local_whisper_options(options: dict[str, Any]) -> None:
         )
 
 
-def _is_loopback_host(host: str) -> bool:
-    if host.casefold() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _clean_base_url(value: str, protocol: str) -> str:
+def _clean_base_url(
+    value: str | None,
+    protocol: str,
+    parameters: dict[str, Any] | None = None,
+) -> str:
+    if protocol == "aliyun_bailian":
+        try:
+            expected = bailian_base_url((parameters or {}).get("workspace_id"))
+        except ValueError:
+            raise InvalidConfiguration("invalid Bailian workspace_id") from None
+        if value is not None and value != expected:
+            raise InvalidConfiguration("Bailian endpoint is fixed to Beijing workspace")
+        return expected
+    if not isinstance(value, str):
+        raise InvalidConfiguration("provider base URL is required")
     try:
         parts = urlsplit(value)
         host = parts.hostname
@@ -313,15 +379,11 @@ def _clean_base_url(value: str, protocol: str) -> str:
         raise InvalidConfiguration("invalid provider base URL")
     if not host:
         raise InvalidConfiguration("invalid provider base URL")
-    if parts.scheme == "http" and protocol != "openai_compatible":
+    if parts.scheme == "http":
         raise InvalidConfiguration("cloud provider base URL must use HTTPS")
-    if parts.scheme == "http" and not _is_loopback_host(host):
-        raise InvalidConfiguration("provider base URL must use HTTPS or loopback HTTP")
     if parts.scheme not in {"http", "https"}:
         raise InvalidConfiguration("invalid provider base URL")
-    if parts.scheme == "http" and _is_loopback_host(host):
-        pass
-    elif parts.scheme != "https":
+    if parts.scheme != "https":
         raise InvalidConfiguration("invalid provider base URL")
     cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
     if protocol == "tencent_recording_asr" and cleaned != TENCENT_ASR_ENDPOINT:
@@ -333,6 +395,39 @@ def _clean_message(
     message: str | None, sensitive_values: tuple[str | None, ...] = ()
 ) -> str | None:
     return sanitize_diagnostic(message, sensitive_values)
+
+
+def _chat_capability_fingerprint(
+    row: ProcessorProfileRecord,
+) -> dict[str, Any] | None:
+    connection = row.connection
+    if row.purpose not in _CHAT_PURPOSES or connection.protocol != "aliyun_bailian":
+        return None
+    options = dict(row.options)
+    return {
+        "schema_version": 1,
+        "protocol": "aliyun_bailian",
+        "endpoint": bailian_chat_endpoint(connection.parameters["workspace_id"]),
+        "connection_revision": connection.revision,
+        "profile_revision": row.revision,
+        "model": row.model,
+        "response_format": "json_object",
+        "enable_thinking": options["enable_thinking"],
+        "options": {
+            "temperature": options["temperature"],
+            "max_tokens": options["max_tokens"],
+        },
+    }
+
+
+def _fingerprint_digest(value: dict[str, Any]) -> str:
+    body = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
 
 
 class ConfigurationService:
@@ -519,7 +614,7 @@ class ConfigurationService:
     def _connection_view(self, row: ProviderConnectionRecord) -> ConnectionView:
         current = row.tested_revision == row.revision
         stored_secret = self.secrets.get(row.credential_ref)
-        if row.protocol == "tencent_recording_asr":
+        if row.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
             configured_fields = configured_credential_fields(
                 row.protocol,
                 stored_secret,
@@ -559,6 +654,20 @@ class ConfigurationService:
             and row.upload_authorized_revision == row.revision
             and row.upload_authorized_connection_revision == connection.revision
         )
+        current_fingerprint = _chat_capability_fingerprint(row)
+        capability_fingerprint = (
+            current_fingerprint
+            if current_fingerprint is not None
+            and dict(row.capability_fingerprint_json or {}) == current_fingerprint
+            and tested
+            and row.test_ok is True
+            else None
+        )
+        chat_data_authorized = (
+            capability_fingerprint is not None
+            and row.chat_data_authorized_fingerprint
+            == _fingerprint_digest(capability_fingerprint)
+        )
         return ProfileView(
             id=row.id,
             name=row.name,
@@ -574,6 +683,8 @@ class ConfigurationService:
             test_ok=row.test_ok if tested else None,
             test_message=row.test_message if tested else None,
             upload_authorized=authorized,
+            capability_fingerprint=capability_fingerprint,
+            chat_data_authorized=chat_data_authorized,
         )
 
     def create_connection(
@@ -581,7 +692,7 @@ class ConfigurationService:
         *,
         name: str,
         protocol: str,
-        base_url: str,
+        base_url: str | None,
         parameters: dict[str, Any],
         secret: str | None = None,
         credentials: dict[str, object] | None = None,
@@ -591,9 +702,11 @@ class ConfigurationService:
         selected_parameters = _normalize_connection_parameters(protocol, parameters)
         if secret is not None and credentials is not None:
             raise InvalidConfiguration("cannot provide two credential formats")
-        if protocol == "tencent_recording_asr":
+        if protocol in {"tencent_recording_asr", "aliyun_bailian"}:
             if secret is not None:
-                raise InvalidConfiguration("Tencent credentials must be an atomic pair")
+                raise InvalidConfiguration(
+                    "provider credentials must use the structured atomic form"
+                )
             try:
                 selected_secret = (
                     serialize_credential_bundle(protocol, credentials)
@@ -601,7 +714,7 @@ class ConfigurationService:
                     else None
                 )
             except ValueError:
-                raise InvalidConfiguration("invalid Tencent credential pair") from None
+                raise InvalidConfiguration("invalid provider credentials") from None
         else:
             if credentials is not None:
                 raise InvalidConfiguration("structured credentials are not supported")
@@ -613,7 +726,7 @@ class ConfigurationService:
         row = ProviderConnectionRecord(
             name=cleaned_name,
             protocol=protocol,
-            base_url=_clean_base_url(base_url, protocol),
+            base_url=_clean_base_url(base_url, protocol, selected_parameters),
             parameters=selected_parameters,
             credential_ref=f"connection:{uuid.uuid4()}",
         )
@@ -652,9 +765,11 @@ class ConfigurationService:
         if (secret is not None or credentials is not None) and clear_secret:
             raise InvalidConfiguration("cannot replace and clear a secret together")
         row = self._connection(connection_id)
-        if row.protocol == "tencent_recording_asr":
+        if row.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
             if secret is not None:
-                raise InvalidConfiguration("Tencent credentials must be an atomic pair")
+                raise InvalidConfiguration(
+                    "provider credentials must use the structured atomic form"
+                )
             try:
                 selected_secret = (
                     serialize_credential_bundle(row.protocol, credentials)
@@ -662,7 +777,7 @@ class ConfigurationService:
                     else None
                 )
             except ValueError:
-                raise InvalidConfiguration("invalid Tencent credential pair") from None
+                raise InvalidConfiguration("invalid provider credentials") from None
         else:
             if credentials is not None:
                 raise InvalidConfiguration("structured credentials are not supported")
@@ -675,14 +790,23 @@ class ConfigurationService:
                 raise InvalidConfiguration("connection name cannot be empty")
             cleaned_name = name.strip()
             _reject_reserved_name(cleaned_name)
-        cleaned_base_url = (
-            _clean_base_url(base_url, row.protocol) if base_url is not None else row.base_url
-        )
         selected_parameters = dict(row.parameters)
         if parameters is not None:
             selected_parameters = _normalize_connection_parameters(
                 row.protocol,
                 parameters,
+            )
+        if row.protocol == "aliyun_bailian":
+            cleaned_base_url = (
+                _clean_base_url(base_url, row.protocol, selected_parameters)
+                if base_url is not None or parameters is not None
+                else row.base_url
+            )
+        else:
+            cleaned_base_url = (
+                _clean_base_url(base_url, row.protocol, selected_parameters)
+                if base_url is not None
+                else row.base_url
             )
         secret_changed = selected_secret is not None and selected_secret != old_secret
         secret_cleared = clear_secret and old_secret is not None
@@ -718,6 +842,9 @@ class ConfigurationService:
                 row.test_ok = None
                 row.tested_revision = None
                 row.test_message = None
+                for profile in row.profiles:
+                    profile.capability_fingerprint_json = None
+                    profile.chat_data_authorized_fingerprint = None
             self.session.commit()
         except Exception as error:
             self.session.rollback()
@@ -771,7 +898,8 @@ class ConfigurationService:
         row.test_ok = ok
         row.tested_revision = row.revision
         row.test_message = _clean_message(
-            message, (self.secrets.get(row.credential_ref), row.credential_ref)
+            message,
+            self.diagnostic_sensitive_values(),
         )
         row.tested_at = datetime.now(timezone.utc)
         self.session.commit()
@@ -784,7 +912,7 @@ class ConfigurationService:
         purpose: str,
         connection_id: str,
         model: str,
-        context_length: int = 8192,
+        context_length: int = 32768,
         options: dict[str, Any] | None = None,
     ) -> ProfileView:
         connection = self._connection(connection_id)
@@ -804,6 +932,7 @@ class ConfigurationService:
             cleaned_model,
             selected_options,
         )
+        _validate_profile_capacity(purpose, context_length, selected_options)
         try:
             self._retire_archived_name_conflicts(
                 ProcessorProfileRecord, cleaned_name
@@ -871,6 +1000,12 @@ class ConfigurationService:
             selected_model,
             selected_options,
         )
+        selected_context_length = changes.get("context_length", row.context_length)
+        _validate_profile_capacity(
+            row.purpose,
+            selected_context_length,
+            normalized_options,
+        )
         if "model" in changes or normalized_model != row.model:
             changes["model"] = normalized_model
         if "options" in changes or normalized_options != dict(row.options):
@@ -901,6 +1036,8 @@ class ConfigurationService:
                 row.tested_connection_revision = None
                 row.upload_authorized_revision = None
                 row.upload_authorized_connection_revision = None
+                row.capability_fingerprint_json = None
+                row.chat_data_authorized_fingerprint = None
             self.session.commit()
         except Exception as error:
             self.session.rollback()
@@ -1010,13 +1147,19 @@ class ConfigurationService:
         row.tested_connection_revision = row.connection.revision
         row.test_message = _clean_message(
             message,
-            (
-                self.secrets.get(row.connection.credential_ref),
-                row.connection.credential_ref,
-            ),
+            self.diagnostic_sensitive_values(),
         )
         row.tested_at = datetime.now(timezone.utc)
-        if row.purpose == "notes" and ok:
+        fingerprint = _chat_capability_fingerprint(row)
+        if fingerprint is not None:
+            row.capability_fingerprint_json = fingerprint if ok else None
+            if not ok:
+                row.chat_data_authorized_fingerprint = None
+        if (
+            row.purpose == "notes"
+            and row.connection.protocol != "aliyun_bailian"
+            and ok
+        ):
             defaults = self.session.get(DefaultSettingsRecord, 1)
             if defaults is None:
                 defaults = DefaultSettingsRecord(
@@ -1046,6 +1189,59 @@ class ConfigurationService:
         self.session.commit()
         return self._profile_view(row)
 
+    def authorize_chat_data(self, profile_id: str) -> ProfileView:
+        row = self._profile(profile_id)
+        view = self._profile_view(row)
+        if (
+            row.purpose not in _CHAT_PURPOSES
+            or row.connection.protocol != "aliyun_bailian"
+            or not view.tested
+            or view.test_ok is not True
+            or view.capability_fingerprint is None
+        ):
+            raise InvalidConfiguration(
+                "chat data authorization requires a current successful capability test"
+            )
+        row.chat_data_authorized_fingerprint = _fingerprint_digest(
+            view.capability_fingerprint
+        )
+        if row.purpose == "notes":
+            defaults = self.session.get(DefaultSettingsRecord, 1)
+            if defaults is None:
+                defaults = DefaultSettingsRecord(
+                    id=1,
+                    local_whisper_options=dict(self.local_whisper_defaults),
+                    notes_auto_enable_allowed=True,
+                )
+                self.session.add(defaults)
+            if (
+                defaults.notes_auto_enable_allowed
+                and defaults.notes_profile_id is None
+                and not defaults.notes_enabled
+            ):
+                defaults.notes_profile_id = row.id
+                defaults.notes_enabled = True
+                defaults.notes_auto_enable_allowed = False
+        self.session.commit()
+        return self._profile_view(row)
+
+    def revoke_chat_data(self, profile_id: str) -> ProfileView:
+        row = self._profile(profile_id)
+        if (
+            row.purpose not in _CHAT_PURPOSES
+            or row.connection.protocol != "aliyun_bailian"
+        ):
+            raise InvalidConfiguration("profile does not use domestic chat")
+        row.chat_data_authorized_fingerprint = None
+        defaults = self.session.get(DefaultSettingsRecord, 1)
+        if defaults is not None:
+            if defaults.translation_profile_id == row.id:
+                defaults.translation_enabled = False
+            if defaults.notes_profile_id == row.id:
+                defaults.notes_enabled = False
+        self.session.commit()
+        return self._profile_view(row)
+
     def _defaults_row(self) -> DefaultSettingsRecord:
         row = self.session.get(DefaultSettingsRecord, 1)
         if row is None:
@@ -1066,7 +1262,11 @@ class ConfigurationService:
         if row.purpose != purpose:
             return False
         view = self._profile_view(row)
-        return view.tested and view.test_ok is True
+        if not (view.tested and view.test_ok is True):
+            return False
+        if purpose in _CHAT_PURPOSES:
+            return view.chat_data_authorized
+        return True
 
     def get_defaults(self) -> DefaultsView:
         row = self._defaults_row()
@@ -1210,9 +1410,10 @@ class ConfigurationService:
     def secret_for_connection(self, connection_id: str) -> str | None:
         """Return a secret only to an injected execution adapter, never to an API schema."""
 
-        return self.secrets.get(
-            self._connection(connection_id, include_archived=True).credential_ref
-        )
+        row = self._connection(connection_id, include_archived=True)
+        if row.protocol == "openai_compatible":
+            raise InvalidConfiguration("legacy_chat_endpoint_blocked")
+        return self.secrets.get(row.credential_ref)
 
     def credential_bundle_for_connection(
         self,
@@ -1221,6 +1422,8 @@ class ConfigurationService:
         """Return a typed bundle at the execution boundary without exposing it publicly."""
 
         row = self._connection(connection_id, include_archived=True)
+        if row.protocol == "openai_compatible":
+            raise InvalidConfiguration("legacy_chat_endpoint_blocked")
         stored = self.secrets.get(row.credential_ref)
         if stored is None:
             return None
@@ -1291,9 +1494,11 @@ class ConfigurationService:
     ) -> dict[str, Any]:
         row = self._profile(profile_id, include_archived=include_archived)
         connection = row.connection
+        if connection.protocol == "openai_compatible":
+            raise InvalidConfiguration("legacy_chat_endpoint_blocked")
         stored_secret = self.secrets.get(connection.credential_ref)
         has_secret = stored_secret is not None
-        if connection.protocol == "tencent_recording_asr":
+        if connection.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
             has_secret = all(
                 configured_credential_fields(
                     connection.protocol,

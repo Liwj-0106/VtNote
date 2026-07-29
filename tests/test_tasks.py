@@ -46,6 +46,48 @@ def make_services(tmp_path: Path) -> tuple[TaskService, ConfigurationService, Se
     return tasks, configuration, session, paths
 
 
+def create_chat_connection(
+    configuration: ConfigurationService,
+    *,
+    name: str = "Chat",
+    workspace_id: str = "ws-1234",
+    api_key: str | None = None,
+):
+    return configuration.create_connection(
+        name=name,
+        protocol="aliyun_bailian",
+        base_url=(
+            f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        parameters={"workspace_id": workspace_id},
+        credentials={"api_key": api_key} if api_key is not None else None,
+    )
+
+
+def create_chat_profile(
+    configuration: ConfigurationService,
+    *,
+    name: str,
+    purpose: str,
+    connection_id: str,
+    model: str,
+):
+    return configuration.create_profile(
+        name=name,
+        purpose=purpose,
+        connection_id=connection_id,
+        model=model,
+        context_length=32768,
+        options={"max_tokens": 4096},
+    )
+
+
+def ready_chat_profile(configuration: ConfigurationService, profile_id: str) -> None:
+    configuration.record_profile_test(profile_id, ok=True, message="ok")
+    configuration.authorize_chat_data(profile_id)
+
+
 def assert_no_secret_fields(value: object) -> None:
     if isinstance(value, dict):
         assert "secret" not in value
@@ -72,24 +114,26 @@ def configure_profiles(configuration: ConfigurationService) -> tuple[str, str, s
     configuration.record_profile_test(cloud.id, ok=True, message="ok")
     configuration.authorize_cloud_upload(cloud.id)
 
-    chat_connection = configuration.create_connection(
-        name="Chat",
-        protocol="openai_compatible",
-        base_url="https://api.example.com/v1",
-        parameters={},
-        secret="chat-secret",
+    chat_connection = create_chat_connection(
+        configuration,
+        api_key="chat-secret",
     )
-    translation = configuration.create_profile(
+    translation = create_chat_profile(
+        configuration,
         name="Translate",
         purpose="translation",
         connection_id=chat_connection.id,
-        model="translate-model",
+        model="qwen-translate",
     )
-    notes = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=chat_connection.id, model="notes-model"
+    notes = create_chat_profile(
+        configuration,
+        name="Notes",
+        purpose="notes",
+        connection_id=chat_connection.id,
+        model="qwen-notes",
     )
-    configuration.record_profile_test(translation.id, ok=True, message="ok")
-    configuration.record_profile_test(notes.id, ok=True, message="ok")
+    ready_chat_profile(configuration, translation.id)
+    ready_chat_profile(configuration, notes.id)
     configuration.update_defaults(
         asr_mode="cloud",
         cloud_asr_profile_id=cloud.id,
@@ -138,9 +182,9 @@ def test_enqueue_creates_durable_rows_and_immutable_redacted_snapshot(tmp_path: 
         assert "cloud-secret" not in json.dumps(stored.pipeline_snapshot_json)
         assert "chat-secret" not in json.dumps(stored.pipeline_snapshot_json)
 
-        configuration.update_profile(notes_id, model="changed-after-enqueue")
+        configuration.update_profile(notes_id, model="qwen-changed")
         reloaded = tasks.get_task(task.id)
-        assert reloaded.pipeline_snapshot["notes"]["profile"]["model"] == "notes-model"
+        assert reloaded.pipeline_snapshot["notes"]["profile"]["model"] == "qwen-notes"
         assert "custom_prompt_envelope" not in reloaded.pipeline_snapshot["notes"]
     finally:
         session.bind.dispose()
@@ -1198,9 +1242,9 @@ def test_public_task_view_redacts_local_path_and_stage_diagnostics(tmp_path: Pat
         source = tmp_path / "private-folder" / "video.mp4"
         source.parent.mkdir(parents=True)
         source.write_bytes(b"media")
-        connection = configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example/v1", parameters={}, secret="known-secret"
+        connection = create_chat_connection(
+            configuration,
+            api_key="known-secret",
         )
         stored_connection = session.get(ProviderConnectionRecord, connection.id)
         assert stored_connection is not None
@@ -1234,9 +1278,9 @@ def test_stage_diagnostic_write_boundary_sanitizes_before_database_commit(
 ) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        connection = configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example/v1", parameters={}, secret="database-secret"
+        connection = create_chat_connection(
+            configuration,
+            api_key="database-secret",
         )
         stored_connection = session.get(ProviderConnectionRecord, connection.id)
         assert stored_connection is not None
@@ -1334,19 +1378,15 @@ def test_stage_progress_and_execution_evidence_round_trip(tmp_path: Path) -> Non
 def test_stage_evidence_rejects_unbounded_or_sensitive_values(tmp_path: Path) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        configuration.create_connection(
-            name="Chat",
-            protocol="openai_compatible",
-            base_url="https://api.example/v1",
-            parameters={},
-            secret="transcribing_segments",
+        create_chat_connection(
+            configuration,
+            api_key="transcribing_segments",
         )
-        configuration.create_connection(
+        create_chat_connection(
+            configuration,
             name="Fallback",
-            protocol="openai_compatible",
-            base_url="http://127.0.0.1:8001/v1",
-            parameters={},
-            secret="cloud_rate_limited",
+            workspace_id="ws-fallback",
+            api_key="cloud_rate_limited",
         )
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
@@ -1400,12 +1440,11 @@ def test_stage_view_fails_closed_for_invalid_persisted_runtime_fields(
 ) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        configuration.create_connection(
+        create_chat_connection(
+            configuration,
             name="Local test",
-            protocol="openai_compatible",
-            base_url="http://127.0.0.1:8000/v1",
-            parameters={},
-            secret="transcribing_segments",
+            workspace_id="ws-local-test",
+            api_key="transcribing_segments",
         )
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
@@ -1441,19 +1480,23 @@ def test_notes_retry_depends_on_transcription_not_translation(
 ) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        connection = configuration.create_connection(
-            name="Chat", protocol="openai_compatible",
-            base_url="https://api.example/v1", parameters={}
+        connection = create_chat_connection(configuration)
+        translation = create_chat_profile(
+            configuration,
+            name="Translation",
+            purpose="translation",
+            connection_id=connection.id,
+            model="qwen-translate",
         )
-        translation = configuration.create_profile(
-            name="Translation", purpose="translation",
-            connection_id=connection.id, model="translate"
+        notes = create_chat_profile(
+            configuration,
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="qwen-notes",
         )
-        notes = configuration.create_profile(
-            name="Notes", purpose="notes", connection_id=connection.id, model="notes"
-        )
-        configuration.record_profile_test(translation.id, ok=True, message="ok")
-        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        ready_chat_profile(configuration, translation.id)
+        ready_chat_profile(configuration, notes.id)
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
             options={
@@ -1497,26 +1540,23 @@ def test_translate_and_notes_retry_in_parallel_without_downgrading_running_state
 ) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        connection = configuration.create_connection(
-            name="Chat",
-            protocol="openai_compatible",
-            base_url="https://api.example/v1",
-            parameters={},
-        )
-        translation = configuration.create_profile(
+        connection = create_chat_connection(configuration)
+        translation = create_chat_profile(
+            configuration,
             name="Translation",
             purpose="translation",
             connection_id=connection.id,
-            model="translate",
+            model="qwen-translate",
         )
-        notes = configuration.create_profile(
+        notes = create_chat_profile(
+            configuration,
             name="Notes",
             purpose="notes",
             connection_id=connection.id,
-            model="notes",
+            model="qwen-notes",
         )
-        configuration.record_profile_test(translation.id, ok=True, message="ok")
-        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        ready_chat_profile(configuration, translation.id)
+        ready_chat_profile(configuration, notes.id)
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
             options={
@@ -1571,26 +1611,23 @@ def test_upstream_retry_conflicts_with_active_dependent_stage(
 ) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        connection = configuration.create_connection(
-            name="Chat",
-            protocol="openai_compatible",
-            base_url="https://api.example/v1",
-            parameters={},
-        )
-        translation = configuration.create_profile(
+        connection = create_chat_connection(configuration)
+        translation = create_chat_profile(
+            configuration,
             name="Translation",
             purpose="translation",
             connection_id=connection.id,
-            model="translate",
+            model="qwen-translate",
         )
-        notes = configuration.create_profile(
+        notes = create_chat_profile(
+            configuration,
             name="Notes",
             purpose="notes",
             connection_id=connection.id,
-            model="notes",
+            model="qwen-notes",
         )
-        configuration.record_profile_test(translation.id, ok=True, message="ok")
-        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        ready_chat_profile(configuration, translation.id)
+        ready_chat_profile(configuration, notes.id)
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}],
             options={
@@ -1623,19 +1660,15 @@ def test_upstream_retry_conflicts_with_active_dependent_stage(
 def test_same_stage_active_attempt_blocks_duplicate_retry(tmp_path: Path) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
-        connection = configuration.create_connection(
-            name="Chat",
-            protocol="openai_compatible",
-            base_url="https://api.example/v1",
-            parameters={},
-        )
-        notes = configuration.create_profile(
+        connection = create_chat_connection(configuration)
+        notes = create_chat_profile(
+            configuration,
             name="Notes",
             purpose="notes",
             connection_id=connection.id,
-            model="notes",
+            model="qwen-notes",
         )
-        configuration.record_profile_test(notes.id, ok=True, message="ok")
+        ready_chat_profile(configuration, notes.id)
         created = tasks.create_task(
             sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
         )

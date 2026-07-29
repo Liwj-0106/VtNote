@@ -51,6 +51,10 @@ _ADDITIVE_COLUMNS = {
     "default_settings": {
         "notes_custom_prompt_envelope_json": "JSON",
     },
+    "processor_profiles": {
+        "capability_fingerprint_json": "JSON",
+        "chat_data_authorized_fingerprint": "VARCHAR(64)",
+    },
     "cloud_submissions": {
         "normalized_result_json": "JSON",
     },
@@ -145,6 +149,16 @@ def _contains_legacy_cloud_snapshot(value: object) -> bool:
     return False
 
 
+def _contains_legacy_chat_snapshot(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("protocol") == "openai_compatible":
+            return True
+        return any(_contains_legacy_chat_snapshot(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_legacy_chat_snapshot(item) for item in value)
+    return False
+
+
 def _migrate_legacy_cloud_provider(engine: Engine) -> None:
     """Retire Volc configuration and stop active snapshots before execution."""
 
@@ -226,6 +240,87 @@ def _migrate_legacy_cloud_provider(engine: Engine) -> None:
         session.commit()
 
 
+def _migrate_legacy_chat_provider(engine: Engine) -> None:
+    """Archive arbitrary chat endpoints and fail active immutable snapshots."""
+
+    now = datetime.now(timezone.utc)
+    reason = "legacy_chat_endpoint_blocked"
+    with Session(engine) as session:
+        legacy_connections = session.scalars(
+            select(ProviderConnectionRecord).where(
+                ProviderConnectionRecord.protocol == "openai_compatible"
+            )
+        ).all()
+        if not legacy_connections:
+            return
+        legacy_connection_ids = {row.id for row in legacy_connections}
+        legacy_profiles = session.scalars(
+            select(ProcessorProfileRecord).where(
+                ProcessorProfileRecord.connection_id.in_(legacy_connection_ids)
+            )
+        ).all()
+        legacy_profile_ids = {row.id for row in legacy_profiles}
+
+        for row in legacy_connections:
+            row.archived_at = row.archived_at or now
+            row.test_ok = None
+            row.tested_revision = None
+            row.test_message = None
+            row.tested_at = None
+        for row in legacy_profiles:
+            row.archived_at = row.archived_at or now
+            row.test_ok = None
+            row.tested_revision = None
+            row.tested_connection_revision = None
+            row.test_message = None
+            row.tested_at = None
+            row.capability_fingerprint_json = None
+            row.chat_data_authorized_fingerprint = None
+
+        defaults = session.get(DefaultSettingsRecord, 1)
+        if defaults is not None:
+            if defaults.translation_profile_id in legacy_profile_ids:
+                defaults.translation_profile_id = None
+                defaults.translation_enabled = False
+            if defaults.notes_profile_id in legacy_profile_ids:
+                defaults.notes_profile_id = None
+                defaults.notes_enabled = False
+
+        active_tasks = session.scalars(
+            select(TaskRecord)
+            .where(TaskRecord.status.in_(("queued", "running")))
+            .options(
+                selectinload(TaskRecord.items).selectinload(ItemRecord.stage_runs)
+            )
+        ).all()
+        for task in active_tasks:
+            if not _contains_legacy_chat_snapshot(task.pipeline_snapshot_json):
+                continue
+            task.status = "failed"
+            task.terminal_reason_code = reason
+            for item in task.items:
+                affected = [
+                    run
+                    for run in item.stage_runs
+                    if run.stage in {"translate", "notes"}
+                    and run.status in {"queued", "running"}
+                ]
+                if not affected:
+                    continue
+                item.status = "failed"
+                for run in affected:
+                    run.status = "failed"
+                    run.error_code = reason
+                    run.error_message = (
+                        "Chat provider changed; configure and authorize Aliyun Bailian"
+                    )
+                    run.finished_at = now
+                    run.lease_owner = None
+                    run.lease_expires_at = None
+                    run.heartbeat_at = None
+        session.commit()
+
+
 def initialize_database(
     database_path: Path,
     *,
@@ -248,6 +343,7 @@ def initialize_database(
             _initialize_schema(engine)
             migrate_sensitive_text(engine, sensitive_text_protector)
             _migrate_legacy_cloud_provider(engine)
+            _migrate_legacy_chat_provider(engine)
             _migrate_default_local_whisper_device(engine)
     except Exception:
         engine.dispose()

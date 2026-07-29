@@ -70,17 +70,23 @@ def _configure_custom_notes(
 ) -> str:
     connection = configuration.create_connection(
         name="Chat",
-        protocol="openai_compatible",
-        base_url="https://api.example.com/v1",
-        parameters={},
+        protocol="aliyun_bailian",
+        base_url=(
+            "https://ws-1234.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        parameters={"workspace_id": "ws-1234"},
     )
     profile = configuration.create_profile(
         name="Notes",
         purpose="notes",
         connection_id=connection.id,
-        model="notes-model",
+        model="qwen-plus",
+        context_length=32768,
+        options={"max_tokens": 4096},
     )
     configuration.record_profile_test(profile.id, ok=True, message="ok")
+    configuration.authorize_chat_data(profile.id)
     configuration.update_defaults(
         notes_enabled=True,
         notes_profile_id=profile.id,

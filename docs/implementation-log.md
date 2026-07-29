@@ -398,3 +398,12 @@
 - Added private-COS routing, deterministic object reuse after a crash, provider-terminal cleanup scheduling, cancellation that stops the local stage without abandoning remote cleanup, and a global GPU lease.
 - Added a compact normalized local-ASR recovery artifact before final transcript publication. A process loss after inference or file publication resumes without repeating inference, while conflicting pre-existing content remains immutable.
 - Added end-to-end coverage for local/cloud/auto routing, inline/COS submission, known/unknown fallback, provider expiry, cancellation, main-loop fairness, exact snapshot credential revisions, crash windows, and publication races. No user-owned media is modified or deleted.
+
+### Task 12: domestic Aliyun Bailian chat boundary
+
+- Replaced active arbitrary `openai_compatible` configuration with one compile-time `aliyun_bailian` adapter. A lowercase DNS-label workspace ID derives the exact Beijing business-workspace endpoint; foreign regions, relays, credentials in URLs, ports, paths, queries, redirects, environment proxies, and `/models` discovery are not accepted.
+- Added a non-streaming `json_object` Chat Completions contract with a 64-KiB request and 256-KiB response boundary, one explicitly bounded 429 retry, no replay after ambiguous POST outcomes, strict response/result validation, safe request/model/usage normalization, and prompt/credential-safe representations and errors.
+- Added structured Bailian API-key bundles, conservative context/output limits, revision-bound capability fingerprints, a no-charge static policy validation, one explicitly acknowledged billable capability test, and independent chat-data consent. Consent covers subtitle cues, title/metadata, target/output language, and a custom prompt; it explicitly excludes audio.
+- Added startup migration that archives legacy arbitrary chat connections/profiles, clears their defaults/test/consent state, fails active legacy snapshots with `legacy_chat_endpoint_blocked`, and blocks legacy credential access before secret-store or transport use.
+- Updated durable task snapshots so translation and notes require both a current capability test and current chat-data consent. Provider/model/options/workspace/key changes invalidate both gates without altering historical snapshots.
+- Added adapter, configuration, API, migration, lifecycle, security, snapshot, and redaction regression coverage. No real model request was sent, no credential was persisted in SQLite or logs, and no user file was modified or deleted.

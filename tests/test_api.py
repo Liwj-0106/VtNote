@@ -17,7 +17,7 @@ from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
-from vtnote.provider_credentials import TencentCredentialBundle
+from vtnote.provider_credentials import BailianCredentialBundle, TencentCredentialBundle
 from vtnote.schemas import Provenance, ProvenanceMethod, Transcript, TranscriptSegment
 from vtnote.secrets import MemorySecretStore
 from vtnote.sources import SourceProbeResult, make_subtitle_track
@@ -25,6 +25,26 @@ from vtnote.sources import SourceProbeResult, make_subtitle_track
 
 BASE_URL = "http://127.0.0.1:8765"
 MODEL_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+
+
+def bailian_connection_payload(
+    *,
+    name: str = "Chat",
+    workspace_id: str = "ws-1234",
+    api_key: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "name": name,
+        "protocol": "aliyun_bailian",
+        "base_url": (
+            f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        "parameters": {"workspace_id": workspace_id},
+    }
+    if api_key is not None:
+        payload["credentials"] = {"api_key": api_key}
+    return payload
 
 
 class PublicResolver:
@@ -77,6 +97,26 @@ class FakeProfileTester:
         assert credentials.secret_id.get_secret_value() == "AKID-example"
         assert credentials.secret_key.get_secret_value() == "secret-key"
         return ConnectivityResult(ok=True, message="provider response omitted")
+
+
+class FakeBailianProfileTester:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def test_profile(
+        self,
+        profile,
+        credentials,
+        test_input,
+        *,
+        follow_redirects: bool,
+    ):
+        self.calls.append((profile, credentials, test_input))
+        assert profile.protocol == "aliyun_bailian"
+        assert isinstance(credentials, BailianCredentialBundle)
+        assert credentials.api_key.get_secret_value() == "sk-private"
+        assert follow_redirects is False
+        return ConnectivityResult(ok=True, message="safe")
 
 
 class FakeSourceProbe:
@@ -294,13 +334,13 @@ def test_default_production_composition_wires_tencent_connection_policy_test(
         engine.dispose()
 
 
-def test_default_tencent_tester_does_not_claim_unimplemented_protocols(
+def test_arbitrary_openai_compatible_protocol_is_rejected_at_creation(
     tmp_path: Path,
 ) -> None:
     client, engine, _ = make_client(tmp_path)
     headers = csrf(client)
     try:
-        connection = client.post(
+        response = client.post(
             "/api/connections",
             headers=headers,
             json={
@@ -310,15 +350,10 @@ def test_default_tencent_tester_does_not_claim_unimplemented_protocols(
                 "parameters": {},
                 "secret": "domestic-key",
             },
-        ).json()
-
-        response = client.post(
-            f"/api/connections/{connection['id']}/test",
-            headers=headers,
         )
 
-        assert response.status_code == 501
-        assert response.json()["error"]["code"] == "adapter_unavailable"
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_configuration"
     finally:
         engine.dispose()
 
@@ -442,6 +477,108 @@ def test_billable_cloud_profile_test_requires_ack_and_uploaded_speech_sample(
         engine.dispose()
 
 
+def test_bailian_policy_capability_test_and_chat_data_consent_are_independent(
+    tmp_path: Path,
+) -> None:
+    tester = FakeBailianProfileTester()
+    client, engine, _ = make_client(tmp_path, profile_tester=tester)
+    headers = csrf(client)
+    try:
+        connection_response = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Bailian",
+                "protocol": "aliyun_bailian",
+                "parameters": {"workspace_id": "ws-1234"},
+                "credentials": {"api_key": "sk-private"},
+            },
+        )
+        assert connection_response.status_code == 201
+        connection = connection_response.json()
+        profile_response = client.post(
+            "/api/profiles",
+            headers=headers,
+            json={
+                "name": "Notes",
+                "purpose": "notes",
+                "connection_id": connection["id"],
+                "model": "qwen-plus",
+                "context_length": 32768,
+                "options": {
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                    "enable_thinking": False,
+                },
+            },
+        )
+        assert profile_response.status_code == 201
+        profile = profile_response.json()
+
+        static = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={"test_kind": "connection_policy_validated"},
+        )
+        assert static.status_code == 200
+        assert static.json()["tested"] is False
+        assert static.json()["chat_data_authorized"] is False
+        assert tester.calls == []
+
+        no_ack = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={"test_kind": "profile_capability_tested"},
+        )
+        assert no_ack.status_code == 400
+        assert no_ack.json()["error"]["code"] == "billable_test_ack_required"
+
+        tested = client.post(
+            f"/api/profiles/{profile['id']}/test",
+            headers=headers,
+            json={
+                "test_kind": "profile_capability_tested",
+                "acknowledge_billable_request": True,
+            },
+        )
+        assert tested.status_code == 200
+        assert tested.json()["tested"] is True
+        assert tested.json()["capability_fingerprint"]["protocol"] == "aliyun_bailian"
+        assert tested.json()["chat_data_authorized"] is False
+        assert len(tester.calls) == 1
+
+        no_consent = client.post(
+            f"/api/profiles/{profile['id']}/authorize-chat-data",
+            headers=headers,
+            json={"acknowledge_chat_data_upload": False},
+        )
+        assert no_consent.status_code == 400
+        assert no_consent.json()["error"]["code"] == "chat_data_consent_required"
+
+        authorized = client.post(
+            f"/api/profiles/{profile['id']}/authorize-chat-data",
+            headers=headers,
+            json={"acknowledge_chat_data_upload": True},
+        )
+        assert authorized.status_code == 200
+        assert authorized.json()["chat_data_authorized"] is True
+        assert authorized.json()["chat_data_scope"] == {
+            "subtitle_cues": True,
+            "title_and_metadata": True,
+            "target_or_output_language": True,
+            "custom_prompt": True,
+            "audio": False,
+        }
+        revoked = client.post(
+            f"/api/profiles/{profile['id']}/revoke-chat-data",
+            headers=headers,
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["chat_data_authorized"] is False
+    finally:
+        engine.dispose()
+
+
 def test_exact_host_origin_and_double_submit_csrf_are_enforced(tmp_path: Path) -> None:
     client, engine, _ = make_client(tmp_path)
     try:
@@ -544,13 +681,7 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
         created = client.post(
             "/api/connections",
             headers=headers,
-            json={
-                "name": "Chat",
-                "protocol": "openai_compatible",
-                "base_url": "https://api.example.com/v1",
-                "parameters": {},
-                "secret": "super-secret",
-            },
+            json=bailian_connection_payload(api_key="super-secret"),
         )
         assert created.status_code == 201
         connection = created.json()
@@ -562,9 +693,9 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
 
         tested = client.post(f"/api/connections/{connection['id']}/test", headers=headers)
         assert tested.status_code == 200
-        assert tester.called is True
+        assert tester.called is False
         assert "super-secret" not in tested.text
-        assert tested.json()["test_message"] == "Connection test succeeded"
+        assert tested.json()["test_message"] == "Connection policy validated"
 
         assert client.get("/api/connections").status_code == 200
         assert client.get(f"/api/connections/{connection['id']}").status_code == 200
@@ -583,15 +714,18 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
                 "name": "Notes",
                 "purpose": "notes",
                 "connection_id": connection["id"],
-                "model": "gpt",
-                "options": {},
+                "model": "qwen-plus",
+                "context_length": 32768,
+                "options": {"max_tokens": 4096},
             },
         )
         assert profile.status_code == 201
         profile_id = profile.json()["id"]
         assert client.get("/api/profiles").status_code == 200
         assert client.patch(
-            f"/api/profiles/{profile_id}", headers=headers, json={"model": "gpt-2"}
+            f"/api/profiles/{profile_id}",
+            headers=headers,
+            json={"model": "qwen-max"},
         ).status_code == 200
         assert client.get("/api/defaults").json()["translation_enabled"] is False
         assert client.patch("/api/defaults", headers=headers, json={"asr_mode": "local"}).status_code == 200
@@ -600,7 +734,10 @@ def test_connection_profile_and_defaults_routes_redact_secrets(tmp_path: Path) -
             headers=headers,
             json={
                 "name": "Translation", "purpose": "translation",
-                "connection_id": connection["id"], "model": "translate", "options": {}
+                "connection_id": connection["id"],
+                "model": "qwen-plus",
+                "context_length": 32768,
+                "options": {"max_tokens": 4096},
             },
         )
         assert translation.status_code == 201
@@ -641,13 +778,11 @@ def test_credential_cleanup_status_and_retry_never_expose_reference_or_secret(
         connection = client.post(
             "/api/connections",
             headers=headers,
-            json={
-                "name": "Disposable",
-                "protocol": "openai_compatible",
-                "base_url": "https://api.example/v1",
-                "parameters": {},
-                "secret": "cleanup-secret",
-            },
+            json=bailian_connection_payload(
+                name="Disposable",
+                workspace_id="ws-disposable",
+                api_key="cleanup-secret",
+            ),
         ).json()
         assert client.delete(
             f"/api/connections/{connection['id']}", headers=headers
@@ -671,10 +806,7 @@ def test_patch_rejects_explicit_null_and_empty_patch_is_a_noop(tmp_path: Path) -
     try:
         connection = client.post(
             "/api/connections", headers=headers,
-            json={
-                "name": "Chat", "protocol": "openai_compatible",
-                "base_url": "https://api.example/v1", "parameters": {},
-            },
+            json=bailian_connection_payload(),
         ).json()
         empty = client.patch(
             f"/api/connections/{connection['id']}", headers=headers, json={}
@@ -690,7 +822,10 @@ def test_patch_rejects_explicit_null_and_empty_patch_is_a_noop(tmp_path: Path) -
             "/api/profiles", headers=headers,
             json={
                 "name": "Notes", "purpose": "notes",
-                "connection_id": connection["id"], "model": "notes",
+                "connection_id": connection["id"],
+                "model": "qwen-plus",
+                "context_length": 32768,
+                "options": {"max_tokens": 4096},
             },
         ).json()
         assert client.patch(

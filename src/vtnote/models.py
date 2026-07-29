@@ -392,6 +392,10 @@ class ProcessorProfileRecord(Base):
     tested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     upload_authorized_revision: Mapped[int | None] = mapped_column(Integer)
     upload_authorized_connection_revision: Mapped[int | None] = mapped_column(Integer)
+    capability_fingerprint_json: Mapped[dict[str, Any] | None] = mapped_column(
+        MutableDict.as_mutable(JSON)
+    )
+    chat_data_authorized_fingerprint: Mapped[str | None] = mapped_column(String(64))
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

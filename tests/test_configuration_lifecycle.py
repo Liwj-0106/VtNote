@@ -56,6 +56,53 @@ def make_services(
     return configuration, tasks, selected_secrets, session
 
 
+def create_chat_connection(
+    configuration: ConfigurationService,
+    *,
+    name: str = "Chat",
+    workspace_id: str = "ws-1234",
+    api_key: str | None = None,
+):
+    kwargs = (
+        {"credentials": {"api_key": api_key}}
+        if api_key is not None
+        else {}
+    )
+    return configuration.create_connection(
+        name=name,
+        protocol="aliyun_bailian",
+        base_url=(
+            f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        parameters={"workspace_id": workspace_id},
+        **kwargs,
+    )
+
+
+def create_chat_profile(
+    configuration: ConfigurationService,
+    *,
+    connection_id: str,
+    name: str = "Notes",
+    purpose: str = "notes",
+    model: str = "qwen-plus",
+):
+    return configuration.create_profile(
+        name=name,
+        purpose=purpose,
+        connection_id=connection_id,
+        model=model,
+        context_length=32768,
+        options={"max_tokens": 4096},
+    )
+
+
+def ready_chat_profile(configuration: ConfigurationService, profile_id: str) -> None:
+    configuration.record_profile_test(profile_id, ok=True, message="ok")
+    configuration.authorize_chat_data(profile_id)
+
+
 def create_legacy_global_name_schema(database_path: Path) -> Engine:
     """Create the pre-partial-index schema with real SQLite UNIQUE constraints."""
 
@@ -91,10 +138,7 @@ def test_secret_rotation_never_exposes_new_secret_with_old_database_config(
     tmp_path: Path,
 ) -> None:
     configuration, _, secrets, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://old.example/v1", parameters={}, secret="old-key"
-    )
+    connection = create_chat_connection(configuration, api_key="old-key")
     stored = session.get(ProviderConnectionRecord, connection.id)
     assert stored is not None
     old_reference = stored.credential_ref
@@ -108,14 +152,21 @@ def test_secret_rotation_never_exposes_new_secret_with_old_database_config(
 
     event.listen(session, "before_commit", observe_before_commit, once=True)
     updated = configuration.update_connection(
-        connection.id, base_url="https://new.example/v1", secret="new-key"
+        connection.id,
+        credentials={"api_key": "new-key"},
     )
 
-    assert observed == [("https://old.example/v1", old_reference, "old-key")]
+    assert len(observed) == 1
+    assert observed[0][0] == connection.base_url
+    assert observed[0][1] == old_reference
+    assert observed[0][2] is not None
+    assert '"api_key":"old-key"' in observed[0][2]
     session.refresh(stored)
     assert stored.credential_ref != old_reference
     assert secrets.get(old_reference) is None
-    assert configuration.secret_for_connection(connection.id) == "new-key"
+    current_secret = configuration.secret_for_connection(connection.id)
+    assert current_secret is not None
+    assert '"api_key":"new-key"' in current_secret
     assert updated.revision == 2
     session.close()
     session.bind.dispose()
@@ -123,10 +174,7 @@ def test_secret_rotation_never_exposes_new_secret_with_old_database_config(
 
 def test_clear_secret_rotates_to_a_new_empty_reference(tmp_path: Path) -> None:
     configuration, _, secrets, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}, secret="old-key"
-    )
+    connection = create_chat_connection(configuration, api_key="old-key")
     stored = session.get(ProviderConnectionRecord, connection.id)
     assert stored is not None
     old_reference = stored.credential_ref
@@ -144,14 +192,9 @@ def test_archiving_keeps_queued_task_profile_and_credential_resolvable(
     tmp_path: Path,
 ) -> None:
     configuration, tasks, _, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}, secret="task-key"
-    )
-    profile = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=connection.id, model="notes"
-    )
-    configuration.record_profile_test(profile.id, ok=True, message="ok")
+    connection = create_chat_connection(configuration, api_key="task-key")
+    profile = create_chat_profile(configuration, connection_id=connection.id)
+    ready_chat_profile(configuration, profile.id)
     task = tasks.create_task(
         sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
     )
@@ -169,7 +212,8 @@ def test_archiving_keeps_queued_task_profile_and_credential_resolvable(
         configuration.get_profile(profile.id)
     resolved = configuration.resolve_profile_for_execution(profile.id)
     assert resolved["connection_id"] == connection.id
-    assert configuration.secret_for_connection(connection.id) == "task-key"
+    task_secret = configuration.secret_for_connection(connection.id)
+    assert task_secret is not None and '"api_key":"task-key"' in task_secret
     session.close()
     session.bind.dispose()
 
@@ -178,15 +222,17 @@ def test_archived_names_can_be_reused_and_terminal_tasks_allow_purge(
     tmp_path: Path,
 ) -> None:
     configuration, tasks, secrets, session = make_services(tmp_path)
-    old_connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://old.example/v1", parameters={}, secret="old-task-key"
+    old_connection = create_chat_connection(
+        configuration,
+        workspace_id="ws-old",
+        api_key="old-task-key",
     )
-    old_profile = configuration.create_profile(
-        name="Notes", purpose="notes",
-        connection_id=old_connection.id, model="old-notes"
+    old_profile = create_chat_profile(
+        configuration,
+        connection_id=old_connection.id,
+        model="qwen-old",
     )
-    configuration.record_profile_test(old_profile.id, ok=True, message="ok")
+    ready_chat_profile(configuration, old_profile.id)
     task = tasks.create_task(
         sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
     )
@@ -196,13 +242,14 @@ def test_archived_names_can_be_reused_and_terminal_tasks_allow_purge(
 
     configuration.delete_profile(old_profile.id)
     configuration.delete_connection(old_connection.id)
-    replacement = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://new.example/v1", parameters={}
+    replacement = create_chat_connection(
+        configuration,
+        workspace_id="ws-new",
     )
-    replacement_profile = configuration.create_profile(
-        name="Notes", purpose="notes",
-        connection_id=replacement.id, model="new-notes"
+    replacement_profile = create_chat_profile(
+        configuration,
+        connection_id=replacement.id,
+        model="qwen-new",
     )
     assert replacement_profile.name == "Notes"
     assert configuration.resolve_profile_for_execution(old_profile.id)["id"] == old_profile.id
@@ -235,20 +282,15 @@ def test_retryable_terminal_task_pins_archives_until_latest_attempt_succeeds(
     retryable_stage_status: str,
 ) -> None:
     configuration, tasks, secrets, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat",
-        protocol="openai_compatible",
-        base_url="https://api.example/v1",
-        parameters={},
-        secret="retry-secret",
+    connection = create_chat_connection(
+        configuration,
+        api_key="retry-secret",
     )
-    profile = configuration.create_profile(
-        name="Notes",
-        purpose="notes",
+    profile = create_chat_profile(
+        configuration,
         connection_id=connection.id,
-        model="notes",
     )
-    configuration.record_profile_test(profile.id, ok=True, message="ok")
+    ready_chat_profile(configuration, profile.id)
     task = tasks.create_task(
         sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
     )
@@ -273,7 +315,9 @@ def test_retryable_terminal_task_pins_archives_until_latest_attempt_succeeds(
         "connections": 0,
     }
     assert configuration.resolve_profile_for_execution(profile.id)["id"] == profile.id
-    assert configuration.secret_for_connection(connection.id) == "retry-secret"
+    retry_secret = configuration.secret_for_connection(connection.id)
+    assert retry_secret is not None
+    assert '"api_key":"retry-secret"' in retry_secret
 
     retried = tasks.retry_stage(
         item.id,
@@ -351,17 +395,14 @@ def test_legacy_global_unique_schema_reuses_archived_names_without_rebuild(
         )
         with Session(engine) as session:
             configuration = ConfigurationService(session, secrets, paths=paths)
-            replacement = configuration.create_connection(
-                name="Chat",
-                protocol="openai_compatible",
-                base_url="https://new.example/v1",
-                parameters={},
+            replacement = create_chat_connection(
+                configuration,
+                workspace_id="ws-replacement",
             )
-            replacement_profile = configuration.create_profile(
-                name="Notes",
-                purpose="notes",
+            replacement_profile = create_chat_profile(
+                configuration,
                 connection_id=replacement.id,
-                model="new-notes",
+                model="qwen-new",
             )
 
             old_connection_row = session.get(
@@ -379,22 +420,26 @@ def test_legacy_global_unique_schema_reuses_archived_names_without_rebuild(
             assert old_profile_row.context_length == 4096
             assert old_profile_row.options == {"temperature": 0.2}
             assert old_profile_row.connection_id == old_connection_id
-            assert configuration.secret_for_connection(old_connection_id) == "legacy-secret"
+            assert secrets.get(old_reference) == "legacy-secret"
+            with pytest.raises(
+                InvalidConfiguration,
+                match="legacy_chat_endpoint_blocked",
+            ):
+                configuration.secret_for_connection(old_connection_id)
             assert replacement_profile.name == "Notes"
 
             with pytest.raises(InvalidConfiguration, match="already exists"):
-                configuration.create_connection(
+                create_chat_connection(
+                    configuration,
                     name="chat",
-                    protocol="openai_compatible",
-                    base_url="https://duplicate.example/v1",
-                    parameters={},
+                    workspace_id="ws-duplicate",
                 )
             with pytest.raises(InvalidConfiguration, match="already exists"):
-                configuration.create_profile(
+                create_chat_profile(
+                    configuration,
                     name="notes",
-                    purpose="notes",
                     connection_id=replacement.id,
-                    model="duplicate-notes",
+                    model="qwen-duplicate",
                 )
     finally:
         engine.dispose()
@@ -406,34 +451,24 @@ def test_reserved_archived_name_prefix_is_rejected_for_user_configuration(
     configuration, _, _, session = make_services(tmp_path)
     try:
         with pytest.raises(InvalidConfiguration, match="reserved"):
-            configuration.create_connection(
+            create_chat_connection(
+                configuration,
                 name="__VTNOTE_ARCHIVED__:manual",
-                protocol="openai_compatible",
-                base_url="https://api.example/v1",
-                parameters={},
             )
-        connection = configuration.create_connection(
-            name="Chat",
-            protocol="openai_compatible",
-            base_url="https://api.example/v1",
-            parameters={},
-        )
+        connection = create_chat_connection(configuration)
         with pytest.raises(InvalidConfiguration, match="reserved"):
             configuration.update_connection(
                 connection.id, name="__vtnote_archived__:manual"
             )
         with pytest.raises(InvalidConfiguration, match="reserved"):
-            configuration.create_profile(
+            create_chat_profile(
+                configuration,
                 name="__vtnote_archived__:manual",
-                purpose="notes",
                 connection_id=connection.id,
-                model="notes",
             )
-        profile = configuration.create_profile(
-            name="Notes",
-            purpose="notes",
+        profile = create_chat_profile(
+            configuration,
             connection_id=connection.id,
-            model="notes",
         )
         with pytest.raises(InvalidConfiguration, match="reserved"):
             configuration.update_profile(
@@ -448,17 +483,11 @@ def test_archived_name_retirement_rolls_back_if_profile_create_fails(
     tmp_path: Path,
 ) -> None:
     configuration, _, _, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat",
-        protocol="openai_compatible",
-        base_url="https://api.example/v1",
-        parameters={},
-    )
-    old_profile = configuration.create_profile(
-        name="Notes",
-        purpose="notes",
+    connection = create_chat_connection(configuration)
+    old_profile = create_chat_profile(
+        configuration,
         connection_id=connection.id,
-        model="old-notes",
+        model="qwen-old",
     )
     old_row = session.get(ProcessorProfileRecord, old_profile.id)
     assert old_row is not None
@@ -470,11 +499,11 @@ def test_archived_name_retirement_rolls_back_if_profile_create_fails(
 
     event.listen(session, "before_commit", fail_commit, once=True)
     with pytest.raises(RuntimeError, match="database unavailable"):
-        configuration.create_profile(
+        create_chat_profile(
+            configuration,
             name="Notes",
-            purpose="notes",
             connection_id=connection.id,
-            model="replacement-notes",
+            model="qwen-replacement",
         )
 
     assert session.in_transaction() is False
@@ -489,15 +518,15 @@ def test_failed_obsolete_credential_delete_is_tracked_and_retryable(
 ) -> None:
     secrets = RecoveringDeleteSecretStore()
     configuration, _, _, session = make_services(tmp_path, secrets)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}, secret="old-secret"
-    )
+    connection = create_chat_connection(configuration, api_key="old-secret")
     stored = session.get(ProviderConnectionRecord, connection.id)
     assert stored is not None
     old_reference = stored.credential_ref
 
-    updated = configuration.update_connection(connection.id, secret="new-secret")
+    updated = configuration.update_connection(
+        connection.id,
+        credentials={"api_key": "new-secret"},
+    )
     assert updated.cleanup_pending is True
     status = configuration.credential_cleanup_status()
     assert status.cleanup_pending is True
@@ -525,9 +554,11 @@ def test_unreferenced_delete_hard_purges_and_tracks_failed_credential_cleanup(
 ) -> None:
     secrets = RecoveringDeleteSecretStore()
     configuration, _, _, session = make_services(tmp_path, secrets)
-    connection = configuration.create_connection(
-        name="Disposable", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}, secret="purge-secret"
+    connection = create_chat_connection(
+        configuration,
+        name="Disposable",
+        workspace_id="ws-disposable",
+        api_key="purge-secret",
     )
     stored = session.get(ProviderConnectionRecord, connection.id)
     assert stored is not None
@@ -538,9 +569,10 @@ def test_unreferenced_delete_hard_purges_and_tracks_failed_credential_cleanup(
     assert configuration.credential_cleanup_status().cleanup_pending is True
     assert reference in configuration.diagnostic_sensitive_values()
 
-    recreated = configuration.create_connection(
-        name="Disposable", protocol="openai_compatible",
-        base_url="https://new.example/v1", parameters={}
+    recreated = create_chat_connection(
+        configuration,
+        name="Disposable",
+        workspace_id="ws-recreated",
     )
     assert recreated.name == "Disposable"
     secrets.fail_delete = False
@@ -569,19 +601,16 @@ def test_profile_archive_repairs_all_affected_defaults(tmp_path: Path) -> None:
     assert defaults.asr_mode == "auto"
     assert defaults.cloud_asr_profile_id is None
 
-    chat = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}
+    chat = create_chat_connection(configuration)
+    translation = create_chat_profile(
+        configuration,
+        name="Translation",
+        purpose="translation",
+        connection_id=chat.id,
     )
-    translation = configuration.create_profile(
-        name="Translation", purpose="translation",
-        connection_id=chat.id, model="translation"
-    )
-    notes = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=chat.id, model="notes"
-    )
-    configuration.record_profile_test(translation.id, ok=True, message="ok")
-    configuration.record_profile_test(notes.id, ok=True, message="ok")
+    notes = create_chat_profile(configuration, connection_id=chat.id)
+    ready_chat_profile(configuration, translation.id)
+    ready_chat_profile(configuration, notes.id)
     configuration.update_defaults(
         translation_enabled=True, translation_profile_id=translation.id,
         notes_enabled=True, notes_profile_id=notes.id,
@@ -601,14 +630,11 @@ def test_first_successful_notes_profile_auto_enables_once_and_respects_opt_out(
     tmp_path: Path,
 ) -> None:
     configuration, _, _, session = make_services(tmp_path / "automatic")
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}
-    )
-    notes = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=connection.id, model="notes"
-    )
+    connection = create_chat_connection(configuration)
+    notes = create_chat_profile(configuration, connection_id=connection.id)
     configuration.record_profile_test(notes.id, ok=True, message="ok")
+    assert configuration.get_defaults().notes_enabled is False
+    configuration.authorize_chat_data(notes.id)
     defaults = configuration.get_defaults()
     assert defaults.notes_enabled is True
     assert defaults.notes_profile_id == notes.id
@@ -617,22 +643,22 @@ def test_first_successful_notes_profile_auto_enables_once_and_respects_opt_out(
 
     configuration, _, _, session = make_services(tmp_path / "opted-out")
     configuration.update_defaults(notes_enabled=False)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}
-    )
-    notes = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=connection.id, model="notes"
-    )
+    connection = create_chat_connection(configuration)
+    notes = create_chat_profile(configuration, connection_id=connection.id)
     configuration.record_profile_test(notes.id, ok=True, message="ok")
+    configuration.authorize_chat_data(notes.id)
     defaults = configuration.get_defaults()
     assert defaults.notes_enabled is False
     assert defaults.notes_profile_id is None
 
-    second = configuration.create_profile(
-        name="Notes 2", purpose="notes", connection_id=connection.id, model="notes-2"
+    second = create_chat_profile(
+        configuration,
+        name="Notes 2",
+        connection_id=connection.id,
+        model="qwen-plus-2",
     )
     configuration.record_profile_test(second.id, ok=True, message="ok")
+    configuration.authorize_chat_data(second.id)
     assert configuration.get_defaults().notes_enabled is False
     session.close()
     session.bind.dispose()
@@ -642,13 +668,12 @@ def test_disabled_defaults_still_validate_profile_reference_and_purpose(
     tmp_path: Path,
 ) -> None:
     configuration, _, _, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}
-    )
-    translation = configuration.create_profile(
-        name="Translation", purpose="translation",
-        connection_id=connection.id, model="translation"
+    connection = create_chat_connection(configuration)
+    translation = create_chat_profile(
+        configuration,
+        name="Translation",
+        purpose="translation",
+        connection_id=connection.id,
     )
     with pytest.raises(InvalidConfiguration, match="notes profile"):
         configuration.update_defaults(
@@ -666,34 +691,30 @@ def test_noop_and_display_name_only_patches_do_not_invalidate_revisions(
     tmp_path: Path,
 ) -> None:
     configuration, _, _, session = make_services(tmp_path)
-    connection = configuration.create_connection(
-        name="Chat", protocol="openai_compatible",
-        base_url="https://api.example/v1", parameters={}
-    )
+    connection = create_chat_connection(configuration)
     configuration.record_connection_test(connection.id, ok=True, message="ok")
     assert configuration.update_connection(connection.id).revision == 1
     renamed = configuration.update_connection(connection.id, name="Chat display")
     assert renamed.revision == 1
     assert renamed.tested is True
     assert configuration.update_connection(
-        connection.id, base_url="https://api.example/v1"
+        connection.id, base_url=connection.base_url
     ).revision == 1
     changed = configuration.update_connection(
-        connection.id, base_url="https://new.example/v1"
+        connection.id,
+        credentials={"api_key": "new-key"},
     )
     assert changed.revision == 2
     assert changed.tested is False
 
-    profile = configuration.create_profile(
-        name="Notes", purpose="notes", connection_id=connection.id, model="notes"
-    )
+    profile = create_chat_profile(configuration, connection_id=connection.id)
     configuration.record_profile_test(profile.id, ok=True, message="ok")
     assert configuration.update_profile(profile.id).revision == 1
     renamed_profile = configuration.update_profile(profile.id, name="Notes display")
     assert renamed_profile.revision == 1
     assert renamed_profile.tested is True
-    assert configuration.update_profile(profile.id, model="notes").revision == 1
-    assert configuration.update_profile(profile.id, model="notes-v2").revision == 2
+    assert configuration.update_profile(profile.id, model="qwen-plus").revision == 1
+    assert configuration.update_profile(profile.id, model="qwen-max").revision == 2
     session.close()
     session.bind.dispose()
 
@@ -705,10 +726,12 @@ def test_cloud_connection_rejects_loopback_http(tmp_path: Path) -> None:
             name="Cloud", protocol="tencent_recording_asr",
             base_url="http://127.0.0.1:9000", parameters={}
         )
-    local = configuration.create_connection(
-        name="Local", protocol="openai_compatible",
-        base_url="http://127.0.0.1:11434/v1", parameters={}
-    )
-    assert local.base_url.startswith("http://127.0.0.1")
+    with pytest.raises(InvalidConfiguration, match="endpoint"):
+        configuration.create_connection(
+            name="Local",
+            protocol="aliyun_bailian",
+            base_url="http://127.0.0.1:11434/v1",
+            parameters={"workspace_id": "ws-local"},
+        )
     session.close()
     session.bind.dispose()
