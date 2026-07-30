@@ -11,6 +11,7 @@ import zlib
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.cookies import CookieError, SimpleCookie
 from types import MappingProxyType
 from typing import Callable, Protocol
 from urllib.parse import urljoin, urlsplit
@@ -44,6 +45,8 @@ _HOP_BY_HOP_HEADERS = frozenset(
     }
 )
 _RESPONSE_HIDDEN_HEADERS = frozenset({"set-cookie", "set-cookie2"})
+_BILIBILI_ANONYMOUS_COOKIE_NAMES = frozenset({"b_nut", "buvid3", "sid"})
+_ANONYMOUS_COOKIE_VALUE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _ERROR_CATEGORY = re.compile(r"^[a-z_]{1,64}$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
@@ -103,6 +106,10 @@ class SourceHttpRequest:
     max_decoded_bytes: int
     method: str = "GET"
     headers: Mapping[str, str] = field(default_factory=dict)
+    anonymous_session_cookies: Mapping[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.url, str) or not self.url:
@@ -132,6 +139,22 @@ class SourceHttpRequest:
             normalized[name] = value
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "headers", MappingProxyType(normalized))
+        if not isinstance(self.anonymous_session_cookies, Mapping):
+            raise ValueError("anonymous session cookies must be a mapping")
+        anonymous_cookies: dict[str, str] = {}
+        for name, value in self.anonymous_session_cookies.items():
+            if (
+                name not in _BILIBILI_ANONYMOUS_COOKIE_NAMES
+                or not isinstance(value, str)
+                or _ANONYMOUS_COOKIE_VALUE.fullmatch(value) is None
+            ):
+                raise ValueError("invalid anonymous session cookie")
+            anonymous_cookies[name] = value
+        object.__setattr__(
+            self,
+            "anonymous_session_cookies",
+            MappingProxyType(anonymous_cookies),
+        )
 
 
 class RawHttpResponse(Protocol):
@@ -260,6 +283,7 @@ class SourceHttpResponse(Iterator[bytes]):
         max_decoded_bytes: int,
         decode_chunk_bytes: int,
         headers: tuple[tuple[str, str], ...],
+        anonymous_session_cookies: Mapping[str, str] | None = None,
     ) -> None:
         self.status = raw.status
         self.headers = {
@@ -277,6 +301,9 @@ class SourceHttpResponse(Iterator[bytes]):
         self._buffer = bytearray()
         self._eof = False
         self._closed = False
+        self._anonymous_session_cookies = MappingProxyType(
+            dict(anonymous_session_cookies or {})
+        )
         encoding = _header_value(headers, "content-encoding")
         normalized_encoding = encoding.casefold() if encoding is not None else ""
         if normalized_encoding in {"", "identity"}:
@@ -288,6 +315,9 @@ class SourceHttpResponse(Iterator[bytes]):
         else:
             self.close()
             raise TransportSecurityError("unsupported_content_encoding", host)
+
+    def anonymous_session_cookies(self) -> dict[str, str]:
+        return dict(self._anonymous_session_cookies)
 
     def _fail(self, category: str) -> None:
         self.close()
@@ -465,6 +495,34 @@ def _safe_request_headers(
     return dict(sorted(safe.items()))
 
 
+def _bilibili_anonymous_cookies(
+    headers: tuple[tuple[str, str], ...],
+) -> dict[str, str]:
+    accepted: dict[str, str] = {}
+    for name, value in headers:
+        if name.casefold() != "set-cookie":
+            continue
+        parsed = SimpleCookie()
+        try:
+            parsed.load(value)
+        except CookieError:
+            continue
+        for cookie_name in _BILIBILI_ANONYMOUS_COOKIE_NAMES:
+            morsel = parsed.get(cookie_name)
+            if morsel is None:
+                continue
+            domain = morsel["domain"].casefold()
+            path = morsel["path"]
+            if (
+                domain not in {"", "bilibili.com", ".bilibili.com"}
+                or path not in {"", "/"}
+                or _ANONYMOUS_COOKIE_VALUE.fullmatch(morsel.value) is None
+            ):
+                continue
+            accepted[cookie_name] = morsel.value
+    return accepted
+
+
 def _validate_headers(
     headers: tuple[tuple[str, str], ...],
     *,
@@ -558,6 +616,20 @@ class PinnedHttpsTransport:
                 raise TransportSecurityError("request_target_too_large", host)
             addresses = self._resolve(host)
             safe_headers = _safe_request_headers(headers, host=host)
+            if request.anonymous_session_cookies:
+                if policy.platform != "bilibili" or not (
+                    host == "bilibili.com" or host.endswith(".bilibili.com")
+                ):
+                    raise TransportSecurityError(
+                        "anonymous_session_rejected",
+                        host,
+                    )
+                safe_headers["Cookie"] = "; ".join(
+                    f"{name}={value}"
+                    for name, value in sorted(
+                        request.anonymous_session_cookies.items()
+                    )
+                )
             _validate_headers(
                 tuple(safe_headers.items()),
                 limits=self.limits,
@@ -629,5 +701,10 @@ class PinnedHttpsTransport:
                 max_decoded_bytes=request.max_decoded_bytes,
                 decode_chunk_bytes=self.limits.decode_chunk_bytes,
                 headers=response_headers,
+                anonymous_session_cookies=(
+                    _bilibili_anonymous_cookies(response_headers)
+                    if policy.platform == "bilibili"
+                    else {}
+                ),
             )
         raise TransportSecurityError("too_many_redirects", policy.platform)

@@ -44,6 +44,12 @@ def test_source_policy_rejects_private_dns_answers(address: str) -> None:
         policy.validate("https://www.youtube.com/watch?v=1")
 
 
+def test_source_policy_reports_proxy_fake_ip_dns_answers() -> None:
+    policy = SourceUrlPolicy(FakeResolver({"www.bilibili.com": ["198.18.0.140"]}))
+    with pytest.raises(UnsafeSourceUrl, match="proxy Fake-IP"):
+        policy.validate("https://www.bilibili.com/video/BV1")
+
+
 def test_source_policy_accepts_exact_and_real_subdomains() -> None:
     policy = SourceUrlPolicy(
         FakeResolver(

@@ -26,6 +26,7 @@ class SocketResolver:
 
 
 _PLATFORM_SUFFIXES = ("youtube.com", "youtu.be", "bilibili.com", "b23.tv")
+_PROXY_FAKE_IP_RANGE = ipaddress.ip_network("198.18.0.0/15")
 _HOST = re.compile(
     r"^(?=.{1,253}\.?$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$"
@@ -59,6 +60,8 @@ def public_ip_answers(addresses: list[str]) -> tuple[str, ...]:
             address = ipaddress.ip_address(answer)
         except ValueError as error:
             raise ValueError("upstream host returned an invalid address") from error
+        if address.version == 4 and address in _PROXY_FAKE_IP_RANGE:
+            raise ValueError("upstream host resolved to a proxy Fake-IP address")
         if (
             not address.is_global
             or address.is_private

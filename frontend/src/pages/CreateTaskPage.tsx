@@ -26,7 +26,15 @@ const sourceModes: Array<{
 ];
 
 function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
+  if (error instanceof ApiError) {
+    if (
+      error.code === "unsafe_source_url" &&
+      error.message.includes("proxy Fake-IP")
+    ) {
+      return "检测到代理 Fake-IP。请在代理软件中将该平台域名加入 Fake-IP 排除列表，然后重试。";
+    }
+    return error.message;
+  }
   if (error instanceof DOMException && error.name === "AbortError") {
     return "上传已取消";
   }
@@ -292,6 +300,7 @@ export function CreateTaskPage() {
                     onChange={(event) => {
                       setUrl(event.target.value);
                       setProbe(null);
+                      setSubmitError(null);
                     }}
                   />
                   <button
@@ -339,6 +348,10 @@ export function CreateTaskPage() {
             </div>
           )}
         </section>
+
+        {submitError && (
+          <InlineNotice tone="danger">{submitError}</InlineNotice>
+        )}
 
         {sourceReady && (
           <section
@@ -585,9 +598,6 @@ export function CreateTaskPage() {
                   取消上传
                 </button>
               </div>
-            )}
-            {submitError && (
-              <InlineNotice tone="danger">{submitError}</InlineNotice>
             )}
             <div className="submit-actions">
               <button
