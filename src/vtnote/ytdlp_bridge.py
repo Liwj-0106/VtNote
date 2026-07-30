@@ -19,6 +19,7 @@ from yt_dlp.networking.exceptions import (
     TransportError,
     UnsupportedRequest,
 )
+from yt_dlp.utils.networking import std_headers
 
 from vtnote.platform_transport import (
     PinnedHttpsTransport,
@@ -29,6 +30,15 @@ from vtnote.youtube_runtime import YoutubeRuntime
 
 
 _SENSITIVE_HEADERS = frozenset({"authorization", "cookie"})
+_CONTROLLED_DEFAULT_HEADERS = {
+    name: str(std_headers[name])
+    for name in (
+        "User-Agent",
+        "Accept",
+        "Accept-Language",
+        "Sec-Fetch-Mode",
+    )
+}
 _REPARSE_POINT = 0x400
 
 
@@ -183,6 +193,7 @@ class VtNoteRequestHandlerRH(RequestHandler):
         self._scope = scope
         self._max_wire_bytes = max_wire_bytes
         self._max_decoded_bytes = max_decoded_bytes
+        self._anonymous_session_cookies: dict[str, str] = {}
 
     def _validate(self, request: Request) -> None:
         try:
@@ -204,7 +215,8 @@ class VtNoteRequestHandlerRH(RequestHandler):
             raise _safe_request_error()
         if request.extensions or request.proxies:
             raise _safe_request_error()
-        headers = dict(request.headers)
+        headers = dict(_CONTROLLED_DEFAULT_HEADERS)
+        headers.update(request.headers)
         if any(
             name.casefold() in _SENSITIVE_HEADERS
             or name.casefold().startswith("proxy-")
@@ -218,6 +230,11 @@ class VtNoteRequestHandlerRH(RequestHandler):
             headers=headers,
             max_wire_bytes=self._max_wire_bytes,
             max_decoded_bytes=self._max_decoded_bytes,
+            anonymous_session_cookies=(
+                self._anonymous_session_cookies
+                if policy.platform == "bilibili"
+                else {}
+            ),
         )
         try:
             bounded = self._transport.request(source_request, policy)
@@ -226,6 +243,14 @@ class VtNoteRequestHandlerRH(RequestHandler):
                 "controlled HTTPS request failed",
                 handler=self,
             ) from None
+        if policy.platform == "bilibili":
+            received = getattr(
+                bounded,
+                "anonymous_session_cookies",
+                None,
+            )
+            if callable(received):
+                self._anonymous_session_cookies.update(received())
         adapter = _BoundedResponseAdapter(bounded)
         return Response(
             adapter,
@@ -234,6 +259,10 @@ class VtNoteRequestHandlerRH(RequestHandler):
             status=bounded.status,
             extensions={},
         )
+
+    def close(self) -> None:
+        self._anonymous_session_cookies.clear()
+        super().close()
 
 
 class VtNoteYoutubeDL(yt_dlp.YoutubeDL):

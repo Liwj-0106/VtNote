@@ -47,10 +47,14 @@ class TrackingBoundedResponse(io.RawIOBase):
         *,
         status: int = 200,
         headers: dict[str, str] | None = None,
+        anonymous_session_cookies: dict[str, str] | None = None,
     ) -> None:
         self.status = status
         self.headers = headers or {"Content-Type": "text/plain"}
         self._body = io.BytesIO(body)
+        self._anonymous_session_cookies = dict(
+            anonymous_session_cookies or {}
+        )
         self.close_calls = 0
 
     def readable(self) -> bool:
@@ -82,6 +86,9 @@ class TrackingBoundedResponse(io.RawIOBase):
             self.close_calls += 1
             self._body.close()
         super().close()
+
+    def anonymous_session_cookies(self) -> dict[str, str]:
+        return dict(self._anonymous_session_cookies)
 
 
 @dataclass
@@ -135,6 +142,13 @@ def probe_scope() -> BoundTransportScope:
     return BoundTransportScope.for_probe(
         page_host_policy("youtube"),
         extractor_aux_host_policy("youtube"),
+    )
+
+
+def bilibili_probe_scope() -> BoundTransportScope:
+    return BoundTransportScope.for_probe(
+        page_host_policy("bilibili"),
+        extractor_aux_host_policy("bilibili"),
     )
 
 
@@ -236,6 +250,69 @@ def test_handler_maps_all_response_read_and_close_shapes() -> None:
     assert raw.close_calls == 1
     assert response.status == 200
     assert response.get_header("Content-Type") == "text/plain"
+
+
+def test_handler_adds_only_fixed_public_default_headers() -> None:
+    transport = FakeTransport([TrackingBoundedResponse(b"ok")])
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+    )
+
+    handler.send(
+        Request("https://www.youtube.com/watch?v=abc")
+    ).close()
+
+    headers = transport.calls[0].request.headers
+    assert set(headers) == {
+        "Accept",
+        "Accept-Language",
+        "Sec-Fetch-Mode",
+        "User-Agent",
+    }
+    assert headers["User-Agent"].startswith("Mozilla/5.0 ")
+    assert "Cookie" not in headers
+    assert "Authorization" not in headers
+
+
+def test_bilibili_handler_keeps_anonymous_cookies_in_one_memory_session() -> None:
+    transport = FakeTransport(
+        [
+            TrackingBoundedResponse(
+                b"page",
+                anonymous_session_cookies={
+                    "b_nut": "1234567890",
+                    "buvid3": "anonymous-1",
+                },
+            ),
+            TrackingBoundedResponse(b"api"),
+        ]
+    )
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=bilibili_probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+    )
+
+    handler.send(
+        Request("https://www.bilibili.com/video/BV1")
+    ).close()
+    handler.send(
+        Request("https://api.bilibili.com/x/player/pagelist")
+    ).close()
+
+    assert transport.calls[0].request.anonymous_session_cookies == {}
+    assert transport.calls[1].request.anonymous_session_cookies == {
+        "b_nut": "1234567890",
+        "buvid3": "anonymous-1",
+    }
+    handler.close()
+    assert handler._anonymous_session_cookies == {}
 
 
 def test_page_aux_and_ephemeral_resource_host_policies_are_distinct() -> None:

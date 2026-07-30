@@ -592,3 +592,16 @@
 - A real production API process started with isolated D-drive data/runtime roots on loopback,
   returned `status=ok` from `/api/health`, served the built SPA root with HTTP 200, and was then
   stopped. No provider request was sent.
+
+### Bilibili live probe compatibility
+
+- Made source-probe failures visible before a source becomes ready and added a specific diagnostic
+  for proxy Fake-IP DNS answers.
+- Added fixed public yt-dlp request headers and a per-bridge Bilibili anonymous session containing
+  only `buvid3`, `b_nut`, and `sid`. Browser/login cookies remain rejected, values are never logged
+  or persisted, and the in-memory session is cleared when the request handler closes.
+- Added transport tests for cookie name/domain/value allowlists, cross-platform rejection, fixed
+  public headers, and in-memory cleanup. The focused source/transport suite passed with 72 checks.
+- After adding Bilibili domains to the local Clash Verge Fake-IP exclusion list, the production API
+  successfully probed `BV1wVKHeKEbB`: canonical Bilibili URL, 330.41-second duration, and no
+  platform subtitle tracks. The item therefore requires audio ASR.

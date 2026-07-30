@@ -166,6 +166,59 @@ def test_direct_request_uses_vetted_addresses_host_sni_inputs_and_no_environment
     assert "127.0.0.1" not in repr(call)
 
 
+def test_bilibili_anonymous_session_accepts_only_allowlisted_cookies() -> None:
+    resolver = FakeResolver({"www.bilibili.com": ["203.107.1.33"]})
+    connector = FakeConnector(
+        [
+            FakeRawResponse(
+                headers=(
+                    ("Set-Cookie", "buvid3=anonymous-1; Domain=.bilibili.com; Path=/"),
+                    ("Set-Cookie", "b_nut=1234567890; Domain=.bilibili.com; Path=/"),
+                    ("Set-Cookie", "sid=anonymous_2; Domain=.bilibili.com; Path=/"),
+                    ("Set-Cookie", "SESSDATA=login-secret; Domain=.bilibili.com; Path=/"),
+                ),
+                body=b"page",
+                peer_ip="203.107.1.33",
+            ),
+            FakeRawResponse(body=b"api", peer_ip="203.107.1.33"),
+        ]
+    )
+    selected = transport(resolver, connector)
+    first = selected.request(
+        request("https://www.bilibili.com/video/BV1"),
+        page_host_policy("bilibili"),
+    )
+
+    cookies = first.anonymous_session_cookies()
+    assert cookies == {
+        "b_nut": "1234567890",
+        "buvid3": "anonymous-1",
+        "sid": "anonymous_2",
+    }
+    selected.request(
+        request(
+            "https://www.bilibili.com/video/BV1",
+            anonymous_session_cookies=cookies,
+        ),
+        page_host_policy("bilibili"),
+    )
+    assert connector.calls[1].headers["Cookie"] == (
+        "b_nut=1234567890; buvid3=anonymous-1; sid=anonymous_2"
+    )
+    assert "login-secret" not in repr(connector.calls)
+
+
+def test_anonymous_session_cookies_are_rejected_for_other_platforms() -> None:
+    resolver = FakeResolver({"www.youtube.com": ["142.250.72.14"]})
+    connector = FakeConnector([FakeRawResponse()])
+    with pytest.raises(TransportSecurityError, match="anonymous_session_rejected"):
+        transport(resolver, connector).request(
+            request(anonymous_session_cookies={"sid": "anonymous"}),
+            page_host_policy("youtube"),
+        )
+    assert connector.calls == []
+
+
 @pytest.mark.parametrize(
     "answers",
     [
