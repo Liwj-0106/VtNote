@@ -42,6 +42,30 @@ _CONTROLLED_DEFAULT_HEADERS = {
 _REPARSE_POINT = 0x400
 
 
+def controlled_public_headers(*, referer: str | None = None) -> dict[str, str]:
+    """Return the fixed non-secret headers allowed for platform requests."""
+
+    headers = dict(_CONTROLLED_DEFAULT_HEADERS)
+    if referer is None:
+        return headers
+    try:
+        parts = urlsplit(referer)
+        port = parts.port
+    except (TypeError, ValueError):
+        raise ValueError("invalid controlled request referer") from None
+    if (
+        parts.scheme.casefold() != "https"
+        or not parts.hostname
+        or port not in {None, 443}
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+    ):
+        raise ValueError("invalid controlled request referer")
+    headers["Referer"] = referer
+    return headers
+
+
 class _BridgeLogger:
     def error(self, *_: object, **__: object) -> None:
         pass
@@ -215,7 +239,7 @@ class VtNoteRequestHandlerRH(RequestHandler):
             raise _safe_request_error()
         if request.extensions or request.proxies:
             raise _safe_request_error()
-        headers = dict(_CONTROLLED_DEFAULT_HEADERS)
+        headers = controlled_public_headers()
         headers.update(request.headers)
         if any(
             name.casefold() in _SENSITIVE_HEADERS

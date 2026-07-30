@@ -29,7 +29,10 @@ from vtnote.maintenance import MaintenanceLoop, build_maintenance_service
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.model_assets import ModelAssetService
 from vtnote.paths import StoragePaths
-from vtnote.platform_sources import build_default_platform_registry
+from vtnote.platform_sources import (
+    FfmpegMediaValidator,
+    build_default_platform_registry,
+)
 from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore
 from vtnote.sensitive_text import WindowsDpapiSensitiveTextProtector
@@ -212,7 +215,7 @@ def run_worker(settings: Settings) -> int:
     source_handler = SourceStageHandler(
         paths=paths,
         platform_source=platform_source,
-        local_sources=media_validator,
+        local_sources=FfmpegMediaValidator(media_validator),
         preferred_languages=("zh-Hans", "zh", "zh-CN", "en"),
     )
 
