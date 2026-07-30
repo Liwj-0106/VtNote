@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vtnote"
+version = "0.1.0"
+description = "Local-first video transcript and notes pipeline"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "httpx>=0.28,<0.29",
+  "keyring>=25,<26",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "SQLAlchemy>=2.0,<3",
+  "uvicorn>=0.34,<0.35",
+  "yt-dlp==2026.7.4",
+  "yt-dlp-ejs==0.8.0",
+  "python-multipart==0.0.32",
+  "faster-whisper==1.2.1",
+  "ctranslate2==4.8.1",
+  "cos-python-sdk-v5==1.9.44",
+]
+
+[project.scripts]
+vtnote = "vtnote.launcher:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=D:/Workspace/Codex/cache/VtNote-pytest"
+cache_dir = "D:/Workspace/Codex/cache/VtNote-runtime/pytest-cache"
+pythonpath = ["src"]
+testpaths = ["tests"]

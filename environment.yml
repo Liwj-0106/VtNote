@@ -1,0 +1,20 @@
+# Verified on Windows on 2026-07-18. CTranslate2 reported one CUDA device.
+name: vtnote
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11.15
+  - ffmpeg=7.1.1
+  - cuda-cudart=12.8.90
+  - libcublas=12.8.4.1
+  - libcudnn=9.10.2.21
+  - pip
+  - pip:
+      - yt-dlp==2026.7.4
+      - yt-dlp-ejs==0.8.0
+      - python-multipart==0.0.32
+      - faster-whisper==1.2.1
+      - ctranslate2==4.8.1
+      - cos-python-sdk-v5==1.9.44
+      - -e .[dev]

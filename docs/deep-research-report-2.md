@@ -1,5 +1,13 @@
 # 现有将视频链接或视频文件转成可供大模型理解的字幕、笔记与摘要工具研究报告
 
+> **历史材料提示（2026-07-24）**
+> 本文保留为早期市场扫描，不再作为 VtNote V1 的价格、版本、供应商能力或实现范围
+> 依据。正文中的 `turn…` 引用标记未完成可点击来源审计，Videosays 旧价格、
+> AssemblyAI 自托管和 OpenAI 模型输出格式等陈述已有明确更正。请以
+> [产品需求](product-requirements.md)、[网站规格](website-specification.md)、
+> [参考项目审计](reference-projects.md)、[一手来源与纠错](research-sources.md)和
+> [需求追踪](traceability.md)为准。
+
 ## 执行摘要
 
 当前市场上，真正成熟的“视频转可供大模型理解的文本”方案，已经明显分成三层：第一层是面向个人用户的“贴链接即得结果”产品，代表是 BibiGPT、Videosays、NoteGPT；第二层是面向会议、培训、课程与企业文件管理的 SaaS，代表是飞书妙记、通义听悟、讯飞听见；第三层是面向开发者和企业平台化集成的 API 或本地化流水线，代表是 OpenAI Audio API 与 Whisper 系、AssemblyAI、Deepgram、WhisperX/faster-whisper。三层方案的差异，不在“能不能转文字”，而在于能否处理中国平台链接、是否优先利用原字幕、时间戳精度、后处理能力、以及最终能否把结果转成结构化知识。citeturn35view0turn37search8turn5search3turn5search1turn10search1turn11search1turn12search0turn8search2
