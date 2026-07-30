@@ -605,3 +605,18 @@
 - After adding Bilibili domains to the local Clash Verge Fake-IP exclusion list, the production API
   successfully probed `BV1wVKHeKEbB`: canonical Bilibili URL, 330.41-second duration, and no
   platform subtitle tracks. The item therefore requires audio ASR.
+
+### Bilibili audio acquisition compatibility
+
+- Reproduced the public-video failure against `BV1skR2BkEke`: the selected Bilibili audio CDN
+  returned HTTP 403 without the extractor's public anti-hotlink headers and HTTP 200 with the
+  fixed public User-Agent plus the validated canonical video-page Referer. No login cookie was
+  required.
+- Resource downloads now reuse only those fixed non-secret public headers and the validated
+  extraction URL as Referer. Authorization, browser cookies, and persisted session state remain
+  prohibited.
+- Corrected worker wiring so the source stage receives the existing `FfmpegMediaValidator`
+  interface instead of a raw processor exposing only `probe_local`.
+- The focused source, launcher, bridge, and transport suites passed with 92 checks. The failed
+  production task recovered its existing 9.35 MB audio asset, completed the source stage, and
+  continued into transcription without downloading the media again.

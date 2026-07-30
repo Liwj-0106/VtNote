@@ -53,6 +53,7 @@ from vtnote.youtube_runtime import YoutubeRuntime, inspect_youtube_runtime
 from vtnote.ytdlp_bridge import (
     BoundTransportScope,
     build_controlled_platform_ytdlp,
+    controlled_public_headers,
 )
 
 
@@ -775,6 +776,7 @@ class ControlledYtDlpOperations:
         expires_at = self.clock() + timedelta(minutes=10)
         self._current.resource_urls = resources
         self._current.expires_at = expires_at
+        self._current.referer = canonical_url
         return cast(dict[str, object], info)
 
     def _resource_policy(self, resource_url: str):
@@ -812,9 +814,13 @@ class ControlledYtDlpOperations:
 
     def _request(self, resource_url: str, *, max_bytes: int):
         try:
+            referer = getattr(self._current, "referer", None)
+            if not isinstance(referer, str):
+                raise ValueError
             response = self.transport.request(
                 SourceHttpRequest(
                     url=resource_url,
+                    headers=controlled_public_headers(referer=referer),
                     max_wire_bytes=max_bytes,
                     max_decoded_bytes=max_bytes,
                 ),

@@ -740,3 +740,9 @@ def test_controlled_download_publishes_complete_target_via_staging(
 
     assert target.read_bytes() == b"complete audio"
     assert list(tmp_path.glob("*.partial")) == []
+    request, _ = transport.calls[0]
+    headers = getattr(request, "headers")
+    assert headers["Referer"] == (
+        "https://www.bilibili.com/video/BV1xx411c7mD"
+    )
+    assert headers["User-Agent"]
