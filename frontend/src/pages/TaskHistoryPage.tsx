@@ -1,204 +1,292 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ApiError, api } from "../api/client";
-import type { Task } from "../api/types";
-import {
-  formatDate,
-  sourceLabel,
-  stageLabel,
-  statusLabel,
-} from "../app/format";
-import { AppLink, useRouter } from "../app/router";
+import { type CSSProperties, useCallback, useEffect, useMemo, useState } from "react";
+import { ApiError, api, isTerminalStatus, retryPollDelay } from "../api/client";
+import type { StageRun, Task } from "../api/types";
+import { formatDate, statusLabel } from "../app/format";
+import { DownloadIcon } from "../app/icons";
+import { AppLink } from "../app/router";
 import { EmptyState } from "../components/EmptyState";
 import { InlineNotice } from "../components/InlineNotice";
-import { StatusBadge } from "../components/StatusBadge";
-
-function activeStage(task: Task): string | null {
-  const runs = task.items[0]?.stage_runs ?? [];
-  const active = runs.find((run) =>
-    ["queued", "running", "waiting_external", "cancel_requested"].includes(
-      run.status,
-    ),
-  );
-  return active ? stageLabel(active.stage) : null;
-}
+import { OutputExportDialog } from "../components/OutputExportDialog";
 
 function taskTitle(task: Task): string {
   const item = task.items[0];
+  return item?.title ?? item?.source_display_name ?? "未命名记录";
+}
+
+const stageOrder: StageRun["stage"][] = ["source", "transcribe", "translate", "notes"];
+const finishedStageStatuses = new Set(["completed", "skipped"]);
+
+const libraryStageLabels: Record<StageRun["stage"], string> = {
+  source: "获取来源",
+  transcribe: "生成字幕",
+  translate: "翻译字幕",
+  notes: "生成笔记",
+};
+
+interface ProgressView {
+  label: string;
+  ratio: number;
+  determinate: boolean;
+  valueText: string;
+}
+
+function latestStageRuns(runs: StageRun[]): StageRun[] {
+  const latest = new Map<StageRun["stage"], StageRun>();
+  for (const run of runs) {
+    const current = latest.get(run.stage);
+    if (!current || run.attempt > current.attempt) latest.set(run.stage, run);
+  }
+  return stageOrder.flatMap((stage) => {
+    const run = latest.get(stage);
+    return run ? [run] : [];
+  });
+}
+
+function taskProgress(task: Task): ProgressView | null {
+  if (isTerminalStatus(task.status)) return null;
+  const runs = latestStageRuns(task.items[0]?.stage_runs ?? []);
+  if (runs.length === 0) {
+    return {
+      label: task.status === "cancel_requested" ? "正在停止" : "等待处理",
+      ratio: 0,
+      determinate: false,
+      valueText: statusLabel(task.status),
+    };
+  }
+
+  const completed = runs.filter((run) => finishedStageStatuses.has(run.status)).length;
+  const current =
+    runs.find((run) =>
+      ["running", "waiting_external", "cancel_requested"].includes(run.status),
+    ) ?? runs.find((run) => !finishedStageStatuses.has(run.status));
+  const total = runs.length;
+  let ratio = completed / total;
+  let determinate = false;
+
+  if (
+    current?.progress &&
+    typeof current.progress.total === "number" &&
+    current.progress.total > 0
+  ) {
+    const stageRatio = Math.min(
+      1,
+      Math.max(0, current.progress.current / current.progress.total),
+    );
+    ratio = Math.min(1, (completed + stageRatio) / total);
+    determinate = true;
+  }
+
+  const baseLabel = current ? libraryStageLabels[current.stage] : "整理结果";
+  const label =
+    task.status === "cancel_requested"
+      ? "正在停止"
+      : current?.status === "waiting_external"
+        ? `${baseLabel} · 等待云端`
+        : baseLabel;
+  return {
+    label,
+    ratio,
+    determinate,
+    valueText: determinate
+      ? `${label}，${Math.round(ratio * 100)}%`
+      : `${label}，已完成 ${completed} / ${total} 个阶段`,
+  };
+}
+
+function mergeNewestTasks(current: Task[], incoming: Task[]): Task[] {
+  const incomingIds = new Set(incoming.map((task) => task.id));
+  return [...incoming, ...current.filter((task) => !incomingIds.has(task.id))];
+}
+
+function terminalLabel(status: string): string {
+  if (status === "completed") return "完成";
+  if (status === "completed_with_warnings") return "完成，有提醒";
+  return statusLabel(status);
+}
+
+function hasExportableOutcome(task: Task): boolean {
+  const item = task.items[0];
+  if (!item || !isTerminalStatus(task.status)) return false;
+  const successfulStages = new Set(
+    latestStageRuns(item.stage_runs)
+      .filter((run) => finishedStageStatuses.has(run.status))
+      .map((run) => run.stage),
+  );
   return (
-    item?.title ??
-    item?.source_display_name ??
-    (item?.source_kind === "bilibili" ? "Bilibili 视频" : null) ??
-    (item?.source_kind === "youtube" ? "YouTube 视频" : null) ??
-    "未命名任务"
+    (task.pipeline_snapshot.audio_export_enabled === true &&
+      successfulStages.has("source")) ||
+    successfulStages.has("transcribe") ||
+    successfulStages.has("notes")
   );
 }
 
 export function TaskHistoryPage() {
-  const { path, navigate } = useRouter();
-  const initialStatus =
-    new URLSearchParams(path.split("?")[1] ?? "").get("status") ?? "";
-  const [status, setStatus] = useState(initialStatus);
-  const [search, setSearch] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Task | null>(null);
 
-  const load = useCallback(
-    async (nextCursor: string | null, append: boolean) => {
-      setLoading(true);
-      setError(null);
-      const query = new URLSearchParams({ limit: "30" });
-      if (status) query.set("status", status);
-      if (nextCursor) query.set("cursor", nextCursor);
-      try {
-        const page = await api.requestPage<Task[]>(
-          `/api/tasks?${query.toString()}`,
-        );
-        setTasks((current) =>
-          append ? [...current, ...page.data] : page.data,
-        );
-        setCursor(page.nextCursor);
-      } catch (caught) {
-        setError(
-          caught instanceof ApiError
-            ? caught.message
-            : "无法读取任务，请稍后重试。",
-        );
-      } finally {
-        setLoading(false);
-      }
-    },
-    [status],
-  );
+  const load = useCallback(async (nextCursor: string | null, append: boolean) => {
+    setLoading(true);
+    setError(null);
+    const query = new URLSearchParams({ limit: "30" });
+    if (nextCursor) query.set("cursor", nextCursor);
+    try {
+      const page = await api.requestPage<Task[]>(`/api/tasks?${query.toString()}`);
+      setTasks((current) => (append ? [...current, ...page.data] : page.data));
+      setCursor(page.nextCursor);
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "无法读取内容库。");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     void load(null, false);
   }, [load]);
 
-  const visible = useMemo(() => {
-    const keyword = search.trim().toLocaleLowerCase();
-    if (!keyword) return tasks;
-    return tasks.filter((task) => {
-      const item = task.items[0];
-      return [taskTitle(task), item?.source_display_name, item?.source_kind]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(keyword));
-    });
-  }, [search, tasks]);
+  const hasActiveTasks = useMemo(
+    () => tasks.some((task) => !isTerminalStatus(task.status)),
+    [tasks],
+  );
+
+  useEffect(() => {
+    if (!hasActiveTasks) return;
+    let disposed = false;
+    let failureCount = 0;
+    let timer: number | null = null;
+    let controller: AbortController | null = null;
+
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => void refresh(), delay);
+    };
+    const refresh = async () => {
+      controller = new AbortController();
+      try {
+        const page = await api.requestPage<Task[]>(
+          "/api/tasks?limit=30",
+          controller.signal,
+        );
+        if (disposed) return;
+        failureCount = 0;
+        setTasks((current) => mergeNewestTasks(current, page.data));
+        schedule(document.hidden ? 10_000 : 1_500);
+      } catch (caught) {
+        if (disposed || (caught instanceof DOMException && caught.name === "AbortError")) {
+          return;
+        }
+        failureCount += 1;
+        schedule(retryPollDelay(failureCount));
+      }
+    };
+
+    schedule(document.hidden ? 5_000 : 900);
+    return () => {
+      disposed = true;
+      controller?.abort();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [hasActiveTasks]);
 
   return (
-    <div className="page history-page">
-      <header className="page-header">
+    <div className="page library-page">
+      <header className="page-header library-header">
         <div>
-          <p className="page-kicker">Library</p>
-          <h1>任务</h1>
-          <p className="page-intro">继续查看处理进度，或打开已经生成的文字。</p>
+          <h1>内容库</h1>
         </div>
-        <AppLink className="button button-primary" to="/">
-          新建任务
-        </AppLink>
       </header>
 
-      <div className="history-tools">
-        <label className="field search-field">
-          <span className="visually-hidden">搜索任务</span>
-          <input
-            className="text-input"
-            type="search"
-            value={search}
-            placeholder="搜索标题或来源"
-            onChange={(event) => setSearch(event.target.value)}
-          />
-        </label>
-        <label className="field filter-field">
-          <span className="visually-hidden">状态筛选</span>
-          <select
-            className="select-input"
-            value={status}
-            onChange={(event) => {
-              const next = event.target.value;
-              setStatus(next);
-              navigate(next ? `/tasks?status=${encodeURIComponent(next)}` : "/tasks", {
-                replace: true,
-              });
-            }}
-          >
-            <option value="">全部状态</option>
-            <option value="running">处理中</option>
-            <option value="queued">等待处理</option>
-            <option value="completed">已完成</option>
-            <option value="completed_with_warnings">有提醒</option>
-            <option value="failed">需要处理</option>
-            <option value="canceled">已停止</option>
-          </select>
-        </label>
-      </div>
-
-      {error && (
-        <InlineNotice tone="danger" title="任务列表暂时不可用">
-          {error}
-        </InlineNotice>
-      )}
-      {!loading && !error && visible.length === 0 && (
+      {error && <InlineNotice tone="danger">{error}</InlineNotice>}
+      {!loading && !error && tasks.length === 0 && (
         <EmptyState
-          title={tasks.length === 0 ? "还没有任务" : "没有符合条件的任务"}
-          description={
-            tasks.length === 0
-              ? "添加一个公开链接或本地文件，生成第一份字幕。"
-              : "换一个关键词或清除状态筛选。"
-          }
-          actionLabel={tasks.length === 0 ? "新建任务" : undefined}
+          title="还没有处理记录"
+          description="从一个 B 站链接或本地视频开始。"
+          actionLabel="新建处理"
         />
       )}
-      {visible.length > 0 && (
-        <div className="task-list">
-          {visible.map((task) => {
-            const item = task.items[0];
-            const stage = activeStage(task);
+      {tasks.length > 0 && (
+        <div className="library-list">
+          {tasks.map((task) => {
+            const progress = taskProgress(task);
+            const exportReady = hasExportableOutcome(task);
             return (
-              <article key={task.id} className="task-list-item">
-                <AppLink
-                  to={`/tasks/${task.id}`}
-                  className="task-row-link"
-                  aria-label={`查看 ${taskTitle(task)}`}
-                >
-                  <div className="task-primary">
-                    <h2>{taskTitle(task)}</h2>
-                    <p>
-                      {sourceLabel(item?.source_kind ?? "unknown")} ·{" "}
-                      {formatDate(task.created_at)}
-                    </p>
-                  </div>
-                  <div className="task-state">
-                    <StatusBadge status={task.status} />
-                    {stage && !["completed", "failed", "canceled"].includes(task.status) && (
-                      <small>当前：{stage}</small>
-                    )}
-                    {!stage && <small>{statusLabel(task.status)}</small>}
-                  </div>
-                </AppLink>
+              <article className="library-row" key={task.id}>
+                <div className="library-record">
+                  <h2>{taskTitle(task)}</h2>
+                  <p>{formatDate(task.created_at)}</p>
+                </div>
+                <div className="library-status" aria-live="polite">
+                  {progress ? (
+                    <div className="library-progress">
+                      <span className="library-progress-label">{progress.label}</span>
+                      <div
+                        className={`library-progress-track${
+                          progress.determinate ? "" : " is-indeterminate"
+                        }`}
+                        role="progressbar"
+                        aria-label={`${taskTitle(task)}处理进度`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={
+                          progress.determinate ? Math.round(progress.ratio * 100) : undefined
+                        }
+                        aria-valuetext={progress.valueText}
+                      >
+                        <span
+                          className="library-progress-fill"
+                          style={
+                            {
+                              "--progress-ratio": progress.ratio,
+                            } as CSSProperties
+                          }
+                        />
+                        {!progress.determinate && (
+                          <span className="library-progress-activity" aria-hidden="true" />
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <span className={`library-status-text is-${task.status}`}>
+                      {terminalLabel(task.status)}
+                    </span>
+                  )}
+                </div>
+                <div className="library-actions">
+                  <AppLink className="button button-quiet" to={`/tasks/${task.id}`}>
+                    {task.status === "failed" ? "继续处理" : "查看详情"}
+                  </AppLink>
+                  <button
+                    type="button"
+                    className="button export-row-button"
+                    disabled={!exportReady}
+                    onClick={() => setSelected(task)}
+                  >
+                    <DownloadIcon />
+                    导出
+                  </button>
+                </div>
               </article>
             );
           })}
         </div>
       )}
-      {loading && tasks.length === 0 && (
-        <p className="muted" role="status">
-          正在读取任务…
-        </p>
-      )}
+      {loading && tasks.length === 0 && <p className="muted">正在读取记录…</p>}
       {cursor && (
         <div className="load-more">
-          <button
-            type="button"
-            className="button"
-            disabled={loading}
-            onClick={() => void load(cursor, true)}
-          >
-            {loading ? "正在读取…" : "加载更早任务"}
+          <button className="button" type="button" onClick={() => void load(cursor, true)}>
+            加载更早记录
           </button>
         </div>
+      )}
+      {selected?.items[0] && (
+        <OutputExportDialog
+          itemId={selected.items[0].id}
+          title={taskTitle(selected)}
+          open
+          onClose={() => setSelected(null)}
+        />
       )}
     </div>
   );

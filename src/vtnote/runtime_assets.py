@@ -28,7 +28,10 @@ RUNTIME_ASSET_ROLES = frozenset(
         "uploaded_source",
         "downloaded_audio",
         "cloud_audio",
+        "cloud_audio_inline",
         "local_audio",
+        "export_audio_m4a",
+        "export_audio_mp3",
         "failed_media",
     }
 )
@@ -123,8 +126,14 @@ class RuntimeAssetService:
                 expected = self.paths.downloaded_audio(item_id, extension)
             elif role == "cloud_audio":
                 expected = self.paths.cloud_ogg(item_id)
+            elif role == "cloud_audio_inline":
+                expected = self.paths.cloud_inline_ogg(item_id)
             elif role == "local_audio":
                 expected = self.paths.local_prepared_audio(item_id)
+            elif role == "export_audio_m4a":
+                expected = self.paths.export_audio(item_id, "m4a")
+            elif role == "export_audio_mp3":
+                expected = self.paths.export_audio(item_id, "mp3")
             else:
                 relative = PurePosixPath(relative_path)
                 if len(relative.parts) != 5 or relative.parts[:4] != (
@@ -314,7 +323,9 @@ class RuntimeAssetService:
                 .where(
                     TaskRecord.terminal_reason_code == "profile_test_sample",
                     RuntimeAssetRecord.state == "active",
-                    RuntimeAssetRecord.role.in_(("uploaded_source", "cloud_audio")),
+                    RuntimeAssetRecord.role.in_(
+                        ("uploaded_source", "cloud_audio", "cloud_audio_inline")
+                    ),
                     RuntimeAssetRecord.created_at <= cutoff,
                 )
                 .order_by(RuntimeAssetRecord.created_at, RuntimeAssetRecord.id)

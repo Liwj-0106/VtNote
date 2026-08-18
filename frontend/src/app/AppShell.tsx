@@ -1,5 +1,4 @@
 import { type ReactNode, useCallback, useState } from "react";
-import type { Task } from "../api/types";
 import { Sidebar } from "./Sidebar";
 
 const SIDEBAR_KEY = "vtnote.sidebar.collapsed";
@@ -10,10 +9,8 @@ function initialCollapsed(): boolean {
 
 export function AppShell({
   children,
-  recentTasks,
 }: {
   children: ReactNode;
-  recentTasks: Task[];
 }) {
   const [collapsed, setCollapsed] = useState(initialCollapsed);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -39,7 +36,6 @@ export function AppShell({
       <Sidebar
         collapsed={collapsed}
         mobileOpen={mobileOpen}
-        recentTasks={recentTasks}
         onToggleCollapse={toggleCollapse}
         onOpenMobile={() => setMobileOpen(true)}
         onCloseMobile={closeMobile}

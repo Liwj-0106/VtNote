@@ -270,6 +270,45 @@ def test_terminal_transitions_recalculate_item_and_task_status(
         engine.dispose()
 
 
+def test_audio_only_source_completion_finishes_item_and_task(
+    tmp_path: Path,
+) -> None:
+    engine = initialize_database(tmp_path / "audio-only.db")
+    task_id = "11111111-1111-4111-8111-111111111111"
+    item_id = "22222222-2222-4222-8222-222222222222"
+    with Session(engine) as session:
+        task = TaskRecord(
+            id=task_id,
+            options={"output_type": "audio"},
+            pipeline_snapshot_json={"output_type": "audio"},
+        )
+        item = ItemRecord(
+            id=item_id,
+            task=task,
+            position=0,
+            source_kind="url",
+            source_locator="https://www.bilibili.com/video/BV1xx411c7mD",
+        )
+        item.stage_runs.append(StageRunRecord(stage="source", attempt=1))
+        session.add(task)
+        session.commit()
+
+    store = WorkerStore(engine, process_id=1)
+    try:
+        claim = store.claim_next("worker", NOW, timedelta(seconds=30))
+        assert claim is not None
+        assert claim.stage == "source"
+        assert store.complete(claim, StageResult(), now=NOW + timedelta(seconds=1))
+
+        with Session(engine) as session:
+            item = session.get(ItemRecord, item_id)
+            task = session.get(TaskRecord, task_id)
+            assert item is not None and item.status == "completed"
+            assert task is not None and task.status == "completed"
+    finally:
+        engine.dispose()
+
+
 class RecordingHandler:
     def __init__(self, action: Callable[[StageContext], StageResult]) -> None:
         self.action = action

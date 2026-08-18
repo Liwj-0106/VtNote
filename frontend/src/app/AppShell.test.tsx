@@ -9,7 +9,7 @@ describe("AppShell", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     render(
       <RouterProvider initialPath="/tasks">
-        <AppShell recentTasks={[]}>
+        <AppShell>
           <h1>任务</h1>
         </AppShell>
       </RouterProvider>,
@@ -32,7 +32,7 @@ describe("AppShell", () => {
   it("provides a skip link and closes the mobile drawer with Escape", async () => {
     render(
       <RouterProvider initialPath="/">
-        <AppShell recentTasks={[]}>
+        <AppShell>
           <h1>新建任务</h1>
         </AppShell>
       </RouterProvider>,

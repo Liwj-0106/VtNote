@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.models import ProcessorProfileRecord, ProviderConnectionRecord
@@ -39,6 +40,23 @@ def create_bailian_connection(
         parameters={"workspace_id": workspace_id},
         **kwargs,
     )
+
+
+def test_configuration_defaults_follow_platform_storage_roots(tmp_path: Path) -> None:
+    service, _, session = make_service(tmp_path)
+    try:
+        defaults = service.get_defaults()
+        settings = Settings()
+
+        assert Path(defaults.local_whisper_options["model_root"]) == (
+            settings.data_root / "models" / "faster-whisper"
+        )
+        assert Path(defaults.local_whisper_options["cache_root"]) == (
+            settings.runtime_cache_root / "models" / "faster-whisper"
+        )
+    finally:
+        session.bind.dispose()
+        session.close()
 
 
 def test_tencent_connection_forces_canonical_api_and_guangzhou_region(
@@ -197,7 +215,7 @@ def test_cos_config_rejects_public_non_guangzhou_or_malformed_bucket_and_prefix(
         session.close()
 
 
-def test_tencent_profile_forces_large_model_2_and_subtitle_format(
+def test_tencent_profile_forces_free_tier_model_and_subtitle_format(
     tmp_path: Path,
 ) -> None:
     service, _, session = make_service(tmp_path)
@@ -210,21 +228,21 @@ def test_tencent_profile_forces_large_model_2_and_subtitle_format(
             credentials={"secret_id": "AKID", "secret_key": "key"},
         )
         profile = service.create_profile(
-            name="Large model 2",
+            name="Free tier",
             purpose="cloud_asr",
             connection_id=connection.id,
-            model="16k_zh_en_2.0",
-            options={"language_scope": "zh_en_dialects"},
+            model="16k_zh",
+            options={"language_scope": "zh_with_limited_english"},
         )
 
-        assert profile.model == "16k_zh_en_2.0"
+        assert profile.model == "16k_zh"
         assert profile.options == {
-            "language_scope": "zh_en_dialects",
+            "language_scope": "zh_with_limited_english",
             "res_text_format": 3,
             "sentence_max_length": 20,
         }
         with pytest.raises(InvalidConfiguration):
-            service.update_profile(profile.id, model="16k_zh")
+            service.update_profile(profile.id, model="16k_zh_en_2.0")
         with pytest.raises(InvalidConfiguration):
             service.update_profile(
                 profile.id,
@@ -514,9 +532,9 @@ def test_profiles_enforce_protocol_and_upload_consent_revision(tmp_path: Path) -
             name="Tencent",
             purpose="cloud_asr",
             connection_id=cloud.id,
-            model="16k_zh_en_2.0",
+            model="16k_zh",
             context_length=8192,
-            options={"language_scope": "zh_en_dialects"},
+            options={"language_scope": "zh_with_limited_english"},
         )
         service.record_profile_test(profile.id, ok=True, message="ready")
         authorized = service.authorize_cloud_upload(profile.id)

@@ -82,6 +82,8 @@ class _ItemSource:
     kind: str
     locator: str
     display_name: str | None
+    output_type: str | None
+    audio_export_enabled: bool
 
 
 class _RecoverySourceAdapter:
@@ -147,10 +149,20 @@ class SourceStageHandler:
             item = session.get(ItemRecord, context.claim.item_id)
             if item is None:
                 raise SourceStageError("source_not_found")
+            output_type = item.task.options.get("output_type")
+            if output_type not in {None, "audio", "transcript", "notes"}:
+                raise SourceStageError("invalid_source_stage")
+            audio_export_enabled = item.task.options.get(
+                "audio_export_enabled", output_type == "audio"
+            )
+            if not isinstance(audio_export_enabled, bool):
+                raise SourceStageError("invalid_source_stage")
             return _ItemSource(
                 kind=item.source_kind,
                 locator=item.source_locator,
                 display_name=item.source_display_name,
+                output_type=output_type,
+                audio_export_enabled=audio_export_enabled,
             )
 
     def _uploaded(
@@ -319,6 +331,21 @@ class SourceStageHandler:
                 paths=self.paths,
                 local_sources=self.local_sources,
             )
+            if source.output_type == "audio":
+                outcome = recovering.fetch_audio(probe, context.claim.item_id)
+                context.checkpoint()
+                self._validate_audio_handoff(context, outcome)
+                return StageResult(
+                    item_title=probe.title,
+                    execution_evidence={
+                        "provider": probe.source_kind,
+                        "source_method": "platform_audio",
+                    },
+                )
+            if source.audio_export_enabled:
+                retained_audio = recovering.fetch_audio(probe, context.claim.item_id)
+                context.checkpoint()
+                self._validate_audio_handoff(context, retained_audio)
             outcome = acquire_subtitle_or_audio(
                 probe,
                 recovering,
@@ -353,7 +380,7 @@ class SourceStageHandler:
                     "asr_route": "platform_subtitle",
                     "provider": probe.source_kind,
                 },
-                trash_stale_audio=True,
+                trash_stale_audio=not source.audio_export_enabled,
             )
         self._validate_audio_handoff(context, outcome)
         return StageResult(

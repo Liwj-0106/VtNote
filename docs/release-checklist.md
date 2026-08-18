@@ -1,41 +1,43 @@
-# VtNote V1 发布检查表
+# VtNote 发布检查表
 
-## 构建与依赖
+## 版本与构建
 
-- [ ] `conda env create -f environment.yml` 可在全新 D 盘测试目录完成。
-- [ ] `python -m pip check` 通过，生产依赖均有精确版本。
-- [ ] `npm ci`、`npm run lint`、`npm test -- --run` 和 `npm run build` 通过。
-- [ ] `node tools/collect_release_evidence.mjs --output <D盘目录>` 成功。
-- [ ] Deno、EJS、yt-dlp、模型 manifest、前端 lock 和 FFmpeg 哈希已记录。
+- [ ] Windows 10/11 的全新环境能按 `environment.yml`、`requirements.lock` 和
+  `frontend/package-lock.json` 完成安装。
+- [ ] `python -m pip check`、后端测试、前端 lint/test/build 和 Playwright 核心旅程通过。
+- [ ] `tools/collect_release_evidence.mjs` 对最终候选采集版本、配置与哈希。
+- [ ] 前端 `dist`、Python 包和安装说明来自同一提交。
 
-## FFmpeg 与许可证
+## 功能分层验证
 
-- [ ] 记录 `ffmpeg -version` 与 `ffmpeg -buildconf`。
-- [ ] 发布包使用经过核验的 LGPL 候选；如果仍含 `--enable-gpl`，不得标记为 LGPL。
-- [ ] `docs/third-party-notices.md` 与实际发布物一致。
-- [ ] 模型权重、CUDA 运行时和所有二进制的再分发条款已人工确认。
+- [ ] 默认离线测试不访问真实服务、不下载模型、不产生费用。
+- [ ] Bilibili 平台字幕、本地媒体、无字幕转 ASR、字幕导出和音频导出均用固定夹具覆盖。
+- [ ] 只选“字幕原文”时不创建 notes 阶段；字幕完成后可直接导出。
+- [ ] AI 笔记为独立可选分支，失败不会破坏字幕或触发重复转写。
+- [ ] API/Worker 中断、租约过期、重试、取消和回收恢复语义通过。
+- [ ] 经内容与费用授权后，再运行腾讯 ASR、TokenHub、Bilibili 等外部冒烟测试；记录
+  样本、时间、服务版本和结果，不在仓库保存密钥或原始私有内容。
 
-当前开发环境的 Conda FFmpeg 7.1.1 含 `--enable-gpl`、x264 和 x265，只能作为
-开发验证证据，不能冒充 LGPL 发布产物。
+## 数据、安全与隐私
 
-## 安全与隐私
+- [ ] 只监听 `127.0.0.1`，Host、Origin、CSRF、SSRF、重定向和路径穿越测试通过。
+- [ ] SQLite、日志、诊断信息、任务快照和构建产物不含明文密钥或自定义提示词。
+- [ ] Credential Manager 引用、DPAPI 数据和云上传授权的失效规则已验证。
+- [ ] `Data`/`Cache` 的备份、活动任务、24 小时回收区和 COS 终态清理已验证。
+- [ ] 删除缓存不会被描述成无条件安全；孤立 partial、模型安装 trash 等已知缺口已
+  解决或写入发行说明。
 
-- [ ] 仅监听 `127.0.0.1:8765`，生产 docs/CORS 关闭。
-- [ ] Host、Origin、CSRF、SSRF、重定向、DNS 重绑定和路径穿越测试通过。
-- [ ] 数据库、日志、诊断包、构建产物和任务快照不含明文密钥或自定义提示词。
-- [ ] 腾讯上传授权和百炼文本授权在配置变更后失效。
-- [ ] 云端未知提交不会自动重复计费；重试需要明确费用确认。
+## 许可与供应链
 
-## 功能与恢复
+- [ ] 项目自身许可证已经确定并添加 `LICENSE`。
+- [ ] 最终发行物生成完整 SBOM/NOTICE；`third-party-notices.md` 与产物一致。
+- [ ] 记录 FFmpeg `-version`、`-buildconf`、哈希及源码/许可履行方式。
+- [ ] 模型权重、Deno、yt-dlp/EJS、CUDA 与所有原生库的来源和再分发条款已确认。
+- [ ] 不包含 DownKyi/aria2/其 GPL FFmpeg，也没有复制 DownKyi 源码。
 
-- [ ] Bilibili/YouTube 有字幕路径、本地媒体和四种字幕格式通过离线夹具。
-- [ ] 腾讯云成功、已知失败回退、未知结果、COS 清理和取消后查询通过。
-- [ ] 本地 CUDA ASR、翻译、笔记和独立失败通过。
-- [ ] API/worker 在每个阶段中断后可恢复，不覆盖 `transcript.json`。
-- [ ] 成功后没有长期媒体副本，回收区 24 小时后有审计地清理。
+## 发布结论
 
-## 发布边界
-
-- [ ] 30–50 条已授权真实样本 POC 已完成并记录失败样本。
-- [ ] 腾讯、Bilibili、YouTube、FFmpeg 和模型许可的最终状态已冻结。
-- [ ] 若没有账号、语料或计费授权，只能标记“实现完成；在线发布资格待验证”。
+- [ ] 未解决项有负责人和明确处置；涉及许可证、密钥泄漏、重复计费或数据损坏的
+  问题不得降级放行。
+- [ ] 没有外部账号、授权样本或计费许可时，只能声明“实现和离线验证完成”，不能
+  宣称真实服务已通过生产验证。

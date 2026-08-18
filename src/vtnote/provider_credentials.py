@@ -40,15 +40,24 @@ class BailianCredentialBundle(_CredentialBundle):
     api_key: SecretStr
 
 
-CredentialBundle = TencentCredentialBundle | BailianCredentialBundle
+class TokenHubCredentialBundle(_CredentialBundle):
+    schema_version: Literal[1] = 1
+    api_key: SecretStr
+
+
+CredentialBundle = (
+    TencentCredentialBundle | BailianCredentialBundle | TokenHubCredentialBundle
+)
 
 _SCHEMAS: dict[str, type[_CredentialBundle]] = {
     "tencent_recording_asr": TencentCredentialBundle,
     "aliyun_bailian": BailianCredentialBundle,
+    "tencent_tokenhub": TokenHubCredentialBundle,
 }
 _FIELDS = {
     "tencent_recording_asr": ("secret_id", "secret_key"),
     "aliyun_bailian": ("api_key",),
+    "tencent_tokenhub": ("api_key",),
 }
 
 

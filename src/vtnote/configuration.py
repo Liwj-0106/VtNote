@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from vtnote.config import Settings
 from vtnote.models import (
     CredentialCleanupRecord,
     DefaultSettingsRecord,
@@ -46,6 +47,7 @@ from vtnote.tencent_contract import (
     TENCENT_ASR_REGION,
     TENCENT_LANGUAGE_SCOPE,
 )
+from vtnote.tokenhub_chat import TOKENHUB_BASE_URL, TOKENHUB_CHAT_ENDPOINT
 from vtnote.sensitive_text import (
     DEFAULT_PROMPT_PURPOSE,
     SensitiveTextProtector,
@@ -129,12 +131,15 @@ _PROTOCOL_PARAMETERS = {
         }
     ),
     "aliyun_bailian": frozenset({"workspace_id"}),
+    "tencent_tokenhub": frozenset(),
 }
-_ACTIVE_PROTOCOLS = frozenset({"tencent_recording_asr", "aliyun_bailian"})
+_ACTIVE_PROTOCOLS = frozenset(
+    {"tencent_recording_asr", "aliyun_bailian", "tencent_tokenhub"}
+)
 _PURPOSE_PROTOCOL = {
-    "cloud_asr": "tencent_recording_asr",
-    "translation": "aliyun_bailian",
-    "notes": "aliyun_bailian",
+    "cloud_asr": frozenset({"tencent_recording_asr"}),
+    "translation": frozenset({"aliyun_bailian", "tencent_tokenhub"}),
+    "notes": frozenset({"aliyun_bailian", "tencent_tokenhub"}),
 }
 _PURPOSE_OPTIONS = {
     "cloud_asr": frozenset(
@@ -217,6 +222,8 @@ def _normalize_connection_parameters(
         except ValueError:
             raise InvalidConfiguration("invalid Bailian workspace_id") from None
         return {"workspace_id": workspace_id}
+    if protocol == "tencent_tokenhub":
+        return {}
     if any(not isinstance(value, str) or not value.strip() for value in parameters.values()):
         raise InvalidConfiguration("connection parameter values must be non-empty strings")
     return dict(parameters)
@@ -267,7 +274,9 @@ def _normalize_profile_contract(
                 "profile purpose is incompatible with connection protocol"
             )
         if cleaned_model != TENCENT_ASR_MODEL:
-            raise InvalidConfiguration("Tencent ASR model must be 16k_zh_en_2.0")
+            raise InvalidConfiguration(
+                f"Tencent ASR model must be {TENCENT_ASR_MODEL}"
+            )
         if set(options) - _PURPOSE_OPTIONS[purpose]:
             raise InvalidConfiguration("unsupported profile option")
         if options.get("language_scope", TENCENT_LANGUAGE_SCOPE) != TENCENT_LANGUAGE_SCOPE:
@@ -281,7 +290,7 @@ def _normalize_profile_contract(
             "res_text_format": 3,
             "sentence_max_length": 20,
         }
-    if protocol != "aliyun_bailian":
+    if protocol not in {"aliyun_bailian", "tencent_tokenhub"}:
         raise InvalidConfiguration(
             "profile purpose is incompatible with connection protocol"
         )
@@ -289,7 +298,7 @@ def _normalize_profile_contract(
     try:
         cleaned_model = validate_chat_model(cleaned_model)
     except ValueError:
-        raise InvalidConfiguration("invalid Bailian model") from None
+        raise InvalidConfiguration("invalid chat model") from None
     normalized = {
         "temperature": options.get("temperature", 0.2),
         "max_tokens": options.get("max_tokens", 4096),
@@ -303,7 +312,7 @@ def _normalize_profile_contract(
 
 
 def _purpose_protocol_is_compatible(purpose: str, protocol: str) -> bool:
-    return _PURPOSE_PROTOCOL.get(purpose) == protocol
+    return protocol in _PURPOSE_PROTOCOL.get(purpose, frozenset())
 
 
 def _validate_profile_capacity(
@@ -368,6 +377,10 @@ def _clean_base_url(
         if value is not None and value != expected:
             raise InvalidConfiguration("Bailian endpoint is fixed to Beijing workspace")
         return expected
+    if protocol == "tencent_tokenhub":
+        if value is not None and value != TOKENHUB_BASE_URL:
+            raise InvalidConfiguration("TokenHub endpoint is fixed to Guangzhou")
+        return TOKENHUB_BASE_URL
     if not isinstance(value, str):
         raise InvalidConfiguration("provider base URL is required")
     try:
@@ -402,13 +415,21 @@ def _chat_capability_fingerprint(
     row: ProcessorProfileRecord,
 ) -> dict[str, Any] | None:
     connection = row.connection
-    if row.purpose not in _CHAT_PURPOSES or connection.protocol != "aliyun_bailian":
+    if (
+        row.purpose not in _CHAT_PURPOSES
+        or connection.protocol not in {"aliyun_bailian", "tencent_tokenhub"}
+    ):
         return None
     options = dict(row.options)
+    endpoint = (
+        bailian_chat_endpoint(connection.parameters["workspace_id"])
+        if connection.protocol == "aliyun_bailian"
+        else TOKENHUB_CHAT_ENDPOINT
+    )
     return {
         "schema_version": 1,
-        "protocol": "aliyun_bailian",
-        "endpoint": bailian_chat_endpoint(connection.parameters["workspace_id"]),
+        "protocol": connection.protocol,
+        "endpoint": endpoint,
         "connection_revision": connection.revision,
         "profile_revision": row.revision,
         "model": row.model,
@@ -448,12 +469,13 @@ class ConfigurationService:
             sensitive_text_protector
             or WindowsDpapiSensitiveTextProtector()
         )
-        data_root = paths.data_root if paths else Path(r"D:\Workspace\Project\VtNote-data")
-        cache_root = (
-            paths.runtime_cache_root
-            if paths
-            else Path(r"D:\Workspace\Codex\cache\VtNote-runtime")
-        )
+        if paths is None:
+            selected_settings = Settings()
+            data_root = selected_settings.data_root
+            cache_root = selected_settings.runtime_cache_root
+        else:
+            data_root = paths.data_root
+            cache_root = paths.runtime_cache_root
         self.local_whisper_defaults = {
             "model": "large-v3-turbo",
             "device": "cuda",
@@ -476,12 +498,8 @@ class ConfigurationService:
                 resolved.relative_to(root)
             except (ValueError, OSError):
                 raise InvalidConfiguration(
-                    "local Whisper paths must remain under the configured D-drive roots"
+                    "local Whisper paths must remain under the configured storage roots"
                 ) from None
-            if resolved.drive.casefold() != "d:":
-                raise InvalidConfiguration(
-                    "local Whisper paths must remain under the configured D-drive roots"
-                )
 
     def _connection(
         self, connection_id: str, *, include_archived: bool = False
@@ -617,7 +635,11 @@ class ConfigurationService:
     def _connection_view(self, row: ProviderConnectionRecord) -> ConnectionView:
         current = row.tested_revision == row.revision
         stored_secret = self.secrets.get(row.credential_ref)
-        if row.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
+        if row.protocol in {
+            "tencent_recording_asr",
+            "aliyun_bailian",
+            "tencent_tokenhub",
+        }:
             configured_fields = configured_credential_fields(
                 row.protocol,
                 stored_secret,
@@ -705,7 +727,11 @@ class ConfigurationService:
         selected_parameters = _normalize_connection_parameters(protocol, parameters)
         if secret is not None and credentials is not None:
             raise InvalidConfiguration("cannot provide two credential formats")
-        if protocol in {"tencent_recording_asr", "aliyun_bailian"}:
+        if protocol in {
+            "tencent_recording_asr",
+            "aliyun_bailian",
+            "tencent_tokenhub",
+        }:
             if secret is not None:
                 raise InvalidConfiguration(
                     "provider credentials must use the structured atomic form"
@@ -768,7 +794,11 @@ class ConfigurationService:
         if (secret is not None or credentials is not None) and clear_secret:
             raise InvalidConfiguration("cannot replace and clear a secret together")
         row = self._connection(connection_id)
-        if row.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
+        if row.protocol in {
+            "tencent_recording_asr",
+            "aliyun_bailian",
+            "tencent_tokenhub",
+        }:
             if secret is not None:
                 raise InvalidConfiguration(
                     "provider credentials must use the structured atomic form"
@@ -871,9 +901,17 @@ class ConfigurationService:
     def get_connection(self, connection_id: str) -> ConnectionView:
         return self._connection_view(self._connection(connection_id))
 
-    def delete_connection(self, connection_id: str) -> None:
+    def delete_connection(
+        self,
+        connection_id: str,
+        *,
+        cascade_profiles: bool = False,
+    ) -> None:
         row = self._connection(connection_id)
-        if any(profile.archived_at is None for profile in row.profiles):
+        active_profiles = [
+            profile for profile in row.profiles if profile.archived_at is None
+        ]
+        if active_profiles and not cascade_profiles:
             raise InvalidConfiguration("connection has active profiles")
         profile_references, connection_references = (
             self._retained_snapshot_references()
@@ -881,6 +919,25 @@ class ConfigurationService:
         referenced = row.id in connection_references or any(
             profile.id in profile_references for profile in row.profiles
         )
+        if active_profiles:
+            defaults = self.session.get(DefaultSettingsRecord, 1)
+            now = datetime.now(timezone.utc)
+            for profile in active_profiles:
+                if defaults is not None:
+                    if defaults.cloud_asr_profile_id == profile.id:
+                        defaults.cloud_asr_profile_id = None
+                        if defaults.asr_mode == "cloud":
+                            defaults.asr_mode = "auto"
+                    if defaults.translation_profile_id == profile.id:
+                        defaults.translation_profile_id = None
+                        defaults.translation_enabled = False
+                    if defaults.notes_profile_id == profile.id:
+                        defaults.notes_profile_id = None
+                        defaults.notes_enabled = False
+                if profile.id in profile_references:
+                    profile.archived_at = now
+                elif referenced:
+                    self.session.delete(profile)
         cleanup_reference: str | None = None
         if referenced:
             row.archived_at = datetime.now(timezone.utc)
@@ -1160,7 +1217,8 @@ class ConfigurationService:
                 row.chat_data_authorized_fingerprint = None
         if (
             row.purpose == "notes"
-            and row.connection.protocol != "aliyun_bailian"
+            and row.connection.protocol
+            not in {"aliyun_bailian", "tencent_tokenhub"}
             and ok
         ):
             defaults = self.session.get(DefaultSettingsRecord, 1)
@@ -1197,7 +1255,8 @@ class ConfigurationService:
         view = self._profile_view(row)
         if (
             row.purpose not in _CHAT_PURPOSES
-            or row.connection.protocol != "aliyun_bailian"
+            or row.connection.protocol
+            not in {"aliyun_bailian", "tencent_tokenhub"}
             or not view.tested
             or view.test_ok is not True
             or view.capability_fingerprint is None
@@ -1232,7 +1291,8 @@ class ConfigurationService:
         row = self._profile(profile_id)
         if (
             row.purpose not in _CHAT_PURPOSES
-            or row.connection.protocol != "aliyun_bailian"
+            or row.connection.protocol
+            not in {"aliyun_bailian", "tencent_tokenhub"}
         ):
             raise InvalidConfiguration("profile does not use domestic chat")
         row.chat_data_authorized_fingerprint = None
@@ -1430,7 +1490,11 @@ class ConfigurationService:
         stored = self.secrets.get(row.credential_ref)
         if stored is None:
             return None
-        if row.protocol not in {"tencent_recording_asr", "aliyun_bailian"}:
+        if row.protocol not in {
+            "tencent_recording_asr",
+            "aliyun_bailian",
+            "tencent_tokenhub",
+        }:
             return stored
         try:
             return parse_credential_bundle(row.protocol, stored)
@@ -1501,7 +1565,11 @@ class ConfigurationService:
             raise InvalidConfiguration("legacy_chat_endpoint_blocked")
         stored_secret = self.secrets.get(connection.credential_ref)
         has_secret = stored_secret is not None
-        if connection.protocol in {"tencent_recording_asr", "aliyun_bailian"}:
+        if connection.protocol in {
+            "tencent_recording_asr",
+            "aliyun_bailian",
+            "tencent_tokenhub",
+        }:
             has_secret = all(
                 configured_credential_fields(
                     connection.protocol,
@@ -1523,7 +1591,7 @@ class ConfigurationService:
             "profile_revision": row.revision,
             "has_secret": has_secret,
         }
-        if connection.protocol == "aliyun_bailian":
+        if connection.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
             capability_fingerprint = _chat_capability_fingerprint(row)
             snapshot["capability_fingerprint"] = (
                 dict(capability_fingerprint)

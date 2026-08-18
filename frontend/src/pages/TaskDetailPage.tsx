@@ -19,7 +19,6 @@ import { ExportMenu } from "../components/ExportMenu";
 import { InlineNotice } from "../components/InlineNotice";
 import { MarkdownNote } from "../components/MarkdownNote";
 import { StageTimeline } from "../components/StageTimeline";
-import { StatusBadge } from "../components/StatusBadge";
 import { TranscriptViewer } from "../components/TranscriptViewer";
 
 type ResultTab = "transcript" | "translation" | "notes";
@@ -362,10 +361,9 @@ export function TaskDetailPage({ taskId }: { taskId: string }) {
         <aside className="stage-inspector" aria-labelledby="stage-heading">
           <div className="inspector-heading">
             <div>
-              <p>当前状态</p>
+              <p>处理进度</p>
               <h2 id="stage-heading">{statusLabel(task.status)}</h2>
             </div>
-            <StatusBadge status={task.status} />
           </div>
           <StageTimeline runs={runs} onRetry={openRetry} />
 
@@ -420,7 +418,34 @@ export function TaskDetailPage({ taskId }: { taskId: string }) {
                   )}
                 </>
               ) : (
-                <p>只会重试这个阶段，不会重新下载或生成原始字幕。</p>
+                <>
+                  <p>只会重试这个阶段，不会重新下载或重复完成的阶段。</p>
+                  {retryRun.stage === "transcribe" && (
+                    <fieldset className="retry-strategies">
+                      <legend>选择方式</legend>
+                      <label>
+                        <input
+                          type="radio"
+                          name="retry-strategy"
+                          value="same"
+                          checked={retryStrategy === "same"}
+                          onChange={() => setRetryStrategy("same")}
+                        />
+                        按原配置重试（云端不可用时自动转本地）
+                      </label>
+                      <label>
+                        <input
+                          type="radio"
+                          name="retry-strategy"
+                          value="local"
+                          checked={retryStrategy === "local"}
+                          onChange={() => setRetryStrategy("local")}
+                        />
+                        仅使用本地识别模型
+                      </label>
+                    </fieldset>
+                  )}
+                </>
               )}
               <div className="actions">
                 <button

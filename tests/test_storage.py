@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from pathlib import Path
+import sys
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from pydantic import ValidationError
@@ -16,7 +17,7 @@ from vtnote.artifacts import (
     write_transcript_json,
     write_translation_json,
 )
-from vtnote.config import Settings
+from vtnote.config import Settings, platform_storage_roots
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.schemas import (
     Provenance,
@@ -107,6 +108,70 @@ def test_settings_reject_relative_or_overlapping_storage_roots(tmp_path: Path) -
                 data_root=Path(r"D:\VtNote-data"),
                 runtime_cache_root=Path(r"C:\VtNote-runtime"),
             )
+
+
+def test_platform_storage_roots_use_native_user_directories() -> None:
+    mac_data, mac_cache = platform_storage_roots(
+        platform_name="darwin",
+        environment={},
+        home="/Users/demo",
+    )
+    assert mac_data == PurePosixPath(
+        "/Users/demo/Library/Application Support/VtNote"
+    )
+    assert mac_cache == PurePosixPath("/Users/demo/Library/Caches/VtNote")
+
+    windows_data, windows_cache = platform_storage_roots(
+        platform_name="win32",
+        environment={"LOCALAPPDATA": r"C:\Users\demo\AppData\Local"},
+        home=r"C:\Users\demo",
+    )
+    assert windows_data == PureWindowsPath(
+        r"C:\Users\demo\AppData\Local\VtNote\Data"
+    )
+    assert windows_cache == PureWindowsPath(
+        r"C:\Users\demo\AppData\Local\VtNote\Cache"
+    )
+
+    linux_data, linux_cache = platform_storage_roots(
+        platform_name="linux",
+        environment={
+            "XDG_DATA_HOME": "/srv/demo/data",
+            "XDG_CACHE_HOME": "/srv/demo/cache",
+        },
+        home="/home/demo",
+    )
+    assert linux_data == PurePosixPath("/srv/demo/data/VtNote")
+    assert linux_cache == PurePosixPath("/srv/demo/cache/VtNote")
+
+
+def test_settings_defaults_are_absolute_and_support_environment_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VTNOTE_DATA_ROOT", raising=False)
+    monkeypatch.delenv("VTNOTE_RUNTIME_CACHE_ROOT", raising=False)
+    defaults = Settings()
+
+    assert defaults.data_root.is_absolute()
+    assert defaults.runtime_cache_root.is_absolute()
+    assert defaults.data_root != defaults.runtime_cache_root
+    if sys.platform == "darwin":
+        assert defaults.data_root == (
+            Path.home() / "Library" / "Application Support" / "VtNote"
+        )
+        assert defaults.runtime_cache_root == (
+            Path.home() / "Library" / "Caches" / "VtNote"
+        )
+
+    data_root = tmp_path / "explicit-data"
+    cache_root = tmp_path / "explicit-cache"
+    monkeypatch.setenv("VTNOTE_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("VTNOTE_RUNTIME_CACHE_ROOT", str(cache_root))
+    overridden = Settings()
+
+    assert overridden.data_root == data_root
+    assert overridden.runtime_cache_root == cache_root
 
 
 def test_settings_cannot_bind_outside_loopback(tmp_path: Path) -> None:

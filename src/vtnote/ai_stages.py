@@ -34,6 +34,7 @@ from vtnote.paths import StoragePaths
 from vtnote.provider_credentials import (
     BailianCredentialBundle,
     CredentialReentryRequired,
+    TokenHubCredentialBundle,
     parse_credential_bundle,
 )
 from vtnote.schemas import Transcript, Translation, transcript_sha256
@@ -44,6 +45,11 @@ from vtnote.sensitive_text import (
     validate_protected_text_envelope,
 )
 from vtnote.translation import TranslationError, Translator
+from vtnote.tokenhub_chat import (
+    TOKENHUB_BASE_URL,
+    TOKENHUB_CHAT_ENDPOINT,
+    TencentTokenHubChatAdapter,
+)
 from vtnote.worker import StageContext, StageExecutionError
 from vtnote.worker_store import StageResult
 
@@ -60,6 +66,7 @@ class ValidatedBailianProfile:
     connection_revision: int
     profile_revision: int
     credential_ref: str
+    protocol: str
 
 
 class BailianCredentialResolver(Protocol):
@@ -73,14 +80,14 @@ class BailianCredentialResolver(Protocol):
     def resolve(
         self,
         validated: ValidatedBailianProfile,
-    ) -> BailianCredentialBundle: ...
+    ) -> BailianCredentialBundle | TokenHubCredentialBundle: ...
 
 
 class AiClientFactory(Protocol):
     def __call__(
         self,
         profile: Mapping[str, object],
-        credentials: BailianCredentialBundle,
+        credentials: BailianCredentialBundle | TokenHubCredentialBundle,
     ) -> ChatClient: ...
 
 
@@ -102,10 +109,15 @@ def _current_fingerprint(
     connection: ProviderConnectionRecord,
 ) -> dict[str, object]:
     options = dict(profile.options)
+    endpoint = (
+        bailian_chat_endpoint(connection.parameters["workspace_id"])
+        if connection.protocol == "aliyun_bailian"
+        else TOKENHUB_CHAT_ENDPOINT
+    )
     return {
         "schema_version": 1,
-        "protocol": "aliyun_bailian",
-        "endpoint": bailian_chat_endpoint(connection.parameters["workspace_id"]),
+        "protocol": connection.protocol,
+        "endpoint": endpoint,
         "connection_revision": connection.revision,
         "profile_revision": profile.revision,
         "model": profile.model,
@@ -136,22 +148,35 @@ class SnapshotBailianCredentialResolver:
         profile_revision = profile.get("profile_revision")
         connection_revision = profile.get("connection_revision")
         parameters = profile.get("parameters")
+        protocol = profile.get("protocol")
         capability = profile.get("capability_fingerprint")
         consent = profile.get("chat_data_consent_fingerprint")
+        valid_parameters = (
+            protocol == "aliyun_bailian"
+            and isinstance(parameters, Mapping)
+            and set(parameters) == {"workspace_id"}
+            and isinstance(parameters.get("workspace_id"), str)
+        ) or (
+            protocol == "tencent_tokenhub"
+            and isinstance(parameters, Mapping)
+            and not parameters
+        )
         if (
             profile_id is None
             or connection_id is None
             or type(profile_revision) is not int
             or type(connection_revision) is not int
             or profile.get("purpose") != purpose
-            or profile.get("protocol") != "aliyun_bailian"
-            or not isinstance(parameters, Mapping)
-            or set(parameters) != {"workspace_id"}
-            or not isinstance(parameters.get("workspace_id"), str)
+            or protocol not in {"aliyun_bailian", "tencent_tokenhub"}
+            or not valid_parameters
         ):
             raise StageExecutionError("ai_profile_snapshot_invalid")
-        endpoint = bailian_chat_endpoint(str(parameters["workspace_id"]))
-        if profile.get("base_url") != endpoint:
+        expected_base_url = (
+            bailian_chat_endpoint(str(parameters["workspace_id"]))
+            if protocol == "aliyun_bailian"
+            else TOKENHUB_BASE_URL
+        )
+        if profile.get("base_url") != expected_base_url:
             raise StageExecutionError("ai_profile_snapshot_invalid")
         if (
             not isinstance(capability, Mapping)
@@ -169,14 +194,14 @@ class SnapshotBailianCredentialResolver:
                 or connection is None
                 or profile_row.connection_id != connection.id
                 or profile_row.purpose != purpose
-                or connection.protocol != "aliyun_bailian"
+                or connection.protocol != protocol
                 or profile_row.revision != profile_revision
                 or connection.revision != connection_revision
                 or profile_row.test_ok is not True
                 or profile_row.tested_revision != profile_row.revision
                 or profile_row.tested_connection_revision != connection.revision
                 or dict(connection.parameters) != dict(parameters)
-                or connection.base_url != endpoint
+                or connection.base_url != expected_base_url
                 or profile_row.model != profile.get("model")
                 or profile_row.context_length != profile.get("context_length")
                 or dict(profile_row.options) != dict(profile.get("options") or {})
@@ -200,12 +225,13 @@ class SnapshotBailianCredentialResolver:
                 connection_revision=connection.revision,
                 profile_revision=profile_row.revision,
                 credential_ref=connection.credential_ref,
+                protocol=connection.protocol,
             )
 
     def resolve(
         self,
         validated: ValidatedBailianProfile,
-    ) -> BailianCredentialBundle:
+    ) -> BailianCredentialBundle | TokenHubCredentialBundle:
         with Session(self.engine) as session:
             profile = session.get(ProcessorProfileRecord, validated.profile_id)
             connection = session.get(
@@ -219,16 +245,17 @@ class SnapshotBailianCredentialResolver:
                 or profile.revision != validated.profile_revision
                 or connection.revision != validated.connection_revision
                 or connection.credential_ref != validated.credential_ref
+                or connection.protocol != validated.protocol
             ):
                 raise StageExecutionError("chat_data_consent_stale")
         stored = self.secrets.get(validated.credential_ref)
         if stored is None:
             raise StageExecutionError("chat_credentials_unavailable")
         try:
-            bundle = parse_credential_bundle("aliyun_bailian", stored)
+            bundle = parse_credential_bundle(validated.protocol, stored)
         except CredentialReentryRequired:
             raise StageExecutionError("chat_credentials_reentry_required") from None
-        if not isinstance(bundle, BailianCredentialBundle):
+        if not isinstance(bundle, (BailianCredentialBundle, TokenHubCredentialBundle)):
             raise StageExecutionError("chat_credentials_unavailable")
         return bundle
 
@@ -272,8 +299,14 @@ class SnapshotCustomPromptResolver:
 
 def build_bailian_chat_client(
     profile: Mapping[str, object],
-    credentials: BailianCredentialBundle,
+    credentials: BailianCredentialBundle | TokenHubCredentialBundle,
 ) -> ChatClient:
+    if profile.get("protocol") == "tencent_tokenhub":
+        if not isinstance(credentials, TokenHubCredentialBundle):
+            raise StageExecutionError("chat_credentials_unavailable")
+        return TencentTokenHubChatAdapter(
+            api_key=SecretStr(credentials.api_key.get_secret_value())
+        )
     parameters = profile.get("parameters")
     workspace_id = (
         parameters.get("workspace_id")
@@ -282,6 +315,8 @@ def build_bailian_chat_client(
     )
     if not isinstance(workspace_id, str):
         raise StageExecutionError("ai_profile_snapshot_invalid")
+    if not isinstance(credentials, BailianCredentialBundle):
+        raise StageExecutionError("chat_credentials_unavailable")
     return AliyunBailianChatAdapter(
         workspace_id=workspace_id,
         api_key=SecretStr(credentials.api_key.get_secret_value()),
@@ -333,9 +368,13 @@ def _read_transcript(paths: StoragePaths, item_id: str) -> Transcript:
 
 def _evidence(profile: Mapping[str, object]) -> dict[str, str]:
     model = profile.get("model")
-    if not isinstance(model, str):
+    protocol = profile.get("protocol")
+    if (
+        not isinstance(model, str)
+        or protocol not in {"aliyun_bailian", "tencent_tokenhub"}
+    ):
         raise StageExecutionError("ai_profile_snapshot_invalid")
-    return {"provider": "aliyun_bailian", "model": model}
+    return {"provider": str(protocol), "model": model}
 
 
 def _raise_ai_error(error: Exception) -> None:

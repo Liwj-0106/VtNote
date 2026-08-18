@@ -21,6 +21,7 @@ from vtnote.media import (
     CommandRunner,
     FfmpegBinaries,
     FfmpegMediaProcessor,
+    MediaInfo,
     PreparedAudio,
 )
 from vtnote.models import (
@@ -33,6 +34,7 @@ from vtnote.provider_credentials import TencentCredentialBundle
 from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 from vtnote.tencent_contract import (
     TENCENT_ASR_ENDPOINT,
+    TENCENT_INLINE_AUDIO_BYTES,
     TencentResponseError,
     TencentSentence,
     build_create_payload_inline,
@@ -66,6 +68,14 @@ class CloudAsrRequestError(RuntimeError):
     def __init__(self, outcome: CloudAsrOutcome) -> None:
         self.outcome = outcome
         super().__init__(outcome.safe_code)
+
+
+BUILTIN_ASR_TEST_SAMPLE_ID = "builtin-tencent-asr-check"
+_BUILTIN_ASR_EXPECTED_PARTS = ("腾讯云", "语音识别", "测试")
+
+
+def _normalized_transcript(value: str) -> str:
+    return "".join(character.casefold() for character in value if character.isalnum())
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,14 +198,20 @@ def _provider_error(
         return CloudAsrOutcome(
             CloudAsrOutcomeKind.FALLBACK_ALLOWED,
             "provider_fallback_allowed",
+            provider_status=code,
         )
     if action == "query_retry":
         return CloudAsrOutcome(
             CloudAsrOutcomeKind.STOP,
             "provider_query_retry",
+            provider_status=code,
             retryable=True,
         )
-    return CloudAsrOutcome(CloudAsrOutcomeKind.STOP, action)
+    return CloudAsrOutcome(
+        CloudAsrOutcomeKind.STOP,
+        action,
+        provider_status=code,
+    )
 
 
 class TencentRecordingClient:
@@ -224,12 +240,12 @@ class TencentRecordingClient:
         path = Path(audio.path)
         if submission.state != "sending" or not path.is_absolute() or not path.is_file():
             raise ValueError("prepared audio is unavailable")
-        if path.stat().st_size > 4_500_000:
+        if path.stat().st_size > TENCENT_INLINE_AUDIO_BYTES:
             raise ValueError("prepared inline audio does not match submission")
         data = path.read_bytes()
         if (
             not data
-            or len(data) > 4_500_000
+            or len(data) > TENCENT_INLINE_AUDIO_BYTES
             or hashlib.sha256(data).hexdigest() != submission.audio_sha256
         ):
             raise ValueError("prepared inline audio does not match submission")
@@ -865,13 +881,13 @@ class TencentConnectivityTester:
         path = Path(audio.path)
         if not path.is_file():
             return TencentConnectivityResult(False, "Speech sample is unavailable")
-        if path.stat().st_size > 4_500_000:
+        if path.stat().st_size > TENCENT_INLINE_AUDIO_BYTES:
             return TencentConnectivityResult(
                 False,
                 "Speech sample is not inline eligible",
             )
         data = path.read_bytes()
-        if not data or len(data) > 4_500_000:
+        if not data or len(data) > TENCENT_INLINE_AUDIO_BYTES:
             return TencentConnectivityResult(
                 False,
                 "Speech sample is not inline eligible",
@@ -902,8 +918,11 @@ class TencentConnectivityTester:
         )
         try:
             task = self.client.create(audio, request_context, submission)
-        except CloudAsrRequestError:
-            return TencentConnectivityResult(False, "Profile test failed")
+        except CloudAsrRequestError as error:
+            return TencentConnectivityResult(
+                False,
+                error.outcome.provider_status or error.outcome.safe_code,
+            )
         for attempt in range(self.maximum_queries):
             outcome = self.client.query(
                 task,
@@ -916,12 +935,31 @@ class TencentConnectivityTester:
                 outcome.kind == CloudAsrOutcomeKind.SUCCESS
                 and outcome.sentences
             ):
+                if sample_id == BUILTIN_ASR_TEST_SAMPLE_ID:
+                    recognized = _normalized_transcript(
+                        "".join(sentence.text for sentence in outcome.sentences)
+                    )
+                    if not all(
+                        _normalized_transcript(part) in recognized
+                        for part in _BUILTIN_ASR_EXPECTED_PARTS
+                    ):
+                        return TencentConnectivityResult(
+                            False,
+                            "provider_test_phrase_mismatch",
+                        )
                 return TencentConnectivityResult(
                     True,
                     "Profile test succeeded; sample upload may be billable",
                 )
             if not outcome.retryable:
-                return TencentConnectivityResult(False, "Profile test failed")
+                return TencentConnectivityResult(
+                    False,
+                    (
+                        "provider_empty_transcript"
+                        if outcome.kind == CloudAsrOutcomeKind.SUCCESS
+                        else outcome.provider_status or outcome.safe_code
+                    ),
+                )
             if attempt + 1 < self.maximum_queries:
                 self.sleeper(
                     bounded_poll_delay(
@@ -929,7 +967,52 @@ class TencentConnectivityTester:
                         attempt,
                     ).total_seconds()
                 )
-        return TencentConnectivityResult(False, "Profile test timed out")
+        return TencentConnectivityResult(False, "provider_test_timeout")
+
+
+class BuiltinSpeechSampleResolver:
+    """Resolve the small, project-owned speech sample used by explicit verification."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path).resolve()
+
+    def __call__(self, sample_id: str) -> PreparedAudio:
+        if sample_id != BUILTIN_ASR_TEST_SAMPLE_ID or not self.path.is_file():
+            raise ValueError("built-in speech sample is unavailable")
+        size = self.path.stat().st_size
+        if size <= 0 or size > TENCENT_INLINE_AUDIO_BYTES:
+            raise ValueError("built-in speech sample is invalid")
+        return PreparedAudio(
+            path=self.path,
+            asset_id=None,
+            converted=False,
+            media_info=MediaInfo(
+                duration_ms=3_318,
+                size_bytes=size,
+                format_name="wav",
+                audio_codec="pcm_s16le",
+                sample_rate=16_000,
+                channels=1,
+            ),
+        )
+
+
+class SpeechSampleResolver:
+    """Route the reserved verification sample locally and uploads to managed storage."""
+
+    def __init__(
+        self,
+        *,
+        builtin: BuiltinSpeechSampleResolver,
+        uploaded: Callable[[str], PreparedAudio],
+    ) -> None:
+        self.builtin = builtin
+        self.uploaded = uploaded
+
+    def __call__(self, sample_id: str) -> PreparedAudio:
+        if sample_id == BUILTIN_ASR_TEST_SAMPLE_ID:
+            return self.builtin(sample_id)
+        return self.uploaded(sample_id)
 
 
 class UploadedSpeechSampleResolver:

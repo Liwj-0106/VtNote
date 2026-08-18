@@ -268,6 +268,11 @@ def test_trashed_asset_reserves_its_canonical_original_path(tmp_path: Path) -> N
     [
         ("unknown", f"items/{ITEM_ID}/audio/downloaded.webm", "invalid_role"),
         ("cloud_audio", f"items/{ITEM_ID}/audio/downloaded.webm", "role_path_mismatch"),
+        (
+            "cloud_audio_inline",
+            f"items/{ITEM_ID}/audio/cloud.ogg",
+            "role_path_mismatch",
+        ),
         ("downloaded_audio", f"items/{ITEM_ID}/audio/downloaded.exe", "role_path_mismatch"),
         ("downloaded_audio", "../outside.webm", "invalid_relative_path"),
     ],
@@ -613,5 +618,48 @@ def test_purge_due_processes_only_assets_whose_retention_has_elapsed(
         assert purged == (due.id,)
         assert session.get(RuntimeAssetRecord, due.id) is None
         assert session.get(RuntimeAssetRecord, later.id) is not None
+    finally:
+        close_session(session)
+def test_export_audio_roles_are_bound_to_their_canonical_paths(tmp_path: Path) -> None:
+    service, session, paths, item = make_service(tmp_path)
+    item_id = item.id
+    try:
+        destination = paths.export_audio(item_id, "m4a")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"m4a-audio")
+
+        view = service.register_staged(
+            item_id=item_id,
+            role="export_audio_m4a",
+            relative_path=paths.runtime_relative(destination),
+        )
+
+        assert service.resolve(view.id) == destination
+        with pytest.raises(RuntimeAssetError) as caught:
+            service.register_staged(
+                item_id=item_id,
+                role="export_audio_mp3",
+                relative_path=paths.runtime_relative(destination),
+            )
+        assert caught.value.code == "role_path_mismatch"
+    finally:
+        close_session(session)
+
+
+def test_cloud_inline_audio_role_is_bound_to_its_canonical_path(tmp_path: Path) -> None:
+    service, session, paths, item = make_service(tmp_path)
+    item_id = item.id
+    try:
+        destination = paths.cloud_inline_ogg(item_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"inline-cloud-audio")
+
+        view = service.register_staged(
+            item_id=item_id,
+            role="cloud_audio_inline",
+            relative_path=paths.runtime_relative(destination),
+        )
+
+        assert service.resolve(view.id) == destination
     finally:
         close_session(session)

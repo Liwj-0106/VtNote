@@ -109,7 +109,7 @@ def configure_profiles(configuration: ConfigurationService) -> tuple[str, str, s
     )
     cloud = configuration.create_profile(
         name="Tencent ASR", purpose="cloud_asr",
-        connection_id=cloud_connection.id, model="16k_zh_en_2.0"
+        connection_id=cloud_connection.id, model="16k_zh"
     )
     configuration.record_profile_test(cloud.id, ok=True, message="ok")
     configuration.authorize_cloud_upload(cloud.id)
@@ -203,6 +203,80 @@ def test_enqueue_never_calls_a_worker(tmp_path: Path) -> None:
         session.close()
 
 
+def test_output_type_builds_only_the_required_pipeline_stages(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        audio = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/audio"}],
+            options={"output_type": "audio"},
+        )
+        assert audio.options["output_type"] == "audio"
+        assert audio.pipeline_snapshot["output_type"] == "audio"
+        assert audio.pipeline_snapshot["translation"]["enabled"] is False
+        assert audio.pipeline_snapshot["notes"]["enabled"] is False
+        assert [run.stage for run in audio.items[0].stage_runs] == ["source"]
+
+        transcript = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/transcript"}],
+            options={"output_type": "transcript"},
+        )
+        assert transcript.pipeline_snapshot["output_type"] == "transcript"
+        assert [run.stage for run in transcript.items[0].stage_runs] == [
+            "source",
+            "transcribe",
+        ]
+
+        connection = create_chat_connection(configuration, api_key="chat-secret")
+        notes_profile = create_chat_profile(
+            configuration,
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="qwen-notes",
+        )
+        ready_chat_profile(configuration, notes_profile.id)
+        notes = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/notes"}],
+            options={
+                "output_type": "notes",
+                "notes_profile_id": notes_profile.id,
+            },
+        )
+        assert notes.pipeline_snapshot["output_type"] == "notes"
+        assert notes.pipeline_snapshot["notes"]["enabled"] is True
+        assert [run.stage for run in notes.items[0].stage_runs] == [
+            "source",
+            "transcribe",
+            "notes",
+        ]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_full_output_pipeline_keeps_audio_enabled(tmp_path: Path) -> None:
+    tasks, _, session, _ = make_services(tmp_path)
+    try:
+        task = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/full-output"}],
+            options={
+                "audio_export_enabled": True,
+                "translation_enabled": False,
+                "notes_enabled": False,
+            },
+        )
+
+        assert task.options["audio_export_enabled"] is True
+        assert task.pipeline_snapshot["audio_export_enabled"] is True
+        assert [run.stage for run in task.items[0].stage_runs] == [
+            "source",
+            "transcribe",
+        ]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
 def test_auto_mode_omits_cloud_profile_until_upload_is_authorized(tmp_path: Path) -> None:
     tasks, configuration, session, _ = make_services(tmp_path)
     try:
@@ -213,7 +287,7 @@ def test_auto_mode_omits_cloud_profile_until_upload_is_authorized(tmp_path: Path
         )
         profile = configuration.create_profile(
             name="Tencent ASR", purpose="cloud_asr",
-            connection_id=connection.id, model="16k_zh_en_2.0"
+            connection_id=connection.id, model="16k_zh"
         )
         configuration.record_profile_test(profile.id, ok=True, message="ok")
         configuration.update_defaults(asr_mode="auto", cloud_asr_profile_id=profile.id)
@@ -223,6 +297,43 @@ def test_auto_mode_omits_cloud_profile_until_upload_is_authorized(tmp_path: Path
         )
         assert created.pipeline_snapshot["asr"] == {"mode": "auto", "profile": None}
         assert created.pipeline_snapshot["local_whisper"]["model"] == "large-v3-turbo"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_auto_mode_snapshots_authorized_tencent_profile_first(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = configuration.create_connection(
+            name="Tencent",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com",
+            parameters={},
+            credentials={"secret_id": "AKID", "secret_key": "key"},
+        )
+        profile = configuration.create_profile(
+            name="Tencent ASR",
+            purpose="cloud_asr",
+            connection_id=connection.id,
+            model="16k_zh",
+        )
+        configuration.record_profile_test(profile.id, ok=True, message="ok")
+        configuration.authorize_cloud_upload(profile.id)
+        configuration.update_defaults(
+            asr_mode="auto",
+            cloud_asr_profile_id=profile.id,
+        )
+
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/abc"}]
+        )
+
+        snapshot = created.pipeline_snapshot["asr"]
+        assert snapshot["mode"] == "auto"
+        assert snapshot["profile"]["protocol"] == "tencent_recording_asr"
+        assert snapshot["profile"]["id"] == profile.id
+        assert snapshot["profile"]["model"] == "16k_zh"
     finally:
         session.bind.dispose()
         session.close()
@@ -1161,13 +1272,13 @@ def test_cloud_confirmed_requires_current_tested_authorized_revisions(
             if run.stage == "transcribe" and run.attempt == 2
         )
         evidence = tasks.record_stage_evidence(
-            new_attempt.id, {"model": "16k_zh_en_2.0"}
+            new_attempt.id, {"model": "16k_zh"}
         )
-        assert evidence.execution_evidence == {"model": "16k_zh_en_2.0"}
+        assert evidence.execution_evidence == {"model": "16k_zh"}
         stored_item = session.get(ItemRecord, item.id)
         assert stored_item is not None
         local_model = stored_item.task.pipeline_snapshot_json["local_whisper"]["model"]
-        assert local_model != "16k_zh_en_2.0"
+        assert local_model != "16k_zh"
         with pytest.raises(InvalidTaskOperation, match="model"):
             tasks.record_stage_evidence(
                 new_attempt.id, {"model": local_model}
@@ -1189,7 +1300,7 @@ def test_retry_override_never_reads_current_defaults(
             name="Explicit retry profile",
             purpose="cloud_asr",
             connection_id=connection_id,
-            model="16k_zh_en_2.0",
+            model="16k_zh",
             context_length=16384,
         )
         configuration.record_profile_test(selected.id, ok=True, message="ok")
@@ -1228,7 +1339,7 @@ def test_retry_override_never_reads_current_defaults(
         )
         assert retry.retry_override_json["asr"]["profile"]["id"] == selected.id
         assert retry.retry_override_json["asr"]["profile"]["model"] == (
-            "16k_zh_en_2.0"
+            "16k_zh"
         )
         assert stored.task.pipeline_snapshot_json == original_task_snapshot
     finally:

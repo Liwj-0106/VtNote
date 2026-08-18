@@ -115,6 +115,8 @@ class TaskView(BaseModel):
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _TASK_OPTION_KEYS = frozenset(
     {
+        "output_type",
+        "audio_export_enabled",
         "asr_mode",
         "cloud_asr_profile_id",
         "translation_enabled",
@@ -568,6 +570,14 @@ class TaskService:
         self, options: dict[str, Any], task_id: str
     ) -> dict[str, Any]:
         defaults = self.configuration.get_defaults()
+        output_type = options.get("output_type")
+        if output_type not in {None, "audio", "transcript", "notes"}:
+            raise InvalidTaskOperation("invalid output type")
+        audio_export_enabled = options.get(
+            "audio_export_enabled", output_type == "audio"
+        )
+        if not isinstance(audio_export_enabled, bool):
+            raise InvalidTaskOperation("invalid audio export option")
         asr_mode = options.get("asr_mode", defaults.asr_mode)
         if asr_mode not in {"auto", "cloud", "local"}:
             raise InvalidTaskOperation("invalid ASR mode")
@@ -599,8 +609,10 @@ class TaskService:
             cloud = None
         elif not cloud_authorized:
             cloud = None
-        translation_enabled = options.get(
-            "translation_enabled", defaults.translation_enabled
+        translation_enabled = (
+            False
+            if output_type is not None
+            else options.get("translation_enabled", defaults.translation_enabled)
         )
         translation_profile_id = options.get(
             "translation_profile_id", defaults.translation_profile_id
@@ -610,7 +622,11 @@ class TaskService:
             if translation_enabled
             else None
         )
-        notes_enabled = options.get("notes_enabled", defaults.notes_enabled)
+        notes_enabled = (
+            output_type == "notes"
+            if output_type is not None
+            else options.get("notes_enabled", defaults.notes_enabled)
+        )
         notes_profile_id = options.get("notes_profile_id", defaults.notes_profile_id)
         notes = (
             self._profile_snapshot(notes_profile_id, "notes")
@@ -647,7 +663,7 @@ class TaskService:
                     task_prompt_purpose(task_id), custom_prompt
                 ).model_dump(mode="json")
             )
-        return {
+        snapshot = {
             "schema_version": 1,
             "asr": {"mode": asr_mode, "profile": cloud},
             "translation": {
@@ -664,6 +680,10 @@ class TaskService:
             },
             "local_whisper": dict(defaults.local_whisper_options),
         }
+        if output_type is not None:
+            snapshot["output_type"] = output_type
+        snapshot["audio_export_enabled"] = audio_export_enabled
+        return snapshot
 
     def _validate_source(self, source: dict[str, str]) -> tuple[str, str]:
         if set(source) != {"kind", "locator"}:
@@ -709,6 +729,7 @@ class TaskService:
         )
         translation_enabled = snapshot["translation"]["enabled"]
         notes_enabled = snapshot["notes"]["enabled"]
+        output_type = snapshot.get("output_type")
         for position, (kind, locator, display_name) in enumerate(validated):
             item = ItemRecord(
                 position=position,
@@ -716,11 +737,18 @@ class TaskService:
                 source_locator=locator,
                 source_display_name=display_name,
             )
-            stages = ["source", "transcribe"]
-            if translation_enabled:
-                stages.append("translate")
-            if notes_enabled:
-                stages.append("notes")
+            if output_type == "audio":
+                stages = ["source"]
+            elif output_type == "transcript":
+                stages = ["source", "transcribe"]
+            elif output_type == "notes":
+                stages = ["source", "transcribe", "notes"]
+            else:
+                stages = ["source", "transcribe"]
+                if translation_enabled:
+                    stages.append("translate")
+                if notes_enabled:
+                    stages.append("notes")
             item.stage_runs = [StageRunRecord(stage=stage, attempt=1) for stage in stages]
             task.items.append(item)
         self.session.add(task)
@@ -983,6 +1011,13 @@ class TaskService:
                 }
             )
         return notes
+
+    def item_outcomes(self, item_id: str) -> dict[str, bool]:
+        self._require_item(item_id)
+        return {
+            "transcript": self.paths.transcript(item_id).is_file(),
+            "notes": bool(self.list_item_notes(item_id)),
+        }
 
     def item_execution_summary(self, item_id: str) -> dict[str, Any]:
         item = self._require_item(item_id)

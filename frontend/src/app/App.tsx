@@ -1,6 +1,5 @@
-import { type ReactNode, useEffect, useState } from "react";
-import { api } from "../api/client";
-import type { Task } from "../api/types";
+import { type ReactNode } from "react";
+import { AiConnectionsPage } from "../pages/AiConnectionsPage";
 import { ConnectionsPage } from "../pages/ConnectionsPage";
 import { CreateTaskPage } from "../pages/CreateTaskPage";
 import { SettingsPage } from "../pages/SettingsPage";
@@ -17,25 +16,13 @@ const taskRoute = /^\/tasks\/([0-9a-f-]{36})$/iu;
 function RoutedApp() {
   const { path } = useRouter();
   const pathname = path.split("?")[0];
-  const [recentTasks, setRecentTasks] = useState<Task[]>([]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    api
-      .request<Task[]>("/api/tasks?limit=5", { signal: controller.signal })
-      .then(setRecentTasks)
-      .catch(() => {
-        // Recent tasks are optional navigation context.
-      });
-    return () => controller.abort();
-  }, [pathname]);
-
   let page: ReactNode;
   if (pathname === "/") page = <CreateTaskPage />;
   else if (pathname === "/tasks") page = <TaskHistoryPage />;
   else if (pathname === "/setup") page = <SetupPage />;
   else if (pathname === "/settings") page = <SettingsPage />;
   else if (pathname === "/settings/connections") page = <ConnectionsPage />;
+  else if (pathname === "/settings/ai-connections") page = <AiConnectionsPage />;
   else if (pathname === "/settings/storage") page = <StoragePage />;
   else {
     const taskMatch = pathname.match(taskRoute);
@@ -51,7 +38,7 @@ function RoutedApp() {
       </div>
     );
   }
-  return <AppShell recentTasks={recentTasks}>{page}</AppShell>;
+  return <AppShell>{page}</AppShell>;
 }
 
 export function App() {

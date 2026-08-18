@@ -174,6 +174,20 @@ def test_model_import_and_creation_are_lazy_and_gpu_options_are_exact(
     assert result.transcript.segments[0].text == "hello"
 
 
+def test_availability_preflight_loads_runtime_without_touching_audio(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel([SimpleNamespace(start=0.0, end=1.0, text="hello")])
+    transcriber, assets, factory_calls = make_transcriber(tmp_path, model)
+
+    available = transcriber.ensure_available(context(tmp_path))
+
+    assert available is model
+    assert assets.calls == 1
+    assert len(factory_calls) == 1
+    assert model.calls == []
+
+
 def test_cuda_unavailable_is_explicit_and_never_creates_cpu_model(
     tmp_path: Path,
 ) -> None:
