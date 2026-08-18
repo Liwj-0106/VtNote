@@ -19,8 +19,9 @@ TENCENT_ASR_ENDPOINT = "https://asr.tencentcloudapi.com"
 TENCENT_ASR_HOST = "asr.tencentcloudapi.com"
 TENCENT_ASR_REGION = "ap-guangzhou"
 TENCENT_ASR_VERSION = "2019-06-14"
-TENCENT_ASR_MODEL = "16k_zh_en_2.0"
-TENCENT_LANGUAGE_SCOPE = "zh_en_dialects"
+TENCENT_ASR_MODEL = "16k_zh"
+TENCENT_LANGUAGE_SCOPE = "zh_with_limited_english"
+TENCENT_INLINE_AUDIO_BYTES = 5_000_000
 _UINT64_MAX = (1 << 64) - 1
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -62,7 +63,7 @@ def base64_encoded_length(binary_bytes: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class TencentLimits:
-    inline_audio_bytes: int = 4_500_000
+    inline_audio_bytes: int = TENCENT_INLINE_AUDIO_BYTES
     maximum_audio_bytes: int = 96 * 1024 * 1024
     maximum_duration_ms: int = 5 * 60 * 60 * 1000
 
@@ -123,7 +124,6 @@ class TencentPreflight:
                 for item in info.format_name.split(",")
             }
             or info.audio_codec != "opus"
-            or info.sample_rate != 16_000
             or info.channels != 1
         ):
             return CloudEligibility(

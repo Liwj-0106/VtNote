@@ -390,13 +390,13 @@ def _validate_managed_runtime(runtime: YoutubeRuntime) -> None:
 
 def _validate_output_root(output_root: Path) -> Path:
     root = Path(output_root)
-    if not root.is_absolute() or root.drive.casefold() != "d:":
-        raise ValueError("yt-dlp output root must be an absolute D-drive path")
+    if not root.is_absolute():
+        raise ValueError("yt-dlp output root must be absolute")
     if _has_reparse_component(root):
         raise ValueError("yt-dlp output root contains a reparse point")
     resolved = root.resolve(strict=False)
-    if resolved.drive.casefold() != "d:":
-        raise ValueError("yt-dlp output root escapes the approved drive")
+    if not resolved.is_absolute():
+        raise ValueError("yt-dlp output root must resolve to an absolute path")
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -37,6 +38,7 @@ from vtnote.uploads import (
     UploadTaskContext,
 )
 from vtnote.url_security import SourceUrlPolicy
+from vtnote.worker_store import WorkerStore
 
 
 BASE_URL = "http://127.0.0.1:8765"
@@ -144,7 +146,7 @@ def test_large_browser_upload_streams_without_system_temp_and_returns_opaque_ass
     headers = csrf(client)
     payload = b"media" * (400 * 1024)
     body, content_type = upload_body(
-        kind="media", filename="conference.mp4", data=payload
+        kind="media", filename="downkyi-export.aac", data=payload
     )
     unusable_temp = tmp_path / "system-temp-is-forbidden"
     monkeypatch.setenv("TEMP", str(unusable_temp))
@@ -161,7 +163,7 @@ def test_large_browser_upload_streams_without_system_temp_and_returns_opaque_ass
         task = response.json()
         item = task["items"][0]
         assert item["source_kind"] == "uploaded_media"
-        assert item["source_display_name"] == "conference.mp4"
+        assert item["source_display_name"] == "downkyi-export.aac"
         asset_id = str(UUID(item["source_locator"]))
         assert asset_id == item["source_locator"]
         assert str(paths.runtime_cache_root) not in json.dumps(task)
@@ -456,6 +458,51 @@ def test_upload_completion_recovers_move_and_registration_crash_shapes(tmp_path:
         recovered = uploads.complete(state)
         assert recovered.items[0].source_locator == asset_id
         assert recovered.items[0].source_display_name == "captions.srt"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_worker_waits_until_uploaded_media_registration_commits(tmp_path: Path) -> None:
+    session, paths, tasks, uploads = make_direct_services(tmp_path)
+    upload_id = str(UUID(int=11))
+    now = datetime(2026, 8, 19, tzinfo=timezone.utc)
+    try:
+        task = tasks.create_upload_task(
+            upload_kind="media",
+            upload_id=upload_id,
+            options={"output_type": "transcript", "notes_enabled": False},
+        )
+        item_id = task.items[0].id
+        store = WorkerStore(session.bind, process_id=1)
+
+        assert store.claim_next("worker", now, timedelta(seconds=30)) is None
+
+        incoming = paths.incoming_upload(upload_id, "mp4")
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        incoming.write_bytes(b"uploaded-media")
+        completed = uploads.complete(
+            uploads.staged_state(
+                task_id=task.id,
+                item_id=item_id,
+                upload_id=upload_id,
+                upload_kind="media",
+                extension="mp4",
+                display_name="video.mp4",
+                incoming_path=incoming,
+                file_size=len(b"uploaded-media"),
+            )
+        )
+
+        assert completed.items[0].source_locator != upload_id
+        assert RuntimeAssetService(session, paths).active_for_role(
+            item_id=item_id,
+            role="uploaded_source",
+        ) is not None
+        claim = store.claim_next("worker", now, timedelta(seconds=30))
+        assert claim is not None
+        assert claim.item_id == item_id
+        assert claim.stage == "source"
     finally:
         session.bind.dispose()
         session.close()

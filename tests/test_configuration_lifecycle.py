@@ -591,7 +591,7 @@ def test_profile_archive_repairs_all_affected_defaults(tmp_path: Path) -> None:
     )
     cloud = configuration.create_profile(
         name="Cloud profile", purpose="cloud_asr",
-        connection_id=cloud_connection.id, model="16k_zh_en_2.0"
+        connection_id=cloud_connection.id, model="16k_zh"
     )
     configuration.record_profile_test(cloud.id, ok=True, message="ok")
     configuration.authorize_cloud_upload(cloud.id)

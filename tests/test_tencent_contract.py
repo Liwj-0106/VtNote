@@ -34,7 +34,9 @@ def prepared(tmp_path: Path, *, size: int, duration_ms: int) -> PreparedAudio:
             size_bytes=size,
             format_name="ogg",
             audio_codec="opus",
-            sample_rate=16_000,
+            # FFprobe reports the mandatory Opus decode rate. Media conversion
+            # separately verifies that OpusHead retains the 16 kHz input rate.
+            sample_rate=48_000,
             channels=1,
         ),
     )
@@ -42,7 +44,7 @@ def prepared(tmp_path: Path, *, size: int, duration_ms: int) -> PreparedAudio:
 
 @pytest.mark.parametrize(
     ("binary_bytes", "encoded_bytes"),
-    [(0, 0), (1, 4), (2, 4), (3, 4), (4, 8), (4_500_000, 6_000_000)],
+    [(0, 0), (1, 4), (2, 4), (3, 4), (4, 8), (5_000_000, 6_666_668)],
 )
 def test_base64_formula_is_exact(
     binary_bytes: int,
@@ -53,8 +55,8 @@ def test_base64_formula_is_exact(
 
 def profile(*, cos_configured: bool = False) -> CloudProfileSnapshot:
     return CloudProfileSnapshot(
-        model="16k_zh_en_2.0",
-        language_scope="zh_en_dialects",
+        model="16k_zh",
+        language_scope="zh_with_limited_english",
         cos_configured=cos_configured,
     )
 
@@ -64,17 +66,22 @@ def test_preflight_routes_exact_inline_boundary(tmp_path: Path) -> None:
     limits = TencentLimits()
 
     inline = evaluator.evaluate(
-        prepared(tmp_path, size=4_500_000, duration_ms=60_000),
+        prepared(tmp_path, size=5_000_000, duration_ms=60_000),
+        profile(),
+        limits,
+    )
+    incident_payload = evaluator.evaluate(
+        prepared(tmp_path, size=4_624_642, duration_ms=1_330_012),
         profile(),
         limits,
     )
     without_cos = evaluator.evaluate(
-        prepared(tmp_path, size=4_500_001, duration_ms=60_000),
+        prepared(tmp_path, size=5_000_001, duration_ms=60_000),
         profile(),
         limits,
     )
     with_cos = evaluator.evaluate(
-        prepared(tmp_path, size=4_500_001, duration_ms=60_000),
+        prepared(tmp_path, size=5_000_001, duration_ms=60_000),
         profile(cos_configured=True),
         limits,
     )
@@ -84,6 +91,11 @@ def test_preflight_routes_exact_inline_boundary(tmp_path: Path) -> None:
         "inline",
         None,
     )
+    assert (
+        incident_payload.eligible,
+        incident_payload.route,
+        incident_payload.reason_code,
+    ) == (True, "inline", None)
     assert (without_cos.eligible, without_cos.route, without_cos.reason_code) == (
         False,
         "local",
@@ -100,7 +112,7 @@ def test_preflight_routes_exact_inline_boundary(tmp_path: Path) -> None:
     ("size", "duration_ms", "reason"),
     [
         (96 * 1024 * 1024 + 1, 60_000, "cloud_payload_exceeded"),
-        (4_500_001, 5 * 60 * 60 * 1000 + 1, "cloud_duration_exceeded"),
+        (5_000_001, 5 * 60 * 60 * 1000 + 1, "cloud_duration_exceeded"),
     ],
 )
 def test_preflight_enforces_five_hour_and_96_mib_limits(
@@ -123,19 +135,19 @@ def test_preflight_enforces_five_hour_and_96_mib_limits(
 def test_profile_contract_rejects_model_or_language_variation() -> None:
     with pytest.raises(ValueError):
         CloudProfileSnapshot(
-            model="16k_zh",
-            language_scope="zh_en_dialects",
+            model="16k_zh_en_2.0",
+            language_scope="zh_with_limited_english",
             cos_configured=False,
         )
     with pytest.raises(ValueError):
         CloudProfileSnapshot(
-            model="16k_zh_en_2.0",
+            model="16k_zh",
             language_scope="auto",
             cos_configured=False,
         )
 
 
-def test_create_payloads_force_large_model_2_and_subtitle_format() -> None:
+def test_create_payloads_force_free_tier_model_and_subtitle_format() -> None:
     inline = build_create_payload_inline(b"abc")
     remote = build_create_payload_url(
         "https://private-bucket.cos.ap-guangzhou.myqcloud.com/object?signature=x"
@@ -145,14 +157,14 @@ def test_create_payloads_force_large_model_2_and_subtitle_format() -> None:
         "ChannelNum": 1,
         "Data": "YWJj",
         "DataLen": 3,
-        "EngineModelType": "16k_zh_en_2.0",
+        "EngineModelType": "16k_zh",
         "ResTextFormat": 3,
         "SentenceMaxLength": 20,
         "SourceType": 1,
     }
     assert remote == {
         "ChannelNum": 1,
-        "EngineModelType": "16k_zh_en_2.0",
+        "EngineModelType": "16k_zh",
         "ResTextFormat": 3,
         "SentenceMaxLength": 20,
         "SourceType": 0,
@@ -178,8 +190,8 @@ def test_tc3_signature_matches_static_vector() -> None:
         "TC3-HMAC-SHA256 "
         "Credential=AKID-example/2023-11-14/asr/tc3_request, "
         "SignedHeaders=content-type;host, "
-        "Signature=c3aea2f52c4ce52b96db18c3f8779ed183629367d0bf3ae"
-        "813459aeba502d68b"
+        "Signature=83a34f6cedf29a97e2556797aa7870f69ee938845e6b96d"
+        "bf26f0d58db823605"
     )
 
 

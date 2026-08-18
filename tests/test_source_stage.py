@@ -153,6 +153,7 @@ def seed(
     source_kind: str,
     source_locator: str,
     display_name: str | None = None,
+    options: dict[str, object] | None = None,
 ) -> tuple[Engine, StoragePaths, WorkerStore, StageContext]:
     paths = StoragePaths(
         data_root=tmp_path / "data",
@@ -164,7 +165,7 @@ def seed(
             id=ITEM_ID,
             task=TaskRecord(
                 status="queued",
-                options={},
+                options=dict(options or {}),
                 pipeline_snapshot_json={},
                 created_at=NOW,
             ),
@@ -387,6 +388,72 @@ def test_platform_candidate_fallback_publishes_without_audio(
             assert row is not None
             assert row.execution_evidence_json == result.execution_evidence
             assert "secret" not in repr(row.execution_evidence_json)
+    finally:
+        engine.dispose()
+
+
+def test_audio_output_bypasses_subtitles_and_fetches_one_owned_audio(
+    tmp_path: Path,
+) -> None:
+    available = track(0)
+    engine, paths, store, context = seed(
+        tmp_path,
+        source_kind="url",
+        source_locator="https://youtu.be/abcDEF12345",
+        options={"output_type": "audio"},
+    )
+    platform = FakePlatformSource(
+        probe_result=youtube_probe(available),
+        subtitle_results={available.id: VALID_VTT},
+        engine=engine,
+        paths=paths,
+    )
+    try:
+        result = handler(paths=paths, platform=platform).run(context)
+        assert result.execution_evidence == {
+            "provider": "youtube",
+            "source_method": "platform_audio",
+        }
+        assert platform.subtitle_calls == []
+        assert platform.audio_calls == 1
+        assert store.complete(context.claim, result, now=NOW)
+        assert not paths.transcript(ITEM_ID).exists()
+        with Session(engine) as session:
+            audio = RuntimeAssetService(session, paths).active_for_role(
+                item_id=ITEM_ID,
+                role="downloaded_audio",
+            )
+            assert audio is not None
+    finally:
+        engine.dispose()
+
+
+def test_full_output_retains_audio_when_platform_subtitle_exists(tmp_path: Path) -> None:
+    available = track(0)
+    engine, paths, store, context = seed(
+        tmp_path,
+        source_kind="url",
+        source_locator="https://youtu.be/abcDEF12345",
+        options={"audio_export_enabled": True},
+    )
+    platform = FakePlatformSource(
+        probe_result=youtube_probe(available),
+        subtitle_results={available.id: VALID_VTT},
+        engine=engine,
+        paths=paths,
+    )
+    try:
+        result = handler(paths=paths, platform=platform).run(context)
+        assert platform.audio_calls == 1
+        assert platform.subtitle_calls == [available.id]
+        assert store.complete(context.claim, result, now=NOW)
+        assert paths.transcript(ITEM_ID).exists()
+        with Session(engine) as session:
+            audio = RuntimeAssetService(session, paths).active_for_role(
+                item_id=ITEM_ID,
+                role="downloaded_audio",
+            )
+            assert audio is not None
     finally:
         engine.dispose()
 

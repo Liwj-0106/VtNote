@@ -22,6 +22,7 @@ from vtnote.media import (
     FfmpegMediaProcessor,
     MediaError,
     MediaLimits,
+    cloud_opus_bitrate,
 )
 from vtnote.models import (
     ItemRecord,
@@ -40,10 +41,11 @@ def ffprobe_payload(
     codec: str = "aac",
     sample_rate: str = "44100",
     channels: int = 2,
+    format_name: str = "mov,mp4",
 ) -> bytes:
     return json.dumps(
         {
-            "format": {"duration": duration, "size": size, "format_name": "mov,mp4"},
+            "format": {"duration": duration, "size": size, "format_name": format_name},
             "streams": [
                 {
                     "codec_type": "audio",
@@ -56,6 +58,19 @@ def ffprobe_payload(
     ).encode()
 
 
+def test_cloud_opus_bitrate_adapts_for_inline_uploads() -> None:
+    assert cloud_opus_bitrate(60_000) == "32k"
+    assert cloud_opus_bitrate(60_000, 5_000_000) == "32k"
+    assert cloud_opus_bitrate(1_765_000, 5_000_000) == "16k"
+    assert cloud_opus_bitrate(1_178_000, 5_000_000) == "25k"
+    assert cloud_opus_bitrate(5 * 60 * 60 * 1000, 5_000_000) == "12k"
+
+    with pytest.raises(ValueError):
+        cloud_opus_bitrate(0, 5_000_000)
+    with pytest.raises(ValueError):
+        cloud_opus_bitrate(60_000, 0)
+
+
 class RecordingRunner:
     def __init__(self, probe_payload: bytes | None = None) -> None:
         self.probe_payload = probe_payload or ffprobe_payload()
@@ -66,6 +81,25 @@ class RecordingRunner:
     ) -> CommandResult:
         self.calls.append((argv, timeout, max_output_bytes))
         return CommandResult(stdout=self.probe_payload, stderr=b"")
+
+
+class ExportRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(
+        self, argv: tuple[str, ...], *, timeout: float, max_output_bytes: int
+    ) -> CommandResult:
+        self.calls.append(argv)
+        if argv[0] == "ffmpeg":
+            Path(argv[-1]).write_bytes(b"encoded-audio")
+            return CommandResult(stdout=b"", stderr=b"")
+        target = Path(argv[-1])
+        if target.suffix == ".mp3":
+            payload = ffprobe_payload(codec="mp3", format_name="mp3")
+        else:
+            payload = ffprobe_payload(codec="aac", format_name="mov,mp4,m4a")
+        return CommandResult(stdout=payload, stderr=b"")
 
 
 def test_command_runner_is_shell_free_timeout_bounded_and_opaque() -> None:
@@ -102,8 +136,29 @@ def test_command_runner_is_shell_free_timeout_bounded_and_opaque() -> None:
     assert "SystemExit" not in str(failed_error.value)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX environment layout")
+def test_ffmpeg_discovery_uses_current_python_environment_bin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = tmp_path / "environment"
+    ffmpeg = environment / "bin" / "ffmpeg"
+    ffprobe = environment / "bin" / "ffprobe"
+    ffmpeg.parent.mkdir(parents=True)
+    ffmpeg.write_bytes(b"ffmpeg")
+    ffprobe.write_bytes(b"ffprobe")
+    monkeypatch.setattr(sys, "prefix", str(environment))
+
+    binaries = FfmpegBinaries.discover()
+
+    assert binaries == FfmpegBinaries(
+        ffmpeg=str(ffmpeg),
+        ffprobe=str(ffprobe),
+    )
+
+
 def test_probe_local_validates_a_local_audio_file_without_modifying_it(tmp_path: Path) -> None:
-    source = tmp_path / "private recording.mp4"
+    source = tmp_path / "downkyi export.aac"
     source.write_bytes(b"original-media")
     original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     runner = RecordingRunner()
@@ -239,6 +294,34 @@ def make_asset_service(tmp_path: Path) -> tuple[RuntimeAssetService, StoragePath
     return RuntimeAssetService(session, paths), paths, session, item.id
 
 
+def test_export_audio_creates_separate_managed_m4a_and_mp3_outputs(
+    tmp_path: Path,
+) -> None:
+    assets, paths, session, item_id = make_asset_service(tmp_path)
+    source = tmp_path / "source.webm"
+    source.write_bytes(b"source-audio")
+    runner = ExportRunner()
+    processor = FfmpegMediaProcessor(
+        runner=runner,
+        binaries=FfmpegBinaries(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        paths=paths,
+        assets=assets,
+    )
+    try:
+        m4a = processor.export_audio(item_id, source, "m4a")
+        mp3 = processor.export_audio(item_id, source, "mp3")
+
+        assert m4a.path == paths.export_audio(item_id, "m4a")
+        assert mp3.path == paths.export_audio(item_id, "mp3")
+        assert assets.active_for_role(item_id=item_id, role="export_audio_m4a")
+        assert assets.active_for_role(item_id=item_id, role="export_audio_mp3")
+        ffmpeg_calls = [call for call in runner.calls if call[0] == "ffmpeg"]
+        assert "ipod" in ffmpeg_calls[0]
+        assert "libmp3lame" in ffmpeg_calls[1]
+    finally:
+        session.close()
+
+
 def write_tiny_wav(path: Path, *, sample_rate: int = 16_000) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = bytearray()
@@ -252,15 +335,59 @@ def write_tiny_wav(path: Path, *, sample_rate: int = 16_000) -> None:
         output.writeframes(bytes(samples))
 
 
-def test_real_ffmpeg_cloud_conversion_is_mono_opus_with_16khz_opushead(
+def test_real_ffmpeg_exports_playable_m4a_and_mp3_files(tmp_path: Path) -> None:
+    binaries = FfmpegBinaries.discover()
+    if not (Path(binaries.ffmpeg).is_file() and Path(binaries.ffprobe).is_file()):
+        pytest.skip("verified FFmpeg binaries are unavailable")
+    assets, paths, session, item_id = make_asset_service(tmp_path)
+    source = tmp_path / "sample.wav"
+    write_tiny_wav(source)
+    processor = FfmpegMediaProcessor(
+        runner=CommandRunner(),
+        binaries=binaries,
+        paths=paths,
+        assets=assets,
+    )
+    try:
+        m4a = processor.export_audio(item_id, source, "m4a")
+        mp3 = processor.export_audio(item_id, source, "mp3")
+
+        assert m4a.path.is_file() and m4a.path.stat().st_size > 0
+        assert m4a.media_info.audio_codec == "aac"
+        assert mp3.path.is_file() and mp3.path.stat().st_size > 0
+        assert mp3.media_info.audio_codec in {"mp3", "mp3float"}
+    finally:
+        close_engine = session.bind
+        session.close()
+        close_engine.dispose()
+
+
+def test_real_ffmpeg_converts_downkyi_aac_to_cloud_opus(
     tmp_path: Path,
 ) -> None:
     binaries = FfmpegBinaries.discover()
     if not (Path(binaries.ffmpeg).is_file() and Path(binaries.ffprobe).is_file()):
         pytest.skip("verified Conda FFmpeg binaries are unavailable")
     assets, paths, session, item_id = make_asset_service(tmp_path)
-    source = tmp_path / "user-original.wav"
-    write_tiny_wav(source)
+    wave_source = tmp_path / "source.wav"
+    source = tmp_path / "downkyi-export.aac"
+    write_tiny_wav(wave_source)
+    CommandRunner().run(
+        (
+            binaries.ffmpeg,
+            "-y",
+            "-i",
+            str(wave_source),
+            "-vn",
+            "-c:a",
+            "aac",
+            "-f",
+            "adts",
+            str(source),
+        ),
+        timeout=30,
+        max_output_bytes=1024 * 1024,
+    )
     original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     processor = FfmpegMediaProcessor(
         runner=CommandRunner(), binaries=binaries, paths=paths, assets=assets
@@ -284,6 +411,13 @@ def test_real_ffmpeg_cloud_conversion_is_mono_opus_with_16khz_opushead(
 
         active = processor.convert_for_cloud(item_id, source)
         assert active.asset_id == prepared.asset_id
+
+        inline = processor.convert_for_cloud(item_id, source, max_bytes=4_500_000)
+        assert inline.path == paths.cloud_inline_ogg(item_id)
+        assert inline.asset_id != prepared.asset_id
+        assert assets.active_for_role(
+            item_id=item_id, role="cloud_audio_inline"
+        ) is not None
 
         trashed = assets.trash(prepared.asset_id)
         assert trashed.state == "trash"

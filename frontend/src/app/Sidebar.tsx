@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-import type { Task } from "../api/types";
 import {
   CloseIcon,
   MenuIcon,
@@ -13,7 +12,6 @@ import { AppLink, useRouter } from "./router";
 interface SidebarProps {
   collapsed: boolean;
   mobileOpen: boolean;
-  recentTasks: Task[];
   onToggleCollapse: () => void;
   onOpenMobile: () => void;
   onCloseMobile: () => void;
@@ -28,7 +26,6 @@ function navCurrent(path: string, target: string): boolean {
 export function Sidebar({
   collapsed,
   mobileOpen,
-  recentTasks,
   onToggleCollapse,
   onOpenMobile,
   onCloseMobile,
@@ -66,8 +63,8 @@ export function Sidebar({
   }, [mobileOpen, onCloseMobile]);
 
   const links = [
-    { to: "/", label: "新建", icon: PlusIcon },
-    { to: "/tasks", label: "任务", icon: TasksIcon },
+    { to: "/", label: "新建处理", icon: PlusIcon },
+    { to: "/tasks", label: "内容库", icon: TasksIcon },
   ];
   return (
     <>
@@ -133,24 +130,6 @@ export function Sidebar({
             </AppLink>
           ))}
         </nav>
-        {!collapsed && recentTasks.length > 0 && (
-          <div className="recent-section">
-            <p className="recent-heading">最近任务</p>
-            {recentTasks.slice(0, 5).map((task) => {
-              const item = task.items[0];
-              return (
-                <AppLink
-                  key={task.id}
-                  to={`/tasks/${task.id}`}
-                  className="recent-link"
-                  onClick={onCloseMobile}
-                >
-                  {item?.title ?? item?.source_display_name ?? "未命名任务"}
-                </AppLink>
-              );
-            })}
-          </div>
-        )}
         <div className="sidebar-bottom">
           <AppLink
             to="/settings"

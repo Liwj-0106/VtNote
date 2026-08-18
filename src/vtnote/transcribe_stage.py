@@ -78,7 +78,13 @@ from vtnote.worker_store import (
 class MediaPreparer(Protocol):
     def prepare_for_local(self, item_id: str, source: Path) -> PreparedAudio: ...
 
-    def convert_for_cloud(self, item_id: str, source: Path) -> PreparedAudio: ...
+    def convert_for_cloud(
+        self,
+        item_id: str,
+        source: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> PreparedAudio: ...
 
 
 class LocalTranscriber(Protocol):
@@ -363,18 +369,22 @@ class TranscribeStageHandler:
 
     def _trash_owned_media(self, context: StageContext) -> None:
         with Session(context.store.engine) as session:
+            item = session.get(ItemRecord, context.claim.item_id)
+            if item is None:
+                raise StageExecutionError("transcribe_source_unavailable")
+            retain_source = item.task.options.get("audio_export_enabled", False)
+            if not isinstance(retain_source, bool):
+                raise StageExecutionError("asr_snapshot_invalid")
+            disposable_roles = ["cloud_audio", "cloud_audio_inline", "local_audio"]
+            if not retain_source:
+                disposable_roles.extend(("uploaded_source", "downloaded_audio"))
             assets = RuntimeAssetService(session, self.paths)
             rows = session.scalars(
                 select(RuntimeAssetRecord).where(
                     RuntimeAssetRecord.item_id == context.claim.item_id,
                     RuntimeAssetRecord.state == "active",
                     RuntimeAssetRecord.role.in_(
-                        (
-                            "uploaded_source",
-                            "downloaded_audio",
-                            "cloud_audio",
-                            "local_audio",
-                        )
+                        tuple(disposable_roles)
                     ),
                 )
             ).all()
@@ -490,12 +500,6 @@ class TranscribeStageHandler:
             self.gpu_lease_duration,
         ):
             raise StageRequeue()
-        source = self._resolve_source(context, selected)
-        context.checkpoint()
-        try:
-            audio = self.media.prepare_for_local(context.claim.item_id, source)
-        except Exception:
-            raise StageExecutionError("local_audio_preparation_failed") from None
 
         def canceled() -> bool:
             try:
@@ -504,18 +508,45 @@ class TranscribeStageHandler:
                 return True
             return False
 
+        transcription_context = TranscriptionContext(
+            local_whisper=local,
+            cancel_requested=canceled,
+        )
+
+        # The real faster-whisper adapter can prove the model/CUDA runtime is
+        # available before a long PCM conversion. Test doubles and alternate
+        # adapters remain compatible because this preflight is optional.
+        ensure_available = getattr(self.local_transcriber, "ensure_available", None)
+        if callable(ensure_available):
+            try:
+                ensure_available(transcription_context)
+            except LocalAsrError as error:
+                if error.code == "local_asr_canceled":
+                    raise StageCancelled() from None
+                raise StageExecutionError(
+                    error.code,
+                    warning=fallback_reason,
+                ) from None
+
+        source = self._resolve_source(context, selected)
+        context.checkpoint()
+        try:
+            audio = self.media.prepare_for_local(context.claim.item_id, source)
+        except Exception:
+            raise StageExecutionError("local_audio_preparation_failed") from None
+
         try:
             result = self.local_transcriber.transcribe(
                 audio,
-                TranscriptionContext(
-                    local_whisper=local,
-                    cancel_requested=canceled,
-                ),
+                transcription_context,
             )
         except LocalAsrError as error:
             if error.code == "local_asr_canceled":
                 raise StageCancelled() from None
-            raise StageExecutionError(error.code) from None
+            raise StageExecutionError(
+                error.code,
+                warning=fallback_reason,
+            ) from None
         try:
             ensure_transcription_recovery(
                 self.paths,
@@ -679,8 +710,18 @@ class TranscribeStageHandler:
 
         source = self._resolve_source(context, selected)
         context.checkpoint()
+        cloud_profile = self._profile(profile)
+        inline_limit = (
+            None
+            if cloud_profile.cos_configured
+            else self.cloud_limits.inline_audio_bytes
+        )
         try:
-            audio = self.media.convert_for_cloud(context.claim.item_id, source)
+            audio = self.media.convert_for_cloud(
+                context.claim.item_id,
+                source,
+                max_bytes=inline_limit,
+            )
         except Exception:
             if mode == "cloud":
                 raise StageExecutionError("cloud_audio_preparation_failed") from None
@@ -690,7 +731,6 @@ class TranscribeStageHandler:
                 route="cloud_to_local",
                 fallback_reason="cloud_server_error",
             )
-        cloud_profile = self._profile(profile)
         eligibility = self.preflight.evaluate(
             audio,
             cloud_profile,

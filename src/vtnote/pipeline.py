@@ -84,6 +84,7 @@ _PROVIDER_IDS = frozenset(
         "bilibili",
         "faster_whisper",
         "tencent_recording_asr",
+        "tencent_tokenhub",
         "youtube",
     }
 )
@@ -98,6 +99,7 @@ _EVIDENCE_KEYS = (
 )
 _SOURCE_METHODS = frozenset(
     {
+        "platform_audio",
         "platform_subtitle",
         "uploaded_subtitle",
         "local_subtitle",

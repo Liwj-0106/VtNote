@@ -13,7 +13,12 @@ from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService
 from vtnote.database import initialize_database
 from vtnote.artifacts import ensure_transcript_json
-from vtnote.local_asr import AsrResult, LocalAsrProvenance
+from vtnote.local_asr import (
+    AsrResult,
+    LocalAsrError,
+    LocalAsrProvenance,
+    TranscriptionContext,
+)
 from vtnote.media import MediaInfo, PreparedAudio
 from vtnote.models import (
     CloudSubmissionRecord,
@@ -24,6 +29,7 @@ from vtnote.models import (
     TaskRecord,
 )
 from vtnote.paths import StoragePaths
+from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.provider_credentials import (
     TencentCredentialBundle,
     serialize_credential_bundle,
@@ -66,14 +72,20 @@ class FakeMedia:
     def __init__(self, prepared: PreparedAudio) -> None:
         self.prepared = prepared
         self.local_calls: list[tuple[str, Path]] = []
-        self.cloud_calls: list[tuple[str, Path]] = []
+        self.cloud_calls: list[tuple[str, Path, int | None]] = []
 
     def prepare_for_local(self, item_id: str, source: Path) -> PreparedAudio:
         self.local_calls.append((item_id, source))
         return self.prepared
 
-    def convert_for_cloud(self, item_id: str, source: Path) -> PreparedAudio:
-        self.cloud_calls.append((item_id, source))
+    def convert_for_cloud(
+        self,
+        item_id: str,
+        source: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> PreparedAudio:
+        self.cloud_calls.append((item_id, source, max_bytes))
         return self.prepared
 
 
@@ -85,6 +97,18 @@ class FakeLocalTranscriber:
     def transcribe(self, audio: PreparedAudio, context: object) -> AsrResult:
         self.calls.append((audio, context))
         return self.result
+
+
+class UnavailableLocalTranscriber:
+    def __init__(self) -> None:
+        self.preflight_calls: list[TranscriptionContext] = []
+
+    def ensure_available(self, context: TranscriptionContext) -> None:
+        self.preflight_calls.append(context)
+        raise LocalAsrError("model_not_installed")
+
+    def transcribe(self, audio: PreparedAudio, context: object) -> AsrResult:
+        raise AssertionError("unavailable local ASR must not receive converted audio")
 
 
 class FakeCloudClient:
@@ -219,10 +243,10 @@ def cloud_profile() -> dict[str, object]:
             "cos_configured": False,
         },
         "connection_revision": 1,
-        "model": "16k_zh_en_2.0",
+        "model": "16k_zh",
         "context_length": 8192,
         "options": {
-            "language_scope": "zh_en_dialects",
+            "language_scope": "zh_with_limited_english",
             "res_text_format": 3,
             "sentence_max_length": 20,
         },
@@ -249,6 +273,7 @@ def make_claim(
     *,
     mode: str,
     profile: dict[str, object] | None,
+    options: dict[str, object] | None = None,
 ) -> tuple[StoragePaths, object, WorkerStore, str]:
     selected_paths = paths(tmp_path)
     engine = initialize_database(selected_paths.database)
@@ -256,6 +281,7 @@ def make_claim(
     source.write_bytes(b"media")
     with Session(engine) as session:
         task = TaskRecord(
+            options=dict(options or {}),
             pipeline_snapshot_json={
                 "schema_version": 1,
                 "asr": {"mode": mode, "profile": profile},
@@ -331,6 +357,41 @@ def test_local_mode_publishes_once_without_cloud_call(tmp_path: Path) -> None:
     assert cloud.create_calls == 0
 
 
+def test_transcribe_retains_export_audio_when_enabled(tmp_path: Path) -> None:
+    selected_paths, claim, store, item_id = make_claim(
+        tmp_path,
+        mode="local",
+        profile=None,
+        options={"audio_export_enabled": True},
+    )
+    retained = selected_paths.downloaded_audio(item_id, "webm")
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    retained.write_bytes(b"retained-source-audio")
+    with Session(store.engine) as session:
+        RuntimeAssetService(session, selected_paths).register_staged(
+            item_id=item_id,
+            role="downloaded_audio",
+            relative_path=selected_paths.runtime_relative(retained),
+        )
+
+    handler = TranscribeStageHandler(
+        paths=selected_paths,
+        media=FakeMedia(prepared_audio(tmp_path, cloud=False)),
+        local_transcriber=FakeLocalTranscriber(local_result()),
+        cloud_client=FakeCloudClient(),
+        credential_resolver=credentials,
+    )
+    result = handler.run(StageContext(store, claim, lambda: NOW))
+    assert store.complete(claim, result, now=NOW + timedelta(seconds=1))
+
+    with Session(store.engine) as session:
+        active = RuntimeAssetService(session, selected_paths).active_for_role(
+            item_id=item_id,
+            role="downloaded_audio",
+        )
+        assert active is not None
+
+
 def test_auto_without_cloud_profile_routes_local_with_safe_reason(
     tmp_path: Path,
 ) -> None:
@@ -353,6 +414,31 @@ def test_auto_without_cloud_profile_routes_local_with_safe_reason(
     assert result.execution_evidence["fallback_reason"] == "cloud_profile_unavailable"
 
 
+def test_auto_local_fallback_preflights_model_before_pcm_conversion(
+    tmp_path: Path,
+) -> None:
+    selected_paths, claim, store, _ = make_claim(
+        tmp_path, mode="auto", profile=None
+    )
+    media = FakeMedia(prepared_audio(tmp_path, cloud=False))
+    local = UnavailableLocalTranscriber()
+    handler = TranscribeStageHandler(
+        paths=selected_paths,
+        media=media,
+        local_transcriber=local,
+        cloud_client=FakeCloudClient(),
+        credential_resolver=credentials,
+    )
+
+    with pytest.raises(StageExecutionError) as caught:
+        handler.run(StageContext(store, claim, lambda: NOW))
+
+    assert caught.value.code == "model_not_installed"
+    assert caught.value.warning == "cloud_profile_unavailable"
+    assert len(local.preflight_calls) == 1
+    assert media.local_calls == []
+
+
 def test_cloud_mode_without_snapshot_consent_stops_before_any_remote_call(
     tmp_path: Path,
 ) -> None:
@@ -360,9 +446,10 @@ def test_cloud_mode_without_snapshot_consent_stops_before_any_remote_call(
         tmp_path, mode="cloud", profile=None
     )
     cloud = FakeCloudClient()
+    media = FakeMedia(prepared_audio(tmp_path, cloud=True))
     handler = TranscribeStageHandler(
         paths=selected_paths,
-        media=FakeMedia(prepared_audio(tmp_path, cloud=True)),
+        media=media,
         local_transcriber=FakeLocalTranscriber(local_result()),
         cloud_client=cloud,
         credential_resolver=credentials,
@@ -382,9 +469,10 @@ def test_cloud_submit_defers_and_reconciler_wakes_query_only_publication(
         tmp_path, mode="cloud", profile=cloud_profile()
     )
     cloud = FakeCloudClient()
+    media = FakeMedia(prepared_audio(tmp_path, cloud=True))
     handler = TranscribeStageHandler(
         paths=selected_paths,
-        media=FakeMedia(prepared_audio(tmp_path, cloud=True)),
+        media=media,
         local_transcriber=FakeLocalTranscriber(local_result()),
         cloud_client=cloud,
         credential_resolver=credentials,
@@ -399,6 +487,7 @@ def test_cloud_submit_defers_and_reconciler_wakes_query_only_publication(
         now=NOW + timedelta(seconds=1),
     )
     assert cloud.create_calls == 1
+    assert media.cloud_calls[0][2] == 5_000_000
 
     query = SuccessQueryClient()
     reconciler = TencentSubmissionReconciler(
@@ -588,7 +677,7 @@ def test_cos_route_uses_deterministic_private_object_and_defers(
         converted=True,
         media_info=MediaInfo(
             duration_ms=selected_audio.media_info.duration_ms,
-            size_bytes=5_000_000,
+            size_bytes=5_000_001,
             format_name="ogg",
             audio_codec="opus",
             sample_rate=16_000,
@@ -597,9 +686,10 @@ def test_cos_route_uses_deterministic_private_object_and_defers(
     )
     cos = FakeCos()
     cloud = FakeCloudClient()
+    media = FakeMedia(selected_audio)
     handler = TranscribeStageHandler(
         paths=selected_paths,
-        media=FakeMedia(selected_audio),
+        media=media,
         local_transcriber=FakeLocalTranscriber(local_result()),
         cloud_client=cloud,
         credential_resolver=credentials,
@@ -610,6 +700,7 @@ def test_cos_route_uses_deterministic_private_object_and_defers(
         handler.run(StageContext(store, claim, lambda: NOW))
 
     assert cloud.create_calls == 1
+    assert media.cloud_calls[0][2] is None
     assert len(cos.puts) == 1
     assert len(cos.presigns) == 1
     with Session(store.engine) as session:
@@ -813,7 +904,13 @@ def test_cancel_during_audio_preparation_stops_before_paid_submit(
     )
 
     class CancelingMedia(FakeMedia):
-        def convert_for_cloud(self, item_id: str, source: Path) -> PreparedAudio:
+        def convert_for_cloud(
+            self,
+            item_id: str,
+            source: Path,
+            *,
+            max_bytes: int | None = None,
+        ) -> PreparedAudio:
             with Session(store.engine) as session:
                 task_id = session.get(StageRunRecord, claim.stage_run_id).item.task_id
                 TaskService(
@@ -826,7 +923,7 @@ def test_cancel_during_audio_preparation_stops_before_paid_submit(
                     selected_paths,
                     object(),
                 ).cancel_task(task_id)
-            return super().convert_for_cloud(item_id, source)
+            return super().convert_for_cloud(item_id, source, max_bytes=max_bytes)
 
     cloud = FakeCloudClient()
     handler = TranscribeStageHandler(
@@ -929,7 +1026,7 @@ def test_crash_after_cos_put_recovers_same_object_before_single_asr_create(
         converted=True,
         media_info=MediaInfo(
             duration_ms=4_000,
-            size_bytes=5_000_000,
+            size_bytes=5_000_001,
             format_name="ogg",
             audio_codec="opus",
             sample_rate=16_000,
@@ -997,7 +1094,7 @@ def test_unknown_cos_submission_keeps_deferred_remote_cleanup_deadline(
         converted=True,
         media_info=MediaInfo(
             duration_ms=4_000,
-            size_bytes=5_000_000,
+            size_bytes=5_000_001,
             format_name="ogg",
             audio_codec="opus",
             sample_rate=16_000,
@@ -1048,7 +1145,7 @@ def test_worker_persists_external_wait_and_yields_main_loop(
                     "source_method": "cloud_asr",
                     "asr_route": "cloud",
                     "provider": "tencent_recording_asr",
-                    "model": "16k_zh_en_2.0",
+                    "model": "16k_zh",
                 },
             )
 
@@ -1092,8 +1189,8 @@ def test_cloud_credentials_resolve_only_exact_snapshot_revisions(
             name="Tencent profile",
             purpose="cloud_asr",
             connection=connection,
-            model="16k_zh_en_2.0",
-            options={"language_scope": "zh_en_dialects"},
+            model="16k_zh",
+            options={"language_scope": "zh_with_limited_english"},
             revision=2,
         )
         session.add(profile)

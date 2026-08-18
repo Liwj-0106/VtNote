@@ -1,16 +1,16 @@
-# VtNote 安装与启动
+# VtNote 安装、启动与备份
 
-## 1. 环境位置
+VtNote 当前支持 Windows 10/11。本地进程只监听 `127.0.0.1:8765`，由一个
+supervisor 同时管理 FastAPI 和独立 Worker。
 
-- 项目：`D:\Workspace\Project\VtNote`
-- Conda 环境：建议使用 `vtnote`
-- 长期数据：`D:\Workspace\Project\VtNote-data`
-- 临时文件、日志和运行时：`D:\Workspace\Codex\cache\VtNote-runtime`
+## 环境要求
 
-不要把密钥写入 `.env`、数据库或启动脚本；界面会把腾讯云和阿里云密钥保存到
-Windows Credential Manager，并且 API 只返回 `has_secret`。
+- Conda；Python 固定为 3.11。
+- Node.js 24 与 npm。
+- NVIDIA GPU（本地 faster-whisper 路径仅支持 CUDA）。
+- FFmpeg/FFprobe；开发环境由 `environment.yml` 固定。
 
-## 2. 创建环境
+## 安装
 
 ```powershell
 cd D:\Workspace\Project\VtNote
@@ -18,61 +18,74 @@ conda env create -f environment.yml
 conda activate vtnote
 python -m pip install --requirement requirements.lock
 python -m pip install --no-deps --editable .
-```
 
-`environment.yml` 固定 Python、FFmpeg、CUDA、cuBLAS 和 cuDNN；`requirements.lock`
-固定 Python 包。不要用系统 Python 替代项目 Conda 环境。
-
-## 3. 构建前端
-
-需要 Node.js 24：
-
-```powershell
-cd D:\Workspace\Project\VtNote\frontend
+cd frontend
 npm ci
 npm run build
+cd ..
 ```
 
-生产模式只提供 `frontend\dist` 中的本地静态文件，不加载第三方字体、脚本或 CDN。
+环境已存在时使用 `conda env update -f environment.yml --prune`，再重复 pip 安装和
+前端构建。不要在运行时自动下载未登记的 Python、Deno 或模型组件。
 
-## 4. 启用 YouTube
-
-VtNote 固定使用 `yt-dlp 2026.7.4`、`yt-dlp-ejs 0.8.0` 和 Deno 2.8.1，
-并禁止远程 EJS、系统 Node 回退和自动升级。
-
-1. 从 Deno 官方发布页下载
-   `deno-x86_64-pc-windows-msvc.zip` 2.8.1。
-2. 执行固定哈希安装：
-
-```powershell
-python tools\install_youtube_runtime.py `
-  --archive D:\Downloads\deno-x86_64-pc-windows-msvc.zip `
-  --acknowledge-install
-```
-
-安装器验证归档 SHA-256
-`5fb5bac71f609fb91ec8960fb290885aadc27eeb22f07a8eca0c3db6be38b11a`
-和 `deno.exe` SHA-256
-`a8afddac131261dc9e085c6a1a79544f0567bd09e481034b5d1533588cba9b30`，
-只写入 D 盘运行时目录。腾讯云、百炼和模型文件仍需在界面中单独配置或下载。
-
-## 5. 启动
+## 启动与停止
 
 ```powershell
 conda activate vtnote
 vtnote
 ```
 
-启动器只监听 `127.0.0.1:8765`，监督 API 和 worker，并在退出时清理子进程。
-浏览器打开 `http://127.0.0.1:8765`。若端口被占用，启动器会直接报告
-`port_unavailable`，不会改用公网地址或随机端口。
+浏览器打开 `http://127.0.0.1:8765`。在启动终端按 `Ctrl+C`，supervisor 会依次停止
+API 和 Worker。
 
-## 6. 备份、升级与移除
+只读健康检查：
 
-- 备份：停止 VtNote 后复制整个 `VtNote-data`；它包含 SQLite、原始字幕、
-  `transcript.json`、译文和笔记，但不包含 Credential Manager 中的密钥。
-- 升级：备份数据，更新代码，在原 Conda 环境重新安装锁文件，重新运行
-  `npm ci && npm run build`，然后查看“设置 → 运行环境”。
-- 恢复：停止程序，用完整备份替换数据目录，再启动；不要只复制 `vtnote.db`。
-- 移除：先导出所需结果，再删除 Conda 环境、项目数据目录和 D 盘运行时目录；
-  最后在 Windows Credential Manager 中删除 VtNote 相关凭据。
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/api/health
+Invoke-RestMethod http://127.0.0.1:8765/api/readiness
+```
+
+## 首次配置
+
+1. 在“设置 → 管理 ASR”添加腾讯云录音文件识别凭据并验证。
+2. 较长音频若无法内联，需要配置私有 COS；应用只使用受控临时对象并在终态清理。
+3. 要生成 AI 笔记时，在“管理模型”添加并验证 TokenHub 连接；当前前端使用
+   `glm-5.1`。
+4. 本地 ASR 需在模型资产页面安装并校验 `large-v3-turbo`。未安装时不会把它当成
+   可用回退。
+
+连接验证会真实调用服务，可能产生少量用量。密钥保存于 Windows Credential
+Manager，不要写入源码、`.env`、文档或启动脚本。
+
+## 数据目录
+
+默认位置：
+
+```text
+%LOCALAPPDATA%\VtNote\Data
+%LOCALAPPDATA%\VtNote\Cache
+```
+
+可用两个绝对路径环境变量覆盖：
+
+```powershell
+$env:VTNOTE_DATA_ROOT = 'D:\VtNote\Data'
+$env:VTNOTE_RUNTIME_CACHE_ROOT = 'D:\VtNote\Cache'
+```
+
+两个根目录必须互不包含，并位于同一 Windows 盘符。目录内容和清理边界见
+[技术方案](technical-decisions.md#数据与存储)。
+
+## 备份与迁移
+
+1. 停止 VtNote。
+2. 备份完整 `Data`；若任务仍在运行或需要保留音频导出，也同时备份 `Cache`。
+3. Windows Credential Manager 中的云凭据不在文件备份内，需要单独重新配置。
+4. 迁移后保持两个根目录和数据库中文件引用一致，再启动应用检查内容库。
+
+`Cache` 包含可恢复任务的中间媒体和按需生成的音频导出，并非任何时候都能安全
+整目录删除。只使用应用内删除/回收机制，或在确认没有活动任务且不需要缓存产物后
+人工清理。
+
+DownKyi 与 VtNote 没有运行时集成。可把 DownKyi 单独下载得到的本地音视频作为普通
+本地文件导入 VtNote；VtNote 不读取其 Cookie、SQLite、aria2 会话或程序目录。

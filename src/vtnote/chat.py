@@ -163,7 +163,7 @@ class ChatResponse:
 
 @dataclass(frozen=True, slots=True)
 class ChatCapabilities:
-    protocol: Literal["aliyun_bailian"]
+    protocol: Literal["aliyun_bailian", "tencent_tokenhub"]
     endpoint: str
     response_format: Literal["json_object"]
     max_request_bytes: int
@@ -204,7 +204,10 @@ class ChatProfileSnapshot:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ChatProfileSnapshot":
-        if not isinstance(value, Mapping) or value.get("protocol") != "aliyun_bailian":
+        if (
+            not isinstance(value, Mapping)
+            or value.get("protocol") not in {"aliyun_bailian", "tencent_tokenhub"}
+        ):
             raise ValueError("invalid domestic chat profile snapshot")
         options = value.get("options")
         if not isinstance(options, Mapping):

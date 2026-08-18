@@ -116,7 +116,7 @@ export interface NoteResult {
 export interface ConnectionView {
   id: string;
   name: string;
-  protocol: "tencent_recording_asr" | "aliyun_bailian";
+  protocol: "tencent_recording_asr" | "aliyun_bailian" | "tencent_tokenhub";
   base_url: string;
   parameters: Record<string, unknown>;
   has_secret: boolean;
@@ -133,7 +133,7 @@ export interface ProfileView {
   name: string;
   purpose: "cloud_asr" | "translation" | "notes";
   connection_id: string;
-  protocol: "tencent_recording_asr" | "aliyun_bailian";
+  protocol: "tencent_recording_asr" | "aliyun_bailian" | "tencent_tokenhub";
   base_url: string;
   model: string;
   context_length: number;

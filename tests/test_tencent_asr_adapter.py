@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import wave
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,8 @@ from vtnote.provider_credentials import TencentCredentialBundle
 from vtnote.paths import StoragePaths
 from vtnote.runtime_assets import RuntimeAssetService
 from vtnote.tencent_asr import (
+    BUILTIN_ASR_TEST_SAMPLE_ID,
+    BuiltinSpeechSampleResolver,
     CloudAsrOutcome,
     CloudAsrOutcomeKind,
     CloudAsrRequestError,
@@ -179,14 +182,14 @@ def test_inline_create_makes_one_exact_canonical_request(tmp_path: Path) -> None
         "ChannelNum": 1,
         "Data": "YXVkaW8=",
         "DataLen": 5,
-        "EngineModelType": "16k_zh_en_2.0",
+        "EngineModelType": "16k_zh",
         "ResTextFormat": 3,
         "SentenceMaxLength": 20,
         "SourceType": 1,
     }
     assert call.body == (
         b'{"ChannelNum":1,"Data":"YXVkaW8=","DataLen":5,'
-        b'"EngineModelType":"16k_zh_en_2.0","ResTextFormat":3,'
+        b'"EngineModelType":"16k_zh","ResTextFormat":3,'
         b'"SentenceMaxLength":20,"SourceType":1}'
     )
     assert call.headers["Host"] == "asr.tencentcloudapi.com"
@@ -794,6 +797,72 @@ def test_connectivity_profile_test_submits_once_and_requires_timestamped_result(
     assert len(sleeps) == 1
 
 
+@pytest.mark.parametrize(
+    ("recognized", "expected"),
+    [
+        ("腾讯云语音识别测试。", True),
+        ("这是一段无关内容。", False),
+    ],
+)
+def test_builtin_profile_test_checks_recognized_phrase(
+    tmp_path: Path,
+    recognized: str,
+    expected: bool,
+) -> None:
+    client = ProfileClient(
+        [
+            CloudAsrOutcome(
+                CloudAsrOutcomeKind.SUCCESS,
+                "provider_success",
+                sentences=(TencentSentence(0, 900, recognized),),
+            )
+        ]
+    )
+    tester = TencentConnectivityTester(
+        client=client,
+        sample_resolver=lambda sample_id: (
+            prepared_audio(tmp_path)
+            if sample_id == BUILTIN_ASR_TEST_SAMPLE_ID
+            else pytest.fail("wrong sample")
+        ),
+        clock=lambda: NOW,
+        sleeper=lambda _: None,
+    )
+
+    result = tester.test_profile(
+        SimpleNamespace(protocol="tencent_recording_asr"),
+        context().credentials,
+        SimpleNamespace(
+            test_kind="provider_profile",
+            acknowledge_billable_request=True,
+            speech_sample_upload_id=BUILTIN_ASR_TEST_SAMPLE_ID,
+        ),
+        follow_redirects=False,
+    )
+
+    assert result.ok is expected
+
+
+def test_builtin_verification_audio_matches_tencent_16khz_contract() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "assets"
+        / "test-audio"
+        / "tencent-asr-check.wav"
+    )
+    sample = BuiltinSpeechSampleResolver(path)(BUILTIN_ASR_TEST_SAMPLE_ID)
+
+    assert sample.media_info.format_name == "wav"
+    assert sample.media_info.audio_codec == "pcm_s16le"
+    assert sample.media_info.sample_rate == 16_000
+    assert sample.media_info.channels == 1
+    assert 2_000 <= sample.media_info.duration_ms <= 10_000
+    with wave.open(str(path), "rb") as audio:
+        assert audio.getframerate() == 16_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+
+
 def test_connectivity_profile_test_rejects_sample_outside_two_to_ten_seconds(
     tmp_path: Path,
 ) -> None:
@@ -839,14 +908,14 @@ def test_connectivity_profile_test_rejects_oversize_before_reading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     selected = prepared_audio(tmp_path)
-    selected.path.write_bytes(b"x" * 4_500_001)
+    selected.path.write_bytes(b"x" * 5_000_001)
     oversized = PreparedAudio(
         path=selected.path,
         asset_id=selected.asset_id,
         converted=True,
         media_info=MediaInfo(
             duration_ms=3_000,
-            size_bytes=4_500_001,
+            size_bytes=5_000_001,
             format_name="ogg",
             audio_codec="opus",
             sample_rate=16_000,

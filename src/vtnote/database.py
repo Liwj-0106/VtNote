@@ -27,6 +27,7 @@ from vtnote.sensitive_text import (
     SensitiveTextProtector,
     migrate_sensitive_text,
 )
+from vtnote.tencent_contract import TENCENT_ASR_MODEL, TENCENT_LANGUAGE_SCOPE
 
 
 _BOOTSTRAP_LOCK = threading.Lock()
@@ -136,6 +137,41 @@ def _migrate_default_local_whisper_device(engine: Engine) -> None:
         migrated = dict(options)
         migrated["device"] = "cuda"
         defaults.local_whisper_options = migrated
+        session.commit()
+
+
+def _migrate_tencent_profiles_to_free_tier(engine: Engine) -> None:
+    """Move active Tencent profiles to the standard monthly-free engine."""
+
+    with Session(engine) as session:
+        profiles = session.scalars(
+            select(ProcessorProfileRecord)
+            .join(ProviderConnectionRecord)
+            .where(
+                ProcessorProfileRecord.archived_at.is_(None),
+                ProcessorProfileRecord.purpose == "cloud_asr",
+                ProviderConnectionRecord.protocol == "tencent_recording_asr",
+                ProcessorProfileRecord.model != TENCENT_ASR_MODEL,
+            )
+        ).all()
+        if not profiles:
+            return
+        for profile in profiles:
+            profile.model = TENCENT_ASR_MODEL
+            profile.options = {
+                "language_scope": TENCENT_LANGUAGE_SCOPE,
+                "res_text_format": 3,
+                "sentence_max_length": 20,
+            }
+            profile.revision += 1
+            profile.test_ok = None
+            profile.tested_revision = None
+            profile.tested_connection_revision = None
+            profile.test_message = None
+            profile.tested_at = None
+            profile.upload_authorized_revision = None
+            profile.upload_authorized_connection_revision = None
+            profile.capability_fingerprint_json = None
         session.commit()
 
 
@@ -345,6 +381,7 @@ def initialize_database(
             _migrate_legacy_cloud_provider(engine)
             _migrate_legacy_chat_provider(engine)
             _migrate_default_local_whisper_device(engine)
+            _migrate_tencent_profiles_to_free_tier(engine)
     except Exception:
         engine.dispose()
         raise

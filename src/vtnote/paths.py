@@ -21,9 +21,25 @@ _LANGUAGE_RE = re.compile(
     r"(?:-(?:[A-Za-z0-9]{5,8}|\d[A-Za-z0-9]{3}))*$"
 )
 _SOURCE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "json"})
-_AUDIO_EXTENSIONS = frozenset({"wav", "mp3", "m4a", "flac", "ogg", "opus", "webm"})
+_AUDIO_EXTENSIONS = frozenset(
+    {"aac", "wav", "mp3", "m4a", "flac", "ogg", "opus", "webm"}
+)
 _MEDIA_EXTENSIONS = frozenset(
-    {"mp4", "mkv", "mov", "webm", "avi", "m4v", "mp3", "m4a", "wav", "flac", "ogg", "opus"}
+    {
+        "mp4",
+        "mkv",
+        "mov",
+        "webm",
+        "avi",
+        "m4v",
+        "aac",
+        "mp3",
+        "m4a",
+        "wav",
+        "flac",
+        "ogg",
+        "opus",
+    }
 )
 _UPLOAD_EXTENSIONS = _SOURCE_EXTENSIONS | _MEDIA_EXTENSIONS
 
@@ -196,8 +212,22 @@ class StoragePaths:
     def cloud_ogg(self, item_id: str | UUID) -> Path:
         return self.runtime("items", _uuid_component(item_id), "audio", "cloud.ogg")
 
+    def cloud_inline_ogg(self, item_id: str | UUID) -> Path:
+        return self.runtime(
+            "items", _uuid_component(item_id), "audio", "cloud-inline.ogg"
+        )
+
     def local_prepared_audio(self, item_id: str | UUID) -> Path:
         return self.runtime("items", _uuid_component(item_id), "audio", "local.wav")
+
+    def export_audio(self, item_id: str | UUID, extension: str) -> Path:
+        normalized = _extension(extension, frozenset({"m4a", "mp3"}))
+        return self.runtime(
+            "items",
+            _uuid_component(item_id),
+            "audio",
+            f"export.{normalized}",
+        )
 
     def conversion_staging(
         self, item_id: str | UUID, staging_id: str | UUID, extension: str

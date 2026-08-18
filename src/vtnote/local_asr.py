@@ -274,6 +274,19 @@ class FasterWhisperTranscriber:
         self._model_path = installed_path
         return model
 
+    def ensure_available(
+        self,
+        context: TranscriptionContext,
+    ) -> WhisperModelLike:
+        """Validate and load the fixed local runtime before media conversion."""
+
+        cache_root = self._validate_options(context)
+        self._raise_if_canceled(context)
+        self._cuda_ready()
+        model = self._load_model(cache_root)
+        self._raise_if_canceled(context)
+        return model
+
     @staticmethod
     def _segment(value: object, index: int) -> TranscriptSegment:
         start = getattr(value, "start", None)
@@ -335,12 +348,8 @@ class FasterWhisperTranscriber:
         audio: PreparedAudio,
         context: TranscriptionContext,
     ) -> AsrResult:
-        cache_root = self._validate_options(context)
         self._validate_audio(audio)
-        self._raise_if_canceled(context)
-        self._cuda_ready()
-        model = self._load_model(cache_root)
-        self._raise_if_canceled(context)
+        model = self.ensure_available(context)
         kwargs: dict[str, object] = {
             "task": "transcribe",
             "vad_filter": _FIXED_VAD,

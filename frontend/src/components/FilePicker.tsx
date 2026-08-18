@@ -23,13 +23,14 @@ export function FilePicker({
         accept={accept}
         onChange={(event) => onChange(event.currentTarget.files?.[0] ?? null)}
       />
-      <label className="file-picker-target" htmlFor={id}>
+      <label
+        className={`file-picker-target ${file ? "has-file" : ""}`}
+        htmlFor={id}
+      >
         <span className="file-picker-action">
-          {file ? "更换文件" : "选择文件"}
+          {file ? "更换文件" : "上传文件"}
         </span>
-        <span className="file-picker-copy">
-          {file ? file.name : "从电脑中选择，不会显示本机路径"}
-        </span>
+        {file && <span className="file-picker-copy">{file.name}</span>}
       </label>
       {file && (
         <p className={`field-hint ${tooLarge ? "field-error" : ""}`}>

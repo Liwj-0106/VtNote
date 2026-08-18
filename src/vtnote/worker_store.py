@@ -230,8 +230,16 @@ class WorkerStore:
         item: ItemRecord,
     ) -> None:
         latest = cls._latest_by_stage(item)
+        statuses = {stage: row.status for stage, row in latest.items()}
+        snapshot = item.task.pipeline_snapshot_json
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("output_type") == "audio"
+            and "transcribe" not in statuses
+        ):
+            statuses["transcribe"] = "skipped"
         item.status = aggregate_item_status(
-            {stage: row.status for stage, row in latest.items()},
+            statuses,
             has_warnings=any(row.warning is not None for row in latest.values()),
         )
         task = item.task
@@ -293,6 +301,19 @@ class WorkerStore:
             )
         )
 
+    @staticmethod
+    def _source_input_ready(item: ItemRecord, stage: str) -> bool:
+        """Keep upload stages unclaimable until ownership registration commits."""
+
+        if stage != "source" or item.source_kind not in {
+            "uploaded_media",
+            "uploaded_subtitle",
+        }:
+            return True
+        # Upload completion binds the verified asset locator and display name in one
+        # transaction. The initial upload task intentionally has no display name.
+        return item.source_display_name is not None
+
     def claim_next(
         self,
         worker_id: str,
@@ -320,6 +341,8 @@ class WorkerStore:
                     latest = self._latest_by_stage(item)
                     for stage, row in latest.items():
                         if row.status != "queued" or stage not in STAGE_ORDER:
+                            continue
+                        if not self._source_input_ready(item, stage):
                             continue
                         dependencies = STAGE_DEPENDENCIES[stage]
                         if any(

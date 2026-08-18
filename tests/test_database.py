@@ -151,6 +151,63 @@ def test_existing_default_device_auto_migrates_to_cuda(tmp_path: Path) -> None:
         migrated.dispose()
 
 
+def test_startup_moves_active_tencent_profiles_to_free_tier_model(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "tencent-free-tier-migration.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        connection = ProviderConnectionRecord(
+            name="Tencent ASR",
+            protocol="tencent_recording_asr",
+            base_url="https://asr.tencentcloudapi.com",
+            parameters={"region": "ap-guangzhou"},
+            credential_ref="connection:tencent",
+        )
+        profile = ProcessorProfileRecord(
+            name="Tencent ASR profile",
+            purpose="cloud_asr",
+            connection=connection,
+            model="16k_zh_en_2.0",
+            context_length=32768,
+            options={
+                "language_scope": "zh_en_dialects",
+                "res_text_format": 3,
+                "sentence_max_length": 20,
+            },
+            test_ok=True,
+            tested_revision=1,
+            tested_connection_revision=1,
+            upload_authorized_revision=1,
+            upload_authorized_connection_revision=1,
+        )
+        task = TaskRecord(
+            pipeline_snapshot_json={"profile": {"model": "16k_zh_en_2.0"}}
+        )
+        session.add_all([profile, task])
+        session.commit()
+        profile_id = profile.id
+        task_id = task.id
+    engine.dispose()
+
+    migrated = initialize_database(database_path)
+    try:
+        with Session(migrated) as session:
+            profile = session.get(ProcessorProfileRecord, profile_id)
+            task = session.get(TaskRecord, task_id)
+            assert profile is not None
+            assert profile.model == "16k_zh"
+            assert profile.options["language_scope"] == "zh_with_limited_english"
+            assert profile.revision == 2
+            assert profile.test_ok is None
+            assert profile.tested_revision is None
+            assert profile.upload_authorized_revision is None
+            assert task is not None
+            assert task.pipeline_snapshot_json["profile"]["model"] == "16k_zh_en_2.0"
+    finally:
+        migrated.dispose()
+
+
 def test_startup_archives_volc_configuration_and_fails_active_snapshots_closed(
     tmp_path: Path,
 ) -> None:

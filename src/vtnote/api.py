@@ -25,7 +25,13 @@ from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.diagnostics import diagnostic_bundle_bytes
 from vtnote.exports import ExportFormat, render_execution_summary
-from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor, MediaError
+from vtnote.media import (
+    MEDIA_EXTENSIONS,
+    CommandRunner,
+    FfmpegBinaries,
+    FfmpegMediaProcessor,
+    MediaError,
+)
 from vtnote.model_assets import ModelAssetError, ModelAssetService
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.platform_sources import build_default_platform_registry
@@ -48,9 +54,18 @@ from vtnote.sensitive_text import (
 )
 from vtnote.tasks import InvalidTaskOperation, LocalSourceValidator, TaskService
 from vtnote.tencent_asr import (
+    BUILTIN_ASR_TEST_SAMPLE_ID,
+    BuiltinSpeechSampleResolver,
+    SpeechSampleResolver,
     TencentConnectivityTester,
     TencentRecordingClient,
     UploadedSpeechSampleResolver,
+)
+from vtnote.tencent_contract import TENCENT_ASR_MODEL, TENCENT_LANGUAGE_SCOPE
+from vtnote.tokenhub_chat import (
+    TOKENHUB_DEFAULT_CONTEXT_LENGTH,
+    TOKENHUB_DEFAULT_MODEL,
+    TokenHubProfileTester,
 )
 from vtnote.uploads import (
     LocalSourceFiles,
@@ -165,6 +180,16 @@ class ProfileTestInput(InputModel):
     )
 
 
+class AsrConnectionVerifyInput(InputModel):
+    acknowledge_billable_request: bool = False
+    authorize_task_audio_upload: bool = False
+
+
+class ChatConnectionVerifyInput(InputModel):
+    acknowledge_billable_request: bool = False
+    authorize_chat_data_upload: bool = False
+
+
 class ChatDataAuthorizationInput(InputModel):
     acknowledge_chat_data_upload: bool
 
@@ -212,6 +237,8 @@ class SourceInput(InputModel):
 
 class TaskCreate(InputModel):
     sources: list[SourceInput]
+    output_type: Literal["audio", "transcript", "notes"] | None = None
+    audio_export_enabled: bool | None = None
     asr_mode: Literal["auto", "cloud", "local"] | None = None
     cloud_asr_profile_id: str | None = None
     translation_enabled: bool | None = None
@@ -228,6 +255,8 @@ class UploadTaskMetadata(InputModel):
     """The first multipart part; the second and final part is always ``file``."""
 
     kind: Literal["media", "subtitle"]
+    output_type: Literal["audio", "transcript", "notes"] | None = None
+    audio_export_enabled: bool | None = None
     asr_mode: Literal["auto", "cloud", "local"] | None = None
     cloud_asr_profile_id: str | None = None
     translation_enabled: bool | None = None
@@ -356,17 +385,28 @@ def create_app(
         resolver=selected_resolver,
         session_factory=sessions,
     )
+    uploaded_speech_samples = UploadedSpeechSampleResolver(
+        engine=selected_engine,
+        paths=paths,
+    )
+    built_in_speech_samples = BuiltinSpeechSampleResolver(
+        Path(__file__).resolve().parents[2]
+        / "assets"
+        / "test-audio"
+        / "tencent-asr-check.wav"
+    )
     default_tencent_tester = TencentConnectivityTester(
         client=TencentRecordingClient(),
-        sample_resolver=UploadedSpeechSampleResolver(
-            engine=selected_engine,
-            paths=paths,
+        sample_resolver=SpeechSampleResolver(
+            builtin=built_in_speech_samples,
+            uploaded=uploaded_speech_samples,
         ),
     )
     selected_connection_tester = (
         connection_tester or default_tencent_tester
     )
     default_bailian_tester = BailianProfileTester()
+    default_tokenhub_tester = TokenHubProfileTester()
     model_assets = ModelAssetService(
         engine=selected_engine,
         paths=paths,
@@ -467,7 +507,7 @@ def create_app(
 
     @app.exception_handler(RuntimeAssetError)
     async def runtime_asset_error(_: Request, error: RuntimeAssetError):
-        status = 404 if error.code == "asset_not_found" else 409
+        status = 404 if error.code in {"asset_not_found", "audio_not_found"} else 409
         if error.code in {"invalid_asset_id", "invalid_item_id"}:
             status = 400
         return _error(
@@ -525,7 +565,7 @@ def create_app(
         cleanup_session = sessions()
         try:
             cleanup_assets = RuntimeAssetService(cleanup_session, paths)
-            for role in ("uploaded_source", "cloud_audio"):
+            for role in ("uploaded_source", "cloud_audio", "cloud_audio_inline"):
                 active = cleanup_assets.active_for_role(item_id=item_id, role=role)
                 if active is not None:
                     cleanup_assets.trash(active.id)
@@ -639,10 +679,16 @@ def create_app(
             session.close()
 
     @app.delete("/api/connections/{connection_id}", status_code=204)
-    def delete_connection(connection_id: str):
+    def delete_connection(
+        connection_id: str,
+        cascade_profiles: bool = Query(default=False),
+    ):
         session, configuration, _ = services()
         try:
-            configuration.delete_connection(connection_id)
+            configuration.delete_connection(
+                connection_id,
+                cascade_profiles=cascade_profiles,
+            )
             return Response(status_code=204)
         finally:
             session.close()
@@ -652,7 +698,7 @@ def create_app(
         session, configuration, _ = services()
         try:
             view = configuration.get_connection(connection_id)
-            if view.protocol == "aliyun_bailian":
+            if view.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
                 return _dump(
                     configuration.record_connection_test(
                         connection_id,
@@ -688,6 +734,193 @@ def create_app(
                     connection_id, ok=result.ok, message=safe_message
                 )
             )
+        finally:
+            session.close()
+
+    @app.post("/api/connections/{connection_id}/verify-asr")
+    def verify_asr_connection(
+        connection_id: str,
+        payload: AsrConnectionVerifyInput,
+    ):
+        if not payload.acknowledge_billable_request:
+            return _error(
+                400,
+                "billable_test_ack_required",
+                "ASR verification may create a small provider charge",
+            )
+        if not payload.authorize_task_audio_upload:
+            return _error(
+                400,
+                "audio_upload_consent_required",
+                "ASR verification requires explicit task audio authorization",
+            )
+        session, configuration, _ = services()
+        try:
+            connection = configuration.get_connection(connection_id)
+            if connection.protocol != "tencent_recording_asr":
+                return _error(
+                    400,
+                    "invalid_asr_connection",
+                    "connection does not support Tencent ASR verification",
+                )
+            profile = next(
+                (
+                    candidate
+                    for candidate in configuration.list_profiles()
+                    if candidate.connection_id == connection_id
+                    and candidate.purpose == "cloud_asr"
+                ),
+                None,
+            )
+            if profile is None:
+                profile = configuration.create_profile(
+                    name=f"{connection.name} ASR",
+                    purpose="cloud_asr",
+                    connection_id=connection_id,
+                    model=TENCENT_ASR_MODEL,
+                    context_length=32768,
+                    options={
+                        "language_scope": TENCENT_LANGUAGE_SCOPE,
+                        "res_text_format": 3,
+                        "sentence_max_length": 20,
+                    },
+                )
+            credentials = configuration.credential_bundle_for_connection(
+                connection_id
+            )
+            test_input = ProfileTestInput(
+                test_kind="provider_profile",
+                acknowledge_billable_request=True,
+                speech_sample_upload_id=BUILTIN_ASR_TEST_SAMPLE_ID,
+            )
+            selected_tester = profile_tester or default_tencent_tester
+            try:
+                result = selected_tester.test_profile(
+                    profile,
+                    credentials,
+                    test_input,
+                    follow_redirects=False,
+                )
+            except Exception:
+                result = ConnectivityResult(False, "ASR verification failed")
+            logger.info(
+                "tencent_asr_verification ok=%s result=%s",
+                result.ok,
+                result.message or "none",
+            )
+            connection = configuration.record_connection_test(
+                connection_id,
+                ok=result.ok,
+                message=result.message,
+            )
+            profile = configuration.record_profile_test(
+                profile.id,
+                ok=result.ok,
+                message=result.message,
+            )
+            if result.ok:
+                profile = configuration.authorize_cloud_upload(profile.id)
+                configuration.update_defaults(
+                    asr_mode="auto",
+                    cloud_asr_profile_id=profile.id,
+                )
+            return {
+                "connection": _dump(connection),
+                "profile": _dump(profile),
+            }
+        finally:
+            session.close()
+
+    @app.post("/api/connections/{connection_id}/verify-chat")
+    def verify_chat_connection(
+        connection_id: str,
+        payload: ChatConnectionVerifyInput,
+    ):
+        if not payload.acknowledge_billable_request:
+            return _error(
+                400,
+                "billable_test_ack_required",
+                "AI model verification may consume provider quota",
+            )
+        if not payload.authorize_chat_data_upload:
+            return _error(
+                400,
+                "chat_data_consent_required",
+                "AI notes require explicit subtitle text authorization",
+            )
+        session, configuration, _ = services()
+        try:
+            connection = configuration.get_connection(connection_id)
+            if connection.protocol != "tencent_tokenhub":
+                return _error(
+                    400,
+                    "invalid_chat_connection",
+                    "connection does not support TokenHub verification",
+                )
+            profile = next(
+                (
+                    candidate
+                    for candidate in configuration.list_profiles()
+                    if candidate.connection_id == connection_id
+                    and candidate.purpose == "notes"
+                ),
+                None,
+            )
+            if profile is None:
+                profile = configuration.create_profile(
+                    name=f"{connection.name} GLM-5.1",
+                    purpose="notes",
+                    connection_id=connection_id,
+                    model=TOKENHUB_DEFAULT_MODEL,
+                    context_length=TOKENHUB_DEFAULT_CONTEXT_LENGTH,
+                    options={
+                        "temperature": 0.2,
+                        "max_tokens": 4096,
+                        "enable_thinking": False,
+                    },
+                )
+            credentials = configuration.credential_bundle_for_connection(
+                connection_id
+            )
+            test_input = ProfileTestInput(
+                test_kind="profile_capability_tested",
+                acknowledge_billable_request=True,
+            )
+            selected_tester = profile_tester or default_tokenhub_tester
+            try:
+                result = selected_tester.test_profile(
+                    profile,
+                    credentials,
+                    test_input,
+                    follow_redirects=False,
+                )
+            except Exception:
+                result = ConnectivityResult(False, "AI model verification failed")
+            logger.info(
+                "tokenhub_verification ok=%s result=%s",
+                result.ok,
+                result.message or "none",
+            )
+            connection = configuration.record_connection_test(
+                connection_id,
+                ok=result.ok,
+                message=result.message,
+            )
+            profile = configuration.record_profile_test(
+                profile.id,
+                ok=result.ok,
+                message=result.message,
+            )
+            if result.ok:
+                profile = configuration.authorize_chat_data(profile.id)
+                configuration.update_defaults(
+                    notes_enabled=True,
+                    notes_profile_id=profile.id,
+                )
+            return {
+                "connection": _dump(connection),
+                "profile": _dump(profile),
+            }
         finally:
             session.close()
 
@@ -740,14 +973,14 @@ def create_app(
         sample_to_cleanup: str | None = None
         try:
             profile = configuration.get_profile(profile_id)
-            if profile.protocol == "aliyun_bailian":
+            if profile.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
                 if payload.test_kind == "connection_policy_validated":
                     return _dump(profile)
                 if payload.test_kind != "profile_capability_tested":
                     return _error(
                         400,
                         "invalid_profile_test_kind",
-                        "Bailian profile requires a capability test",
+                        "chat profile requires a capability test",
                     )
             elif payload.test_kind in {
                 "connection_policy_validated",
@@ -761,7 +994,11 @@ def create_app(
             if (
                 profile_tester is None
                 and profile.protocol
-                not in {"tencent_recording_asr", "aliyun_bailian"}
+                not in {
+                    "tencent_recording_asr",
+                    "aliyun_bailian",
+                    "tencent_tokenhub",
+                }
             ):
                 return _error(
                     501,
@@ -813,11 +1050,12 @@ def create_app(
             credentials = configuration.credential_bundle_for_connection(
                 profile.connection_id
             )
-            selected_profile_tester = (
-                profile_tester
-                or (
-                    default_bailian_tester
-                    if profile.protocol == "aliyun_bailian"
+            selected_profile_tester = profile_tester or (
+                default_bailian_tester
+                if profile.protocol == "aliyun_bailian"
+                else (
+                    default_tokenhub_tester
+                    if profile.protocol == "tencent_tokenhub"
                     else default_tencent_tester
                 )
             )
@@ -1246,6 +1484,60 @@ def create_app(
         finally:
             session.close()
 
+    def item_audio_source(
+        assets: RuntimeAssetService, item_id: str
+    ) -> Path | None:
+        for role in (
+            "downloaded_audio",
+            "uploaded_source",
+            "cloud_audio_inline",
+            "cloud_audio",
+            "local_audio",
+        ):
+            view = assets.active_for_role(item_id=item_id, role=role)
+            if view is None:
+                continue
+            resolved = assets.resolve(view.id)
+            if resolved.suffix.removeprefix(".").casefold() in MEDIA_EXTENSIONS:
+                return resolved
+        return None
+
+    @app.get("/api/items/{item_id}/outcomes")
+    def get_item_outcomes(item_id: str):
+        session, _, tasks = services()
+        try:
+            outcomes = tasks.item_outcomes(item_id)
+            audio = item_audio_source(RuntimeAssetService(session, paths), item_id)
+            return {"audio": audio is not None, **outcomes}
+        finally:
+            session.close()
+
+    @app.get("/api/items/{item_id}/audio")
+    def download_item_audio(
+        item_id: str,
+        format: Literal["m4a", "mp3"] = "m4a",
+    ):
+        session, _, tasks = services()
+        try:
+            tasks.item_outcomes(item_id)
+            assets = RuntimeAssetService(session, paths)
+            source = item_audio_source(assets, item_id)
+            if source is None:
+                raise RuntimeAssetError("audio_not_found")
+            prepared = FfmpegMediaProcessor(
+                runner=CommandRunner(),
+                binaries=FfmpegBinaries.discover(),
+                paths=paths,
+                assets=assets,
+            ).export_audio(item_id, source, format)
+            return FileResponse(
+                prepared.path,
+                media_type="audio/mp4" if format == "m4a" else "audio/mpeg",
+                filename=f"vtnote-{item_id[:8]}-audio.{format}",
+            )
+        finally:
+            session.close()
+
     @app.get("/api/items/{item_id}/execution-summary")
     def get_item_execution_summary(
         item_id: str,
@@ -1359,6 +1651,7 @@ def create_app(
             "settings",
             "settings/setup",
             "settings/connections",
+            "settings/ai-connections",
             "settings/storage",
         }
 

@@ -22,6 +22,7 @@ from vtnote.youtube_runtime import YoutubeRuntime, YoutubeRuntimeManifest
 from vtnote.ytdlp_bridge import (
     BoundTransportScope,
     VtNoteRequestHandlerRH,
+    build_controlled_platform_ytdlp,
     build_controlled_ytdlp,
 )
 
@@ -495,6 +496,24 @@ def test_controlled_builder_uses_static_output_and_runtime_options_only(
             scope=probe_scope(),
             options={"nocheckcertificate": True},
         )
+
+
+def test_bilibili_builder_accepts_owned_absolute_output_root(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "bilibili"
+
+    bridge = build_controlled_platform_ytdlp(
+        FakeTransport([]),
+        output_root,
+        scope=bilibili_probe_scope(),
+    )
+
+    assert output_root.is_dir()
+    assert bridge.params["outtmpl"] == {
+        "default": str(output_root / "source.%(ext)s")
+    }
+    assert bridge.params["js_runtimes"] == {}
 
 
 def test_probe_forces_download_false(

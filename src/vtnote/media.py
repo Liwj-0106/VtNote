@@ -19,9 +19,47 @@ from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 
 
 MEDIA_EXTENSIONS = frozenset(
-    {"mp4", "mkv", "mov", "webm", "avi", "m4v", "mp3", "m4a", "wav", "flac", "ogg", "opus"}
+    {
+        "mp4",
+        "mkv",
+        "mov",
+        "webm",
+        "avi",
+        "m4v",
+        "aac",
+        "mp3",
+        "m4a",
+        "wav",
+        "flac",
+        "ogg",
+        "opus",
+    }
 )
-CLOUD_OPUS_BITRATE = "32k"
+CLOUD_OPUS_BITRATE_KBPS = 32
+CLOUD_OPUS_MIN_BITRATE_KBPS = 12
+# Raw AAC containers can report a shorter duration than the decoded stream. Keep
+# enough headroom for that drift and for codec/container overhead before the
+# final, authoritative byte-size preflight.
+CLOUD_OPUS_TARGET_HEADROOM = 0.75
+
+
+def cloud_opus_bitrate(duration_ms: int, max_bytes: int | None = None) -> str:
+    """Choose the highest bounded speech bitrate likely to fit an inline request."""
+
+    if type(duration_ms) is not int or duration_ms <= 0:
+        raise ValueError("duration must be a positive integer")
+    if max_bytes is None:
+        return f"{CLOUD_OPUS_BITRATE_KBPS}k"
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("maximum bytes must be a positive integer")
+    target_kbps = math.floor(
+        max_bytes * 8 * CLOUD_OPUS_TARGET_HEADROOM / duration_ms
+    )
+    bounded = max(
+        CLOUD_OPUS_MIN_BITRATE_KBPS,
+        min(CLOUD_OPUS_BITRATE_KBPS, target_kbps),
+    )
+    return f"{bounded}k"
 
 
 class CommandError(RuntimeError):
@@ -156,12 +194,22 @@ class FfmpegBinaries:
 
     @classmethod
     def discover(cls) -> "FfmpegBinaries":
-        conda_bin = Path(sys.prefix) / "Library" / "bin"
-        ffmpeg = conda_bin / "ffmpeg.exe"
-        ffprobe = conda_bin / "ffprobe.exe"
+        prefix = Path(sys.prefix)
+        windows_bin = prefix / "Library" / "bin"
+        posix_bin = prefix / "bin"
+        ffmpeg_candidates = (
+            windows_bin / "ffmpeg.exe",
+            posix_bin / "ffmpeg",
+        )
+        ffprobe_candidates = (
+            windows_bin / "ffprobe.exe",
+            posix_bin / "ffprobe",
+        )
+        ffmpeg = next((path for path in ffmpeg_candidates if path.is_file()), None)
+        ffprobe = next((path for path in ffprobe_candidates if path.is_file()), None)
         return cls(
-            ffmpeg=str(ffmpeg if ffmpeg.is_file() else shutil.which("ffmpeg") or "ffmpeg"),
-            ffprobe=str(ffprobe if ffprobe.is_file() else shutil.which("ffprobe") or "ffprobe"),
+            ffmpeg=str(ffmpeg or shutil.which("ffmpeg") or "ffmpeg"),
+            ffprobe=str(ffprobe or shutil.which("ffprobe") or "ffprobe"),
         )
 
 
@@ -460,15 +508,75 @@ class FfmpegMediaProcessor:
             raise MediaError("invalid_local_audio")
         return info
 
-    def convert_for_cloud(self, item_id: str, source: Path) -> PreparedAudio:
+    def _validate_export_output(self, path: Path, export_format: str) -> MediaInfo:
+        info = self.probe_local(path)
+        formats = {
+            name.strip().casefold()
+            for name in info.format_name.split(",")
+            if name.strip()
+        }
+        if export_format == "m4a":
+            if info.audio_codec != "aac" or not formats.intersection(
+                {"mov", "mp4", "m4a"}
+            ):
+                raise MediaError("invalid_m4a_export")
+        elif export_format == "mp3":
+            if info.audio_codec not in {"mp3", "mp3float"} or "mp3" not in formats:
+                raise MediaError("invalid_mp3_export")
+        else:
+            raise MediaError("invalid_audio_export_format")
+        return info
+
+    def export_audio(
+        self, item_id: str, source: Path, export_format: str
+    ) -> PreparedAudio:
+        normalized = export_format.casefold()
+        if normalized not in {"m4a", "mp3"}:
+            raise MediaError("invalid_audio_export_format")
         self.probe_local(source)
         paths, _ = self._runtime_dependencies()
-        destination = paths.cloud_ogg(item_id)
+        destination = paths.export_audio(item_id, normalized)
+        if normalized == "m4a":
+            audio_args = ("-c:a", "aac", "-b:a", "192k", "-f", "ipod")
+        else:
+            audio_args = (
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                "-f",
+                "mp3",
+            )
         asset_id, output, info = self._run_conversion(
             item_id=item_id,
             source=source,
             destination=destination,
-            role="cloud_audio",
+            role=f"export_audio_{normalized}",
+            audio_args=audio_args,
+            validate_output=lambda path: self._validate_export_output(path, normalized),
+        )
+        return PreparedAudio(output, asset_id, True, info)
+
+    def convert_for_cloud(
+        self,
+        item_id: str,
+        source: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> PreparedAudio:
+        source_info = self.probe_local(source)
+        paths, _ = self._runtime_dependencies()
+        inline = max_bytes is not None
+        destination = (
+            paths.cloud_inline_ogg(item_id) if inline else paths.cloud_ogg(item_id)
+        )
+        bitrate = cloud_opus_bitrate(source_info.duration_ms, max_bytes)
+        rate_control = ("-vbr", "off") if inline else ()
+        asset_id, output, info = self._run_conversion(
+            item_id=item_id,
+            source=source,
+            destination=destination,
+            role="cloud_audio_inline" if inline else "cloud_audio",
             validate_output=self._validate_cloud_output,
             audio_args=(
                 "-ac",
@@ -478,7 +586,8 @@ class FfmpegMediaProcessor:
                 "-c:a",
                 "libopus",
                 "-b:a",
-                CLOUD_OPUS_BITRATE,
+                bitrate,
+                *rate_control,
                 "-application",
                 "voip",
                 "-f",

@@ -48,6 +48,7 @@ from vtnote.schemas import (
     Translation,
 )
 from vtnote.tasks import InvalidTaskOperation, TaskService
+from vtnote.tokenhub_chat import TOKENHUB_BASE_URL, TOKENHUB_CHAT_ENDPOINT
 from vtnote.url_security import SourceUrlPolicy
 from vtnote.worker import StageContext, Worker
 from vtnote.worker_store import WorkerStore
@@ -458,6 +459,60 @@ def test_profile_snapshot_carries_exact_test_and_text_consent_fingerprints(
     assert snapshot["chat_data_consent_fingerprint"] == case.profiles[
         "translation"
     ]["chat_data_consent_fingerprint"]
+
+
+def test_tokenhub_snapshot_validation_uses_connection_base_url(
+    tmp_path: Path,
+) -> None:
+    case = _make_case(tmp_path, translation=False, notes=True)
+    with Session(case.store.engine) as session:
+        task = session.get(TaskRecord, case.task_id)
+        assert task is not None
+        snapshot = json.loads(json.dumps(task.pipeline_snapshot_json))
+        profile_snapshot = snapshot["notes"]["profile"]
+        connection = session.get(
+            ProviderConnectionRecord,
+            profile_snapshot["connection_id"],
+        )
+        profile = session.get(ProcessorProfileRecord, profile_snapshot["id"])
+        assert connection is not None and profile is not None
+
+        fingerprint = _fingerprint(
+            connection_revision=1,
+            profile_revision=1,
+            endpoint=TOKENHUB_CHAT_ENDPOINT,
+        )
+        fingerprint["protocol"] = "tencent_tokenhub"
+        fingerprint["model"] = "glm-5.1"
+        digest = _fingerprint_digest(fingerprint)
+
+        connection.protocol = "tencent_tokenhub"
+        connection.base_url = TOKENHUB_BASE_URL
+        connection.parameters = {}
+        profile.model = "glm-5.1"
+        profile.context_length = 200_000
+        profile.capability_fingerprint_json = fingerprint
+        profile.chat_data_authorized_fingerprint = digest
+        profile_snapshot.update(
+            {
+                "protocol": "tencent_tokenhub",
+                "base_url": TOKENHUB_BASE_URL,
+                "parameters": {},
+                "model": "glm-5.1",
+                "context_length": 200_000,
+                "capability_fingerprint": fingerprint,
+                "chat_data_consent_fingerprint": digest,
+            }
+        )
+        task.pipeline_snapshot_json = snapshot
+        session.commit()
+
+    validated = SnapshotBailianCredentialResolver(
+        engine=case.store.engine,
+        secrets=case.secrets,
+    ).validate(profile_snapshot, purpose="notes")
+
+    assert validated.protocol == "tencent_tokenhub"
 
 
 @pytest.mark.parametrize("mutation", ["missing", "stale"])

@@ -20,10 +20,14 @@ from vtnote.artifacts import (
 from vtnote.config import Settings
 from vtnote.database import initialize_database
 from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
-from vtnote.media import MediaInfo
+from vtnote.media import MediaInfo, PreparedAudio
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
-from vtnote.provider_credentials import BailianCredentialBundle, TencentCredentialBundle
+from vtnote.provider_credentials import (
+    BailianCredentialBundle,
+    TencentCredentialBundle,
+    TokenHubCredentialBundle,
+)
 from vtnote.schemas import (
     Provenance,
     ProvenanceMethod,
@@ -145,6 +149,28 @@ class FakeBailianProfileTester:
         assert profile.protocol == "aliyun_bailian"
         assert isinstance(credentials, BailianCredentialBundle)
         assert credentials.api_key.get_secret_value() == "sk-private"
+        assert follow_redirects is False
+        return ConnectivityResult(ok=True, message="safe")
+
+
+class FakeTokenHubProfileTester:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def test_profile(
+        self,
+        profile,
+        credentials,
+        test_input,
+        *,
+        follow_redirects: bool,
+    ):
+        self.calls.append((profile, credentials, test_input))
+        assert profile.protocol == "tencent_tokenhub"
+        assert profile.model == "glm-5.1"
+        assert profile.context_length == 200_000
+        assert isinstance(credentials, TokenHubCredentialBundle)
+        assert credentials.api_key.get_secret_value() == "tokenhub-private"
         assert follow_redirects is False
         return ConnectivityResult(ok=True, message="safe")
 
@@ -366,6 +392,104 @@ def test_default_production_composition_wires_tencent_connection_policy_test(
         engine.dispose()
 
 
+def test_tencent_asr_verification_uses_builtin_sample_and_delete_cascades(
+    tmp_path: Path,
+) -> None:
+    tester = FakeProfileTester()
+    client, engine, _ = make_client(tmp_path, profile_tester=tester)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent ASR",
+                "protocol": "tencent_recording_asr",
+                "base_url": "https://asr.tencentcloudapi.com",
+                "parameters": {
+                    "asr_region": "ap-guangzhou",
+                    "cos_configured": False,
+                },
+                "credentials": {
+                    "secret_id": "AKID-example",
+                    "secret_key": "secret-key",
+                },
+            },
+        ).json()
+
+        verified = client.post(
+            f"/api/connections/{connection['id']}/verify-asr",
+            headers=headers,
+            json={
+                "acknowledge_billable_request": True,
+                "authorize_task_audio_upload": True,
+            },
+        )
+
+        assert verified.status_code == 200
+        assert verified.json()["connection"]["test_ok"] is True
+        assert verified.json()["profile"]["test_ok"] is True
+        assert verified.json()["profile"]["upload_authorized"] is True
+        assert tester.calls[0][2].speech_sample_upload_id == (
+            "builtin-tencent-asr-check"
+        )
+        assert client.get("/api/defaults").json()["cloud_asr_profile_id"] == (
+            verified.json()["profile"]["id"]
+        )
+
+        deleted = client.delete(
+            f"/api/connections/{connection['id']}?cascade_profiles=true",
+            headers=headers,
+        )
+        assert deleted.status_code == 204
+        assert client.get("/api/profiles").json() == []
+        assert client.get("/api/defaults").json()["cloud_asr_profile_id"] is None
+    finally:
+        engine.dispose()
+
+
+def test_tokenhub_verification_creates_and_authorizes_glm_notes_profile(
+    tmp_path: Path,
+) -> None:
+    tester = FakeTokenHubProfileTester()
+    client, engine, _ = make_client(tmp_path, profile_tester=tester)
+    headers = csrf(client)
+    try:
+        connection = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": "Tencent TokenHub",
+                "protocol": "tencent_tokenhub",
+                "base_url": "https://tokenhub.tencentmaas.com/v1",
+                "parameters": {},
+                "credentials": {"api_key": "tokenhub-private"},
+            },
+        ).json()
+
+        verified = client.post(
+            f"/api/connections/{connection['id']}/verify-chat",
+            headers=headers,
+            json={
+                "acknowledge_billable_request": True,
+                "authorize_chat_data_upload": True,
+            },
+        )
+
+        assert verified.status_code == 200
+        assert verified.json()["connection"]["test_ok"] is True
+        assert verified.json()["profile"]["test_ok"] is True
+        assert verified.json()["profile"]["chat_data_authorized"] is True
+        assert verified.json()["profile"]["model"] == "glm-5.1"
+        assert "tokenhub-private" not in verified.text
+        assert client.get("/api/defaults").json()["notes_profile_id"] == (
+            verified.json()["profile"]["id"]
+        )
+        assert len(tester.calls) == 1
+    finally:
+        engine.dispose()
+
+
 def test_arbitrary_openai_compatible_protocol_is_rejected_at_creation(
     tmp_path: Path,
 ) -> None:
@@ -469,8 +593,8 @@ def test_billable_cloud_profile_test_requires_ack_and_uploaded_speech_sample(
                 "name": "Tencent ASR",
                 "purpose": "cloud_asr",
                 "connection_id": connection["id"],
-                "model": "16k_zh_en_2.0",
-                "options": {"language_scope": "zh_en_dialects"},
+                "model": "16k_zh",
+                "options": {"language_scope": "zh_with_limited_english"},
             },
         ).json()
 
@@ -1289,6 +1413,82 @@ def test_health_readiness_pagination_and_result_read_models(tmp_path: Path) -> N
         engine.dispose()
 
 
+def test_item_outcomes_and_audio_download_reflect_available_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [{"kind": "url", "locator": "https://youtu.be/outcomes"}],
+                "output_type": "audio",
+            },
+        ).json()
+        item_id = task["items"][0]["id"]
+        source = paths.downloaded_audio(item_id, "webm")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"owned-audio")
+        transcript = Transcript(
+            language="en",
+            duration_ms=500,
+            provenance=Provenance(
+                method=ProvenanceMethod.PLATFORM_SUBTITLE,
+                provider="youtube",
+            ),
+            segments=(
+                TranscriptSegment(
+                    id="seg_000001", start_ms=0, end_ms=500, text="Hello"
+                ),
+            ),
+        )
+        write_transcript_json(paths, item_id, transcript)
+        write_note_markdown(
+            paths,
+            item_id,
+            "22222222-2222-4222-8222-222222222222",
+            "# Note\n",
+        )
+        with Session(engine) as session:
+            RuntimeAssetService(session, paths).register_staged(
+                item_id=item_id,
+                role="downloaded_audio",
+                relative_path=paths.runtime_relative(source),
+            )
+
+        outcomes = client.get(f"/api/items/{item_id}/outcomes")
+        assert outcomes.status_code == 200
+        assert outcomes.json() == {"audio": True, "transcript": True, "notes": True}
+
+        class FakeExportProcessor:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def export_audio(
+                self, export_item_id: str, export_source: Path, export_format: str
+            ) -> PreparedAudio:
+                assert export_source == source
+                destination = paths.export_audio(export_item_id, export_format)
+                destination.write_bytes(b"converted-audio")
+                return PreparedAudio(
+                    destination,
+                    None,
+                    True,
+                    MediaInfo(500, 15, export_format, "aac", 44_100, 2),
+                )
+
+        monkeypatch.setattr(api_module, "FfmpegMediaProcessor", FakeExportProcessor)
+        downloaded = client.get(f"/api/items/{item_id}/audio?format=m4a")
+        assert downloaded.status_code == 200
+        assert downloaded.content == b"converted-audio"
+        assert "vtnote-" in downloaded.headers["content-disposition"]
+        assert downloaded.headers["content-disposition"].endswith('-audio.m4a"')
+    finally:
+        engine.dispose()
+
+
 def test_storage_trash_list_and_restore_are_typed_and_csrf_protected(
     tmp_path: Path,
 ) -> None:
@@ -1347,6 +1547,58 @@ def test_storage_trash_list_and_restore_are_typed_and_csrf_protected(
         assert restored.status_code == 200
         assert restored.json()["state"] == "active"
         assert runtime_file.read_bytes() == b"owned"
+    finally:
+        engine.dispose()
+
+
+def test_task_create_accepts_and_returns_output_type(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.post(
+            "/api/tasks",
+            headers=csrf(client),
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/output-type"}
+                ],
+                "output_type": "transcript",
+            },
+        )
+        assert response.status_code == 201
+        payload = response.json()
+        assert payload["options"]["output_type"] == "transcript"
+        assert payload["pipeline_snapshot"]["output_type"] == "transcript"
+        assert [run["stage"] for run in payload["items"][0]["stage_runs"]] == [
+            "source",
+            "transcribe",
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_task_create_accepts_audio_export_enabled(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.post(
+            "/api/tasks",
+            headers=csrf(client),
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/full-output"}
+                ],
+                "audio_export_enabled": True,
+                "translation_enabled": False,
+                "notes_enabled": False,
+            },
+        )
+        assert response.status_code == 201
+        payload = response.json()
+        assert payload["options"]["audio_export_enabled"] is True
+        assert payload["pipeline_snapshot"]["audio_export_enabled"] is True
+        assert [run["stage"] for run in payload["items"][0]["stage_runs"]] == [
+            "source",
+            "transcribe",
+        ]
     finally:
         engine.dispose()
 
@@ -1474,7 +1726,7 @@ def test_retry_api_accepts_explicit_local_and_cloud_confirmed_success(
                 "name": "Explicit cloud retry",
                 "purpose": "cloud_asr",
                 "connection_id": connection["id"],
-                "model": "16k_zh_en_2.0",
+                "model": "16k_zh",
             },
         ).json()
         with Session(engine) as session:
