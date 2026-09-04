@@ -7,6 +7,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -73,8 +74,13 @@ class Settings(BaseSettings):
 
     data_root: Path = Field(default_factory=_default_data_root)
     runtime_cache_root: Path = Field(default_factory=_default_runtime_cache_root)
+    managed_assets_root: Path | None = None
+    platform_proxy_url: str | None = None
+    platform_cookie_browser: Literal["chrome", "edge", "firefox"] | None = None
+    platform_douyin_cookie_file: Path | None = Field(default=None, repr=False)
+    platform_youtube_cookie_file: Path | None = Field(default=None, repr=False)
     bind_host: Literal["127.0.0.1"] = "127.0.0.1"
-    bind_port: int = Field(default=8765, ge=1, le=65_535)
+    bind_port: int = Field(default=8766, ge=1, le=65_535)
     enable_dev_docs: bool = False
 
     @field_validator("data_root", "runtime_cache_root")
@@ -83,6 +89,53 @@ class Settings(BaseSettings):
         if not value.is_absolute():
             raise ValueError("storage roots must be absolute")
         return value.absolute()
+
+    @field_validator("managed_assets_root")
+    @classmethod
+    def validate_optional_absolute_root(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if not value.is_absolute():
+            raise ValueError("managed assets root must be absolute")
+        return value.absolute()
+
+    @field_validator(
+        "platform_douyin_cookie_file",
+        "platform_youtube_cookie_file",
+    )
+    @classmethod
+    def validate_cookie_file_path(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if not value.is_absolute():
+            raise ValueError("platform cookie file path must be absolute")
+        return value.absolute()
+
+    @field_validator("platform_proxy_url")
+    @classmethod
+    def validate_platform_proxy_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parts = urlsplit(value)
+            port = parts.port
+        except (TypeError, ValueError):
+            raise ValueError("platform proxy URL is invalid") from None
+        if (
+            parts.scheme.casefold() != "http"
+            or parts.hostname not in {"127.0.0.1", "::1"}
+            or port is None
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError(
+                "platform proxy must be an unauthenticated loopback HTTP URL with a port"
+            )
+        host = "[::1]" if parts.hostname == "::1" else "127.0.0.1"
+        return f"http://{host}:{port}"
 
     @model_validator(mode="after")
     def validate_separate_roots(self) -> Self:
@@ -97,4 +150,13 @@ class Settings(BaseSettings):
             and resolved_data.anchor.casefold() != resolved_cache.anchor.casefold()
         ):
             raise ValueError("data and runtime cache roots must use the same Windows drive")
+        if self.managed_assets_root is not None:
+            resolved_assets = self.managed_assets_root.resolve(strict=False)
+            if (
+                _contains(resolved_data, resolved_assets)
+                or _contains(resolved_assets, resolved_data)
+                or _contains(resolved_cache, resolved_assets)
+                or _contains(resolved_assets, resolved_cache)
+            ):
+                raise ValueError("managed assets root must not overlap storage roots")
         return self

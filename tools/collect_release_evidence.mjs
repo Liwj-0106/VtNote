@@ -1,19 +1,33 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  delimiter,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptRoot = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(scriptRoot);
 const argumentsList = process.argv.slice(2);
 const outputIndex = argumentsList.indexOf("--output");
-if (outputIndex < 0 || !argumentsList[outputIndex + 1]) {
-  throw new Error("--output is required");
-}
-const outputDirectory = resolve(argumentsList[outputIndex + 1]);
-if (!isAbsolute(outputDirectory) || !/^D:\\/iu.test(outputDirectory)) {
-  throw new Error("release evidence output must be an absolute D-drive directory");
+const outputDirectory = resolve(
+  outputIndex >= 0 && argumentsList[outputIndex + 1]
+    ? argumentsList[outputIndex + 1]
+    : join(repoRoot, "dist", "release-evidence"),
+);
+const outputRelative = relative(repoRoot, outputDirectory);
+if (
+  !isAbsolute(outputDirectory) ||
+  outputRelative.startsWith("..") ||
+  isAbsolute(outputRelative)
+) {
+  throw new Error("release evidence output must remain inside the project");
 }
 mkdirSync(outputDirectory, { recursive: true });
 const outputFile = join(outputDirectory, "release-evidence.json");
@@ -21,18 +35,38 @@ if (existsSync(outputFile)) {
   throw new Error("release evidence already exists");
 }
 
-const python =
-  process.env.VTNOTE_PYTHON ??
-  "D:\\ProgramData\\Anaconda3\\envs\\vtnote\\python.exe";
-const ffmpeg =
-  process.env.VTNOTE_FFMPEG ??
-  "D:\\ProgramData\\Anaconda3\\envs\\vtnote\\Library\\bin\\ffmpeg.exe";
+const python = process.env.VTNOTE_PYTHON ?? "python";
+const ffmpeg = process.env.VTNOTE_FFMPEG ?? "ffmpeg";
 const deno =
   process.env.VTNOTE_DENO ??
-  "D:\\Workspace\\Codex\\cache\\VtNote-runtime\\youtube-runtime\\deno\\2.8.1\\deno.exe";
+  join(
+    repoRoot,
+    ".vtnote",
+    "runtime",
+    "youtube-runtime",
+    "deno",
+    "2.8.1",
+    "deno.exe",
+  );
 
 function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function resolveExecutable(executable) {
+  if (isAbsolute(executable) && existsSync(executable)) return executable;
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+  const candidates = extname(executable) ? [""] : extensions;
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (!directory) continue;
+    for (const extension of candidates) {
+      const candidate = join(directory, `${executable}${extension}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  throw new Error("release evidence executable is unavailable");
 }
 
 function controlledEnvironment(extra = {}) {
@@ -60,8 +94,11 @@ function run(executable, args, extraEnvironment = {}) {
   );
 }
 
-const ffmpegVersionOutput = run(ffmpeg, ["-version"]);
-const ffmpegBuildOutput = run(ffmpeg, ["-buildconf"]);
+const pythonExecutable = resolveExecutable(python);
+const ffmpegExecutable = resolveExecutable(ffmpeg);
+const denoExecutable = resolveExecutable(deno);
+const ffmpegVersionOutput = run(ffmpegExecutable, ["-version"]);
+const ffmpegBuildOutput = run(ffmpegExecutable, ["-buildconf"]);
 const versionLine = ffmpegVersionOutput.split("\n")[0].trim();
 const configurationLine =
   ffmpegBuildOutput
@@ -99,23 +136,30 @@ const pythonCode = [
   `names=${JSON.stringify(packageNames)}`,
   "print(json.dumps({name:m.version(name) for name in names},sort_keys=True))",
 ].join(";");
-const pythonPackages = JSON.parse(run(python, ["-c", pythonCode]));
+const pythonPackages = JSON.parse(run(pythonExecutable, ["-c", pythonCode]));
 const ejsHashCode = [
   "from vtnote.youtube_runtime import SystemYoutubeRuntimeInventory",
   "print(SystemYoutubeRuntimeInventory().package_hash('yt-dlp-ejs') or '')",
 ].join(";");
 const ejsPackageSha256 = run(
-  python,
+  pythonExecutable,
   ["-c", ejsHashCode],
   { PYTHONPATH: join(repoRoot, "src") },
 ).trim();
 
 const denoVersion = run(
-  deno,
+  denoExecutable,
   ["--version"],
   {
     DENO_DIR:
-      "D:\\Workspace\\Codex\\cache\\VtNote-runtime\\youtube-runtime\\deno-cache\\2.8.1",
+      join(
+        repoRoot,
+        ".vtnote",
+        "runtime",
+        "youtube-runtime",
+        "deno-cache",
+        "2.8.1",
+      ),
   },
 )
   .split("\n")[0]
@@ -134,7 +178,7 @@ const evidence = {
   schema_version: 1,
   source_commit: run("git", ["rev-parse", "HEAD"]).trim(),
   python: {
-    version: run(python, ["--version"]).trim(),
+    version: run(pythonExecutable, ["--version"]).trim(),
     packages: pythonPackages,
     requirements_lock_sha256: sha256(join(repoRoot, "requirements.lock")),
     environment_yml_sha256: sha256(join(repoRoot, "environment.yml")),
@@ -145,7 +189,7 @@ const evidence = {
   },
   ffmpeg: {
     version: versionLine,
-    executable_sha256: sha256(ffmpeg),
+    executable_sha256: sha256(ffmpegExecutable),
     build_configuration: buildFlags,
     distribution_classification: gplEnabled
       ? "development_gpl_only"
@@ -153,7 +197,7 @@ const evidence = {
   },
   youtube_runtime: {
     deno_version: denoVersion,
-    deno_executable_sha256: sha256(deno),
+    deno_executable_sha256: sha256(denoExecutable),
     ejs_package_sha256: ejsPackageSha256,
     remote_components_enabled: false,
   },

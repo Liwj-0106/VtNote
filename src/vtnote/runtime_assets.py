@@ -44,6 +44,7 @@ _RECOVERABLE_AUDIO_EXTENSIONS = (
     "ogg",
     "opus",
     "webm",
+    "mp4",
 )
 
 

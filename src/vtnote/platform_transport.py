@@ -44,11 +44,23 @@ _HOP_BY_HOP_HEADERS = frozenset(
         "upgrade",
     }
 )
+_MANAGED_REQUEST_HEADERS = frozenset({"accept-encoding", "content-length"})
 _RESPONSE_HIDDEN_HEADERS = frozenset({"set-cookie", "set-cookie2"})
 _BILIBILI_ANONYMOUS_COOKIE_NAMES = frozenset({"b_nut", "buvid3", "sid"})
 _ANONYMOUS_COOKIE_VALUE = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
 _ERROR_CATEGORY = re.compile(r"^[a-z_]{1,64}$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_YOUTUBE_BROWSER_AUTHORIZATION = re.compile(
+    r"^(?:SAPISID(?:1P|3P)?HASH [0-9]{9,12}_[0-9a-f]{40}(?:_u)?)"
+    r"(?: SAPISID(?:1P|3P)?HASH [0-9]{9,12}_[0-9a-f]{40}(?:_u)?)*$"
+)
+
+
+def is_youtube_browser_authorization(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and _YOUTUBE_BROWSER_AUTHORIZATION.fullmatch(value) is not None
+    )
 
 
 class TransportSecurityError(RuntimeError):
@@ -60,7 +72,7 @@ class TransportSecurityError(RuntimeError):
         try:
             normalized_host = normalize_host(host)
         except ValueError:
-            if host not in {"bilibili", "youtube"}:
+            if host not in {"bilibili", "douyin", "youtube"}:
                 raise ValueError("invalid transport error host") from None
             normalized_host = host
         self.category = category
@@ -74,6 +86,7 @@ class TransportLimits:
     max_header_count: int = 64
     max_header_line_bytes: int = 8_192
     max_request_target_bytes: int = 16_384
+    max_request_body_bytes: int = 2 * 1024 * 1024
     connect_timeout: float = 10.0
     read_timeout: float = 30.0
     decode_chunk_bytes: int = 64 * 1024
@@ -84,6 +97,7 @@ class TransportLimits:
             self.max_header_count,
             self.max_header_line_bytes,
             self.max_request_target_bytes,
+            self.max_request_body_bytes,
             self.decode_chunk_bytes,
         )
         if any(type(value) is not int or value <= 0 for value in integer_values):
@@ -105,11 +119,14 @@ class SourceHttpRequest:
     max_wire_bytes: int
     max_decoded_bytes: int
     method: str = "GET"
+    body: bytes | None = field(default=None, repr=False)
     headers: Mapping[str, str] = field(default_factory=dict)
     anonymous_session_cookies: Mapping[str, str] = field(
         default_factory=dict,
         repr=False,
     )
+    browser_cookie_header: str | None = field(default=None, repr=False)
+    browser_authorization_header: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.url, str) or not self.url:
@@ -119,8 +136,13 @@ class SourceHttpRequest:
         if type(self.max_decoded_bytes) is not int or self.max_decoded_bytes <= 0:
             raise ValueError("max decoded bytes must be positive")
         method = self.method.upper()
-        if method not in {"GET", "HEAD"}:
-            raise ValueError("source request method must be GET or HEAD")
+        if method not in {"GET", "HEAD", "POST"}:
+            raise ValueError("source request method must be GET, HEAD, or POST")
+        if method == "POST":
+            if not isinstance(self.body, bytes) or not self.body:
+                raise ValueError("POST source request requires a byte body")
+        elif self.body is not None:
+            raise ValueError("GET and HEAD source requests cannot have a body")
         if not isinstance(self.headers, Mapping):
             raise ValueError("source request headers must be a mapping")
         normalized: dict[str, str] = {}
@@ -155,6 +177,20 @@ class SourceHttpRequest:
             "anonymous_session_cookies",
             MappingProxyType(anonymous_cookies),
         )
+        if self.browser_cookie_header is not None and (
+            not isinstance(self.browser_cookie_header, str)
+            or not self.browser_cookie_header
+            or "\r" in self.browser_cookie_header
+            or "\n" in self.browser_cookie_header
+            or len(self.browser_cookie_header.encode("utf-8")) > 8_192
+        ):
+            raise ValueError("invalid browser cookie header")
+        if self.browser_authorization_header is not None and (
+            not is_youtube_browser_authorization(
+                self.browser_authorization_header
+            )
+        ):
+            raise ValueError("invalid browser authorization header")
 
 
 class RawHttpResponse(Protocol):
@@ -168,6 +204,8 @@ class RawHttpResponse(Protocol):
 
 
 class HttpsConnector(Protocol):
+    dns_pinned: bool
+
     def request(
         self,
         *,
@@ -175,6 +213,7 @@ class HttpsConnector(Protocol):
         addresses: tuple[str, ...],
         method: str,
         target: str,
+        body: bytes | None,
         headers: dict[str, str],
         connect_timeout: float,
         read_timeout: float,
@@ -212,7 +251,7 @@ class _DirectRawResponse:
     def __init__(
         self,
         response: http.client.HTTPResponse,
-        connection: _PinnedHttpsConnection,
+        connection: http.client.HTTPSConnection,
         peer_ip: str,
     ) -> None:
         self.status = response.status
@@ -234,6 +273,8 @@ class _DirectRawResponse:
 class DirectHttpsConnector:
     """Dial only explicit vetted IPs while retaining hostname TLS verification."""
 
+    dns_pinned = True
+
     def __init__(self, context: ssl.SSLContext | None = None) -> None:
         self.context = context or ssl.create_default_context()
         if (
@@ -249,6 +290,7 @@ class DirectHttpsConnector:
         addresses: tuple[str, ...],
         method: str,
         target: str,
+        body: bytes | None,
         headers: dict[str, str],
         connect_timeout: float,
         read_timeout: float,
@@ -261,7 +303,7 @@ class DirectHttpsConnector:
                 context=self.context,
             )
             try:
-                connection.request(method, target, headers=headers)
+                connection.request(method, target, body=body, headers=headers)
                 if connection.sock is None:
                     raise OSError("TLS socket unavailable")
                 connection.sock.settimeout(read_timeout)
@@ -273,11 +315,85 @@ class DirectHttpsConnector:
         raise OSError("all direct HTTPS addresses failed")
 
 
+class LoopbackHttpProxyConnector:
+    """Use one explicitly configured loopback HTTP CONNECT proxy.
+
+    Redirects and target hosts remain controlled by ``PinnedHttpsTransport``.
+    TLS is established end-to-end to the selected target hostname after CONNECT;
+    proxy authentication and non-loopback proxy endpoints are deliberately absent.
+    """
+
+    dns_pinned = False
+
+    def __init__(
+        self,
+        proxy_url: str,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        try:
+            parts = urlsplit(proxy_url)
+            port = parts.port
+        except (TypeError, ValueError):
+            raise ValueError("invalid loopback proxy URL") from None
+        if (
+            parts.scheme.casefold() != "http"
+            or parts.hostname not in {"127.0.0.1", "::1"}
+            or port is None
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError("proxy must be an unauthenticated loopback HTTP URL")
+        self.proxy_host = parts.hostname
+        self.proxy_port = port
+        self.context = context or ssl.create_default_context()
+        if (
+            not self.context.check_hostname
+            or self.context.verify_mode != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("proxied HTTPS requires hostname and certificate verification")
+
+    def request(
+        self,
+        *,
+        host: str,
+        addresses: tuple[str, ...],
+        method: str,
+        target: str,
+        body: bytes | None,
+        headers: dict[str, str],
+        connect_timeout: float,
+        read_timeout: float,
+    ) -> RawHttpResponse:
+        del addresses
+        connection = http.client.HTTPSConnection(
+            self.proxy_host,
+            port=self.proxy_port,
+            timeout=connect_timeout,
+            context=self.context,
+        )
+        connection.set_tunnel(host, port=443)
+        try:
+            connection.request(method, target, body=body, headers=headers)
+            if connection.sock is None:
+                raise OSError("TLS socket unavailable")
+            connection.sock.settimeout(read_timeout)
+            peer_ip = str(connection.sock.getpeername()[0])
+            response = connection.getresponse()
+            return _DirectRawResponse(response, connection, peer_ip)
+        except Exception:
+            connection.close()
+            raise
+
+
 class SourceHttpResponse(Iterator[bytes]):
     def __init__(
         self,
         raw: RawHttpResponse,
         *,
+        url: str,
         host: str,
         max_wire_bytes: int,
         max_decoded_bytes: int,
@@ -286,6 +402,7 @@ class SourceHttpResponse(Iterator[bytes]):
         anonymous_session_cookies: Mapping[str, str] | None = None,
     ) -> None:
         self.status = raw.status
+        self.url = url
         self.headers = {
             name: value
             for name, value in headers
@@ -485,6 +602,7 @@ def _safe_request_headers(
         if (
             lowered in _SENSITIVE_HEADERS
             or lowered in _HOP_BY_HOP_HEADERS
+            or lowered in _MANAGED_REQUEST_HEADERS
             or lowered in connection_tokens
             or lowered.startswith("proxy-")
         ):
@@ -563,6 +681,8 @@ class PinnedHttpsTransport:
         self,
         url: str,
         policy: UpstreamHostPolicy,
+        *,
+        is_redirect: bool = False,
     ) -> tuple[str, str]:
         safe_host = policy.platform
         try:
@@ -579,7 +699,7 @@ class PinnedHttpsTransport:
             or parts.fragment
         ):
             raise TransportSecurityError("invalid_url", host)
-        if not policy.allows(host):
+        if not policy.allows(host, is_redirect=is_redirect):
             raise TransportSecurityError("host_not_allowed", host)
         target = parts.path or "/"
         if parts.query:
@@ -607,15 +727,30 @@ class PinnedHttpsTransport:
 
         current_url = request.url
         headers = dict(request.headers)
+        if (
+            request.body is not None
+            and len(request.body) > self.limits.max_request_body_bytes
+        ):
+            raise TransportSecurityError("request_body_too_large", policy.platform)
         for redirect_count in range(self.limits.max_redirects + 1):
-            host, target = self._parse_url(current_url, policy)
+            host, target = self._parse_url(
+                current_url,
+                policy,
+                is_redirect=redirect_count > 0,
+            )
             if (
                 len(f"{request.method} {target} HTTP/1.1".encode("utf-8"))
                 > self.limits.max_request_target_bytes
             ):
                 raise TransportSecurityError("request_target_too_large", host)
-            addresses = self._resolve(host)
+            addresses = (
+                self._resolve(host)
+                if getattr(self.connector, "dns_pinned", True)
+                else ()
+            )
             safe_headers = _safe_request_headers(headers, host=host)
+            if request.body is not None:
+                safe_headers["Content-Length"] = str(len(request.body))
             if request.anonymous_session_cookies:
                 if policy.platform != "bilibili" or not (
                     host == "bilibili.com" or host.endswith(".bilibili.com")
@@ -630,6 +765,34 @@ class PinnedHttpsTransport:
                         request.anonymous_session_cookies.items()
                     )
                 )
+            if request.browser_cookie_header is not None:
+                if (
+                    request.anonymous_session_cookies
+                    or policy.platform not in {"douyin", "youtube"}
+                    or policy.stage not in {"page", "extractor_aux"}
+                ):
+                    raise TransportSecurityError(
+                        "browser_session_rejected",
+                        host,
+                    )
+                # The cookie jar scoped this header to the original URL. Never
+                # forward it across a transport-managed redirect.
+                if redirect_count == 0:
+                    safe_headers["Cookie"] = request.browser_cookie_header
+            if request.browser_authorization_header is not None:
+                if (
+                    policy.platform != "youtube"
+                    or policy.stage not in {"page", "extractor_aux"}
+                    or request.method != "POST"
+                ):
+                    raise TransportSecurityError(
+                        "browser_authorization_rejected",
+                        host,
+                    )
+                if redirect_count == 0:
+                    safe_headers["Authorization"] = (
+                        request.browser_authorization_header
+                    )
             _validate_headers(
                 tuple(safe_headers.items()),
                 limits=self.limits,
@@ -641,6 +804,7 @@ class PinnedHttpsTransport:
                     addresses=addresses,
                     method=request.method,
                     target=target,
+                    body=request.body,
                     headers=safe_headers,
                     connect_timeout=float(self.limits.connect_timeout),
                     read_timeout=float(self.limits.read_timeout),
@@ -648,11 +812,16 @@ class PinnedHttpsTransport:
             except Exception:
                 raise TransportSecurityError("connection_failed", host) from None
             try:
-                peer = ipaddress.ip_address(raw.peer_ip).compressed
+                peer_address = ipaddress.ip_address(raw.peer_ip)
+                peer = peer_address.compressed
             except ValueError:
                 raw.close()
                 raise TransportSecurityError("peer_mismatch", host) from None
-            if peer not in addresses:
+            if getattr(self.connector, "dns_pinned", True):
+                peer_matches = peer in addresses
+            else:
+                peer_matches = peer_address.is_loopback
+            if not peer_matches:
                 raw.close()
                 raise TransportSecurityError("peer_mismatch", host)
             response_headers = tuple(raw.headers)
@@ -696,6 +865,7 @@ class PinnedHttpsTransport:
                 continue
             return SourceHttpResponse(
                 raw,
+                url=current_url,
                 host=host,
                 max_wire_bytes=request.max_wire_bytes,
                 max_decoded_bytes=request.max_decoded_bytes,

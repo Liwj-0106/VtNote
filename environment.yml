@@ -17,4 +17,5 @@ dependencies:
       - faster-whisper==1.2.1
       - ctranslate2==4.8.1
       - cos-python-sdk-v5==1.9.44
+      - sherpa-onnx==1.13.6
       - -e .[dev]

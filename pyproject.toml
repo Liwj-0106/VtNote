@@ -21,6 +21,8 @@ dependencies = [
   "faster-whisper==1.2.1",
   "ctranslate2==4.8.1",
   "cos-python-sdk-v5==1.9.44",
+  "numpy>=1.26,<3",
+  "sherpa-onnx==1.13.6",
 ]
 
 [project.scripts]
@@ -32,8 +34,11 @@ dev = ["pytest>=8,<10"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.pytest.ini_options]
-addopts = "--basetemp=D:/Workspace/Codex/cache/VtNote-pytest"
-cache_dir = "D:/Workspace/Codex/cache/VtNote-runtime/pytest-cache"
+addopts = "--basetemp=.vtnote/Cache/test/pytest-tmp"
+cache_dir = ".vtnote/Cache/test/pytest-cache"
 pythonpath = ["src"]
 testpaths = ["tests"]

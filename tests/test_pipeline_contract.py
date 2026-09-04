@@ -105,6 +105,20 @@ def test_execution_evidence_accepts_registered_fallback_reason() -> None:
     ) == {"fallback_reason": "cloud_rate_limited"}
 
 
+def test_execution_evidence_accepts_douyin_provider() -> None:
+    assert pipeline_contract.validate_execution_evidence(
+        {"provider": "douyin", "source_method": "platform_audio"}
+    ) == {"source_method": "platform_audio", "provider": "douyin"}
+
+
+def test_execution_evidence_accepts_an_explicit_hugging_face_model_id() -> None:
+    model = "Systran/faster-whisper-large-v3"
+    assert pipeline_contract.validate_execution_evidence(
+        {"model": model},
+        allowed_models=(model,),
+    ) == {"model": model}
+
+
 @pytest.mark.parametrize(
     "status_code",
     [

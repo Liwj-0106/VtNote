@@ -12,7 +12,7 @@ from vtnote.secrets import MemorySecretStore
 from vtnote.sensitive_text import MemorySensitiveTextProtector
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 
 
 class _Resolver:

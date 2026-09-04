@@ -19,6 +19,12 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background: var(--canvas);
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::selection {
+  background: var(--terracotta-soft);
+  color: var(--ink);
 }
 
 body.drawer-open {
@@ -54,6 +60,7 @@ a {
 
 button {
   min-height: 44px;
+  touch-action: manipulation;
 }
 
 h1,
@@ -135,7 +142,10 @@ h3 {
   cursor: pointer;
   transition:
     background var(--motion-fast),
-    border-color var(--motion-fast);
+    border-color var(--motion-fast),
+    box-shadow var(--motion-fast),
+    color var(--motion-fast),
+    transform var(--motion-fast) var(--ease-standard);
 }
 
 .button:hover:not(:disabled) {
@@ -143,15 +153,20 @@ h3 {
   background: var(--surface-strong);
 }
 
+.button:active:not(:disabled) {
+  background: var(--pressed);
+  transform: translateY(1px);
+}
+
 .button-primary {
-  border-color: var(--ink);
-  background: var(--ink);
-  color: var(--canvas);
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-contrast);
 }
 
 .button-primary:hover:not(:disabled) {
-  border-color: #000;
-  background: #11100f;
+  border-color: color-mix(in srgb, var(--accent) 86%, var(--ink));
+  background: color-mix(in srgb, var(--accent) 86%, var(--ink));
 }
 
 .button-quiet {
@@ -160,8 +175,23 @@ h3 {
 }
 
 .button-danger {
-  border-color: var(--danger);
-  color: var(--danger);
+  border-color: var(--destructive);
+  color: var(--destructive);
+}
+
+.button-danger:hover:not(:disabled) {
+  border-color: var(--destructive-strong);
+  background: var(--destructive-soft);
+  color: var(--destructive-strong);
+}
+
+.icon-button.destructive-icon-button {
+  color: var(--destructive);
+}
+
+.icon-button.destructive-icon-button:hover {
+  background: var(--destructive-soft);
+  color: var(--destructive-strong);
 }
 
 .button:disabled {
@@ -181,11 +211,20 @@ h3 {
   background: transparent;
   color: var(--ink-secondary);
   cursor: pointer;
+  transition:
+    background var(--motion-fast),
+    color var(--motion-fast),
+    transform var(--motion-fast) var(--ease-standard);
 }
 
 .icon-button:hover {
-  background: rgb(38 36 33 / 0.055);
+  background: var(--hover);
   color: var(--ink);
+}
+
+.icon-button:active:not(:disabled) {
+  background: var(--pressed);
+  transform: scale(0.97);
 }
 
 .field {
@@ -229,7 +268,6 @@ h3 {
 }
 
 .text-input,
-.select-input,
 .textarea-input {
   width: 100%;
   min-height: 46px;
@@ -237,6 +275,9 @@ h3 {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--surface-strong);
+  transition:
+    border-color var(--motion-fast),
+    box-shadow var(--motion-fast);
 }
 
 .textarea-input {
@@ -245,13 +286,11 @@ h3 {
 }
 
 .text-input:hover,
-.select-input:hover,
 .textarea-input:hover {
   border-color: var(--ink-secondary);
 }
 
 .text-input:focus,
-.select-input:focus,
 .textarea-input:focus {
   border-color: var(--terracotta-strong);
   box-shadow: 0 0 0 2px var(--terracotta-soft);
@@ -311,7 +350,6 @@ h3 {
 @media (forced-colors: active) {
   .button,
   .text-input,
-  .select-input,
   .textarea-input {
     border: 1px solid CanvasText;
   }

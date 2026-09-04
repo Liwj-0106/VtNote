@@ -41,7 +41,7 @@ from vtnote.url_security import SourceUrlPolicy
 from vtnote.worker_store import WorkerStore
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 VALID_SRT = b"1\n00:00:00,000 --> 00:00:01,000\nhello\n"
 
 
@@ -202,6 +202,24 @@ def test_subtitle_upload_is_sniffed_but_original_bytes_remain_runtime_owned(
             assert asset is not None
             assert paths.runtime_from_relative(asset.relative_path).read_bytes() == VALID_SRT
         assert not paths.source_original(item["id"], "srt").exists()
+    finally:
+        engine.dispose()
+
+
+def test_plain_text_subtitle_upload_is_accepted(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    body, content_type = upload_body(
+        kind="subtitle",
+        filename="transcript.txt",
+        data="第一段\n第二段\n".encode(),
+    )
+    try:
+        response = post_multipart(client, body, content_type, headers)
+        assert response.status_code == 201
+        item = response.json()["items"][0]
+        assert item["source_kind"] == "uploaded_subtitle"
+        assert item["source_display_name"] == "transcript.txt"
     finally:
         engine.dispose()
 

@@ -1,4 +1,5 @@
-import { type ReactNode, useEffect, useRef } from "react";
+import { type ReactNode, useId } from "react";
+import { ModalDialog } from "./ModalDialog";
 
 export function ConfirmDialog({
   open,
@@ -19,35 +20,20 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const returnFocus = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    const element = dialog.current;
-    if (!element) return;
-    if (open && !element.open) {
-      returnFocus.current = document.activeElement as HTMLElement | null;
-      element.showModal();
-    } else if (!open && element.open) {
-      element.close();
-    }
-  }, [open]);
+  const titleId = useId();
 
   return (
-    <dialog
-      ref={dialog}
+    <ModalDialog
+      open={open}
+      busy={busy}
       className="confirm-dialog"
-      aria-labelledby="confirm-dialog-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-      onClose={() => returnFocus.current?.focus()}
+      labelledBy={titleId}
+      onClose={onClose}
     >
-      <h2 id="confirm-dialog-title">{title}</h2>
+      <h2 id={titleId}>{title}</h2>
       <div className="dialog-description">{description}</div>
       <div className="actions dialog-actions">
-        <button className="button" type="button" onClick={onClose}>
+        <button className="button" type="button" disabled={busy} onClick={onClose}>
           返回
         </button>
         <button
@@ -59,6 +45,6 @@ export function ConfirmDialog({
           {busy ? "正在处理…" : confirmLabel}
         </button>
       </div>
-    </dialog>
+    </ModalDialog>
   );
 }

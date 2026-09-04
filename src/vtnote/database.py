@@ -14,6 +14,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
 
+from vtnote.local_asr_contract import FASTER_WHISPER_ENGINE, LOCAL_ASR_ENGINES
 from vtnote.models import (
     Base,
     DefaultSettingsRecord,
@@ -51,6 +52,10 @@ _ADDITIVE_COLUMNS = {
     },
     "default_settings": {
         "notes_custom_prompt_envelope_json": "JSON",
+        "export_directory": "TEXT",
+        "local_asr_engine": (
+            "VARCHAR(32) NOT NULL DEFAULT 'faster_whisper'"
+        ),
     },
     "processor_profiles": {
         "capability_fingerprint_json": "JSON",
@@ -118,6 +123,10 @@ def _initialize_schema(engine: Engine) -> None:
         try:
             Base.metadata.create_all(connection)
             _apply_additive_schema_upgrades(connection)
+            connection.exec_driver_sql(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS library_search_fts
+                USING fts5(document_id UNINDEXED, content, tokenize='trigram')"""
+            )
         except Exception:
             connection.rollback()
             raise
@@ -138,6 +147,53 @@ def _migrate_default_local_whisper_device(engine: Engine) -> None:
         migrated["device"] = "cuda"
         defaults.local_whisper_options = migrated
         session.commit()
+
+
+def _migrate_default_local_asr_engine(engine: Engine) -> None:
+    """Retire removed local-ASR choices without rewriting task history."""
+
+    with Session(engine) as session:
+        defaults = session.get(DefaultSettingsRecord, 1)
+        if (
+            defaults is None
+            or defaults.local_asr_engine in LOCAL_ASR_ENGINES
+        ):
+            return
+        defaults.local_asr_engine = FASTER_WHISPER_ENGINE
+        session.commit()
+
+
+def _migrate_default_local_whisper_v2(engine: Engine) -> None:
+    """Upgrade mutable defaults while preserving every historical task snapshot."""
+
+    with Session(engine) as session:
+        defaults = session.get(DefaultSettingsRecord, 1)
+        if defaults is None or not isinstance(defaults.local_whisper_options, dict):
+            return
+        options = dict(defaults.local_whisper_options)
+        additions = {
+            "schema_version": 2,
+            "vad_parameters": {
+                "threshold": 0.5,
+                "min_speech_duration_ms": 250,
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            "cpu_fallback_enabled": False,
+            "word_timestamps": True,
+            "punctuation_normalization": True,
+            "speaker_diarization_enabled": False,
+            "chunk_duration_ms": 900_000,
+            "chunk_overlap_ms": 5_000,
+        }
+        changed = False
+        for key, value in additions.items():
+            if key not in options:
+                options[key] = value
+                changed = True
+        if changed:
+            defaults.local_whisper_options = options
+            session.commit()
 
 
 def _migrate_tencent_profiles_to_free_tier(engine: Engine) -> None:
@@ -380,7 +436,9 @@ def initialize_database(
             migrate_sensitive_text(engine, sensitive_text_protector)
             _migrate_legacy_cloud_provider(engine)
             _migrate_legacy_chat_provider(engine)
+            _migrate_default_local_asr_engine(engine)
             _migrate_default_local_whisper_device(engine)
+            _migrate_default_local_whisper_v2(engine)
             _migrate_tencent_profiles_to_free_tier(engine)
     except Exception:
         engine.dispose()

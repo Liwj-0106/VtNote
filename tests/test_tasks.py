@@ -163,10 +163,23 @@ def test_enqueue_creates_durable_rows_and_immutable_redacted_snapshot(tmp_path: 
         assert task.pipeline_snapshot["translation"]["profile"]["id"] == translation_id
         assert task.pipeline_snapshot["notes"]["profile"]["id"] == notes_id
         assert task.pipeline_snapshot["local_whisper"] == {
+            "schema_version": 2,
             "model": "large-v3-turbo",
             "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
+            "vad_parameters": {
+                "threshold": 0.5,
+                "min_speech_duration_ms": 250,
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            "cpu_fallback_enabled": False,
+            "word_timestamps": True,
+            "punctuation_normalization": True,
+            "speaker_diarization_enabled": False,
+            "chunk_duration_ms": 900_000,
+            "chunk_overlap_ms": 5_000,
             "model_root": str(paths.durable("models", "faster-whisper")),
             "cache_root": str(paths.runtime("models", "faster-whisper")),
         }
@@ -1637,6 +1650,119 @@ def test_notes_retry_depends_on_transcription_not_translation(
         assert [(run.attempt, run.status) for run in attempts] == [
             (1, "failed"), (2, "queued")
         ]
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_completed_notes_stage_can_be_regenerated(tmp_path: Path) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = create_chat_connection(configuration)
+        notes = create_chat_profile(
+            configuration,
+            name="Notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="qwen-notes",
+        )
+        ready_chat_profile(configuration, notes.id)
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/regenerate"}],
+            options={
+                "output_type": "notes",
+                "notes_profile_id": notes.id,
+            },
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        for run in item.stage_runs:
+            run.status = "completed"
+        item.status = "completed"
+        item.task.status = "completed"
+        session.commit()
+
+        regenerated = tasks.retry_stage(
+            item.id,
+            "notes",
+            expected_attempt=1,
+            override={"schema_version": 1, "strategy": "same"},
+        )
+
+        attempts = [run for run in regenerated.stage_runs if run.stage == "notes"]
+        assert [(run.attempt, run.status) for run in attempts] == [
+            (1, "completed"),
+            (2, "queued"),
+        ]
+        assert regenerated.status == "queued"
+        assert tasks.get_task(created.id).status == "queued"
+    finally:
+        session.bind.dispose()
+        session.close()
+
+
+def test_notes_retry_persists_an_explicit_current_profile_and_language(
+    tmp_path: Path,
+) -> None:
+    tasks, configuration, session, _ = make_services(tmp_path)
+    try:
+        connection = create_chat_connection(configuration, api_key="chat-secret")
+        original = create_chat_profile(
+            configuration,
+            name="Original notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="qwen-original",
+        )
+        selected = create_chat_profile(
+            configuration,
+            name="Selected notes",
+            purpose="notes",
+            connection_id=connection.id,
+            model="qwen-selected",
+        )
+        ready_chat_profile(configuration, original.id)
+        ready_chat_profile(configuration, selected.id)
+        created = tasks.create_task(
+            sources=[{"kind": "url", "locator": "https://youtu.be/notes-retry"}],
+            options={
+                "output_type": "notes",
+                "notes_profile_id": original.id,
+            },
+        )
+        item = session.get(ItemRecord, created.items[0].id)
+        assert item is not None
+        for run in item.stage_runs:
+            run.status = "completed" if run.stage != "notes" else "failed"
+        session.commit()
+        original_snapshot = json.loads(json.dumps(item.task.pipeline_snapshot_json))
+
+        override = tasks.build_retry_override(
+            notes_profile_id=selected.id,
+            notes_profile_revision=selected.revision,
+            notes_output_language="en",
+        )
+        tasks.retry_stage(
+            item.id,
+            "notes",
+            expected_attempt=1,
+            override=override,
+        )
+
+        session.expire_all()
+        stored = session.get(ItemRecord, item.id)
+        assert stored is not None
+        retry = max(
+            (run for run in stored.stage_runs if run.stage == "notes"),
+            key=lambda run: run.attempt,
+        )
+        assert retry.retry_override_json["notes"]["profile"]["id"] == selected.id
+        assert (
+            retry.retry_override_json["notes"]["profile"]["model"]
+            == "qwen-selected"
+        )
+        assert retry.retry_override_json["notes"]["output_language"] == "en"
+        assert stored.task.pipeline_snapshot_json == original_snapshot
     finally:
         session.bind.dispose()
         session.close()

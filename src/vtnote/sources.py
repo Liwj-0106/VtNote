@@ -7,12 +7,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from vtnote.artifacts import validate_source_subtitle
 
 
 SourceKind = Literal[
     "bilibili",
+    "douyin",
     "youtube",
     "local_media",
     "uploaded_media",
@@ -24,6 +26,7 @@ SubtitleKind = Literal["manual", "automatic", "unconfirmed"]
 SOURCE_KINDS = frozenset(
     {
         "bilibili",
+        "douyin",
         "youtube",
         "local_media",
         "uploaded_media",
@@ -31,13 +34,14 @@ SOURCE_KINDS = frozenset(
         "uploaded_subtitle",
     }
 )
-REMOTE_SOURCE_KINDS = frozenset({"bilibili", "youtube"})
+REMOTE_SOURCE_KINDS = frozenset({"bilibili", "douyin", "youtube"})
 SUBTITLE_KINDS = frozenset({"manual", "automatic", "unconfirmed"})
 SUBTITLE_FORMAT_ORDER = {"vtt": 0, "srt": 1, "ass": 2, "json": 3}
 _SUBTITLE_KIND_ORDER = {"manual": 0, "automatic": 1, "unconfirmed": 2}
 _TRACK_ID = re.compile(r"^trk_[0-9a-f]{64}$")
 _LANGUAGE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _FORMAT = re.compile(r"^[a-z0-9]{1,16}$")
+_PUBLISHED_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _CANDIDATE_ERROR_CODES = frozenset(
     {
         "subtitle_empty",
@@ -191,6 +195,10 @@ class SourceProbeResult:
     canonical_url: str | None
     title: str
     duration_ms: int | None
+    author: str | None = None
+    published_at: str | None = None
+    thumbnail_url: str | None = None
+    description: str | None = field(default=None, repr=False)
     subtitle_tracks: tuple[SubtitleTrack, ...] = ()
     redirect_trace: tuple[str, ...] = field(
         default=(),
@@ -210,6 +218,39 @@ class SourceProbeResult:
             type(self.duration_ms) is not int or self.duration_ms < 0
         ):
             raise ValueError("source duration must be a nonnegative integer")
+        if self.author is not None and (
+            not isinstance(self.author, str)
+            or not self.author.strip()
+            or len(self.author) > 512
+        ):
+            raise ValueError("source author must be a bounded string")
+        if self.published_at is not None and (
+            not isinstance(self.published_at, str)
+            or _PUBLISHED_DATE.fullmatch(self.published_at) is None
+        ):
+            raise ValueError("source publication date must use YYYY-MM-DD")
+        if self.thumbnail_url is not None:
+            try:
+                thumbnail = urlsplit(self.thumbnail_url)
+                port = thumbnail.port
+            except ValueError:
+                raise ValueError("source thumbnail URL is invalid") from None
+            if (
+                len(self.thumbnail_url) > 4_096
+                or thumbnail.scheme.casefold() != "https"
+                or not thumbnail.hostname
+                or port not in {None, 443}
+                or thumbnail.username is not None
+                or thumbnail.password is not None
+                or thumbnail.fragment
+            ):
+                raise ValueError("source thumbnail URL is invalid")
+        if self.description is not None and (
+            not isinstance(self.description, str)
+            or not self.description.strip()
+            or len(self.description) > 20_000
+        ):
+            raise ValueError("source description must be a bounded string")
         if source_kind in REMOTE_SOURCE_KINDS:
             if not isinstance(self.canonical_url, str) or not self.canonical_url:
                 raise ValueError("remote source requires a canonical URL")
@@ -231,6 +272,84 @@ class SourceProbeResult:
             raise ValueError("invalid private redirect trace")
         object.__setattr__(self, "source_kind", source_kind)
         object.__setattr__(self, "title", self.title.strip())
+        if self.author is not None:
+            object.__setattr__(self, "author", self.author.strip())
+        if self.description is not None:
+            object.__setattr__(self, "description", self.description.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCollectionItem:
+    id: str
+    canonical_url: str
+    title: str
+    duration_ms: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.id, str)
+            or not self.id.strip()
+            or len(self.id) > 128
+        ):
+            raise ValueError("collection item id must be a non-empty bounded string")
+        if not isinstance(self.canonical_url, str) or not self.canonical_url:
+            raise ValueError("collection item requires a canonical URL")
+        if (
+            not isinstance(self.title, str)
+            or not self.title.strip()
+            or len(self.title) > 4_096
+        ):
+            raise ValueError("collection item title must be a non-empty bounded string")
+        if self.duration_ms is not None and (
+            type(self.duration_ms) is not int or self.duration_ms < 0
+        ):
+            raise ValueError("collection item duration must be a nonnegative integer")
+        object.__setattr__(self, "id", self.id.strip())
+        object.__setattr__(self, "title", self.title.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCollectionProbeResult:
+    source_kind: SourceKind
+    id: str
+    canonical_url: str
+    title: str
+    items: tuple[SourceCollectionItem, ...]
+    total_items: int
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        source_kind = _normalize_source_kind(self.source_kind)
+        if source_kind not in REMOTE_SOURCE_KINDS:
+            raise ValueError("collection source must be remote")
+        if not isinstance(self.id, str) or not self.id.strip() or len(self.id) > 128:
+            raise ValueError("collection id must be a non-empty bounded string")
+        if not isinstance(self.canonical_url, str) or not self.canonical_url:
+            raise ValueError("collection requires a canonical URL")
+        if (
+            not isinstance(self.title, str)
+            or not self.title.strip()
+            or len(self.title) > 4_096
+        ):
+            raise ValueError("collection title must be a non-empty bounded string")
+        if not isinstance(self.items, tuple) or not self.items or any(
+            not isinstance(item, SourceCollectionItem) for item in self.items
+        ):
+            raise ValueError("collection requires valid items")
+        if type(self.total_items) is not int or self.total_items < len(self.items):
+            raise ValueError("collection total must include all returned items")
+        if type(self.truncated) is not bool:
+            raise ValueError("collection truncated flag must be boolean")
+        item_ids = [item.id for item in self.items]
+        item_urls = [item.canonical_url for item in self.items]
+        if (
+            len(item_ids) != len(set(item_ids))
+            or len(item_urls) != len(set(item_urls))
+        ):
+            raise ValueError("collection items must be unique")
+        object.__setattr__(self, "source_kind", source_kind)
+        object.__setattr__(self, "id", self.id.strip())
+        object.__setattr__(self, "title", self.title.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +364,12 @@ class AudioOutcome:
     format: str
     duration_ms: int
     size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThumbnailOutcome:
+    content: bytes
+    media_type: Literal["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"]
 
 
 class SourceError(RuntimeError):
@@ -284,6 +409,8 @@ class SubtitleCandidateError(SourceError):
 class SourceAdapter(Protocol):
     def probe(self, canonical_source: str) -> SourceProbeResult: ...
 
+    def fetch_thumbnail(self, canonical_source: str) -> ThumbnailOutcome: ...
+
     def fetch_subtitle(
         self,
         probe: SourceProbeResult,
@@ -295,6 +422,13 @@ class SourceAdapter(Protocol):
         probe: SourceProbeResult,
         item_id: str,
     ) -> AudioOutcome: ...
+
+
+class SourceCollectionAdapter(Protocol):
+    def probe_collection(
+        self,
+        canonical_source: str,
+    ) -> SourceCollectionProbeResult | None: ...
 
 
 class SubtitleTrackSelector:

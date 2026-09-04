@@ -19,6 +19,7 @@ from vtnote.local_asr import (
     LocalAsrProvenance,
     TranscriptionContext,
 )
+from vtnote.local_asr_contract import build_local_asr_snapshot
 from vtnote.media import MediaInfo, PreparedAudio
 from vtnote.models import (
     CloudSubmissionRecord,
@@ -225,8 +226,8 @@ def local_snapshot(*, device: str = "cuda") -> dict[str, object]:
         "device": device,
         "compute_type": "int8_float16",
         "vad_filter": True,
-        "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",
-        "cache_root": r"D:\Workspace\Codex\cache\VtNote-runtime\models\faster-whisper",
+        "model_root": ".vtnote/ManagedAssets/Data/models/faster-whisper",
+        "cache_root": ".vtnote/ManagedAssets/Cache/models/faster-whisper",
     }
 
 
@@ -280,13 +281,15 @@ def make_claim(
     source = tmp_path / "source.mp4"
     source.write_bytes(b"media")
     with Session(engine) as session:
+        snapshot = {
+            "schema_version": 1,
+            "asr": {"mode": mode, "profile": profile},
+            "local_asr": build_local_asr_snapshot("faster_whisper"),
+            "local_whisper": local_snapshot(),
+        }
         task = TaskRecord(
             options=dict(options or {}),
-            pipeline_snapshot_json={
-                "schema_version": 1,
-                "asr": {"mode": mode, "profile": profile},
-                "local_whisper": local_snapshot(),
-            }
+            pipeline_snapshot_json=snapshot,
         )
         item = ItemRecord(
             task=task,

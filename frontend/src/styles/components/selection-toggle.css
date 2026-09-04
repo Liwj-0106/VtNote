@@ -1,0 +1,76 @@
+.selection-toggle-button {
+  display: inline-grid;
+  width: var(--control-md);
+  height: var(--control-md);
+  flex: 0 0 var(--control-md);
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  transition: border-color var(--motion-fast), background var(--motion-fast),
+    color var(--motion-fast), transform var(--motion-fast);
+}
+
+.selection-toggle-button:hover:not(:disabled) {
+  border-color: var(--terracotta);
+  background: var(--hover);
+  color: var(--terracotta-strong);
+}
+
+.selection-toggle-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.selection-toggle-button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.selection-toggle-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.selection-toggle-mark {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1.5px solid currentcolor;
+  border-radius: 5px;
+}
+
+.selection-toggle-mark svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 2.2;
+}
+
+.selection-toggle-button[data-state="on"] {
+  border-color: color-mix(in srgb, var(--terracotta) 58%, var(--border));
+  background: var(--terracotta-soft);
+  color: var(--terracotta-strong);
+}
+
+.selection-toggle-button[data-state="on"] .selection-toggle-mark {
+  border-color: var(--terracotta-strong);
+  background: var(--terracotta-strong);
+  color: var(--accent-contrast);
+}
+
+.selection-toggle-button[data-state="mixed"] {
+  border-color: color-mix(in srgb, var(--terracotta) 44%, var(--border));
+  background: var(--selected);
+  color: var(--terracotta-strong);
+}
+
+.selection-toggle-button[data-state="mixed"] .selection-toggle-mark::after {
+  width: 10px;
+  height: 2px;
+  border-radius: 2px;
+  background: currentcolor;
+  content: "";
+}

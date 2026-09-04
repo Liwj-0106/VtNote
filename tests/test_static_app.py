@@ -13,7 +13,7 @@ from vtnote.secrets import MemorySecretStore
 from vtnote.sensitive_text import MemorySensitiveTextProtector
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 
 
 def test_built_spa_is_served_without_capturing_api_or_mutation_routes(
@@ -29,6 +29,10 @@ def test_built_spa_is_served_without_capturing_api_or_mutation_routes(
         encoding="utf-8",
     )
     (assets / "app.js").write_text("window.VTNOTE = true;", encoding="utf-8")
+    (dist / "favicon.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" />',
+        encoding="utf-8",
+    )
     settings = Settings(data_root=data_root, runtime_cache_root=runtime_root)
     engine = initialize_database(data_root / "vtnote.db")
     app = create_app(
@@ -42,10 +46,15 @@ def test_built_spa_is_served_without_capturing_api_or_mutation_routes(
     with TestClient(app, base_url=BASE_URL) as client:
         assert "VtNote UI" in client.get("/").text
         assert "VtNote UI" in client.get("/tasks").text
+        assert "VtNote UI" in client.get("/settings/export").text
+        assert "VtNote UI" in client.get("/settings/models").text
         assert "VtNote UI" in client.get(
             "/tasks/94f344da-aa8d-481c-8d91-e6b94efc6e67"
         ).text
         assert client.get("/assets/app.js").text == "window.VTNOTE = true;"
+        favicon = client.get("/favicon.svg")
+        assert favicon.status_code == 200
+        assert favicon.headers["content-type"] == "image/svg+xml"
         assert client.get("/api/nope").json()["error"]["code"] == "http_error"
         csrf = client.get("/api/security/csrf").json()["csrf_token"]
         assert (

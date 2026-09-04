@@ -19,7 +19,7 @@ from vtnote.worker import StageContext
 from vtnote.worker_store import WorkerStore
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
 SRT = b"1\n00:00:00,000 --> 00:00:01,200\nVtNote offline\n"
 

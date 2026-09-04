@@ -20,9 +20,9 @@ _LANGUAGE_RE = re.compile(
     r"^[A-Za-z]{2,3}(?:-[A-Za-z]{4})?(?:-(?:[A-Za-z]{2}|\d{3}))?"
     r"(?:-(?:[A-Za-z0-9]{5,8}|\d[A-Za-z0-9]{3}))*$"
 )
-_SOURCE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "json"})
+_SOURCE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "txt", "json"})
 _AUDIO_EXTENSIONS = frozenset(
-    {"aac", "wav", "mp3", "m4a", "flac", "ogg", "opus", "webm"}
+    {"aac", "wav", "mp3", "m4a", "flac", "ogg", "opus", "webm", "mp4"}
 )
 _MEDIA_EXTENSIONS = frozenset(
     {
@@ -132,6 +132,13 @@ class StoragePaths:
     def from_settings(cls, settings: Settings) -> "StoragePaths":
         return cls(settings.data_root, settings.runtime_cache_root)
 
+    @classmethod
+    def managed_assets_from_settings(cls, settings: Settings) -> "StoragePaths":
+        root = settings.managed_assets_root
+        if root is None:
+            return cls.from_settings(settings)
+        return cls(root / "Data", root / "Cache")
+
     @property
     def database(self) -> Path:
         return self.durable("vtnote.db")
@@ -150,8 +157,29 @@ class StoragePaths:
             f"original.{_extension(extension, _SOURCE_EXTENSIONS)}",
         )
 
+    def durable_item_root(self, item_id: str | UUID) -> Path:
+        """Return the exact durable directory owned by one task item."""
+
+        return self.durable("items", _uuid_component(item_id))
+
+    def runtime_item_root(self, item_id: str | UUID) -> Path:
+        """Return the exact disposable-cache directory owned by one task item."""
+
+        return self.runtime("items", _uuid_component(item_id))
+
+    def task_deletion_staging(self, operation_id: str | UUID) -> Path:
+        """Return an internal rollback staging directory for one delete operation."""
+
+        return self.runtime("task-deletions", _uuid_component(operation_id))
+
     def transcript(self, item_id: str | UUID) -> Path:
         return self.durable("items", _uuid_component(item_id), "transcript.json")
+
+    def transcript_alignment(self, item_id: str | UUID) -> Path:
+        return self.durable("items", _uuid_component(item_id), "alignment.json")
+
+    def speaker_map(self, item_id: str | UUID) -> Path:
+        return self.durable("items", _uuid_component(item_id), "speakers.json")
 
     def transcription_recovery(
         self,
@@ -163,6 +191,22 @@ class StoragePaths:
             _uuid_component(item_id),
             "recovery",
             f"{_uuid_component(stage_run_id)}.json",
+        )
+
+    def transcription_chunk_recovery(
+        self,
+        item_id: str | UUID,
+        stage_run_id: str | UUID,
+        chunk_index: int,
+    ) -> Path:
+        if type(chunk_index) is not int or chunk_index < 0 or chunk_index > 999_999:
+            raise UnsafePathError("invalid transcription chunk index")
+        return self.durable(
+            "items",
+            _uuid_component(item_id),
+            "recovery",
+            _uuid_component(stage_run_id),
+            f"chunk-{chunk_index:06d}.json",
         )
 
     def translation(self, item_id: str | UUID, language: str) -> Path:

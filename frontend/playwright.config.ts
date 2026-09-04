@@ -4,8 +4,17 @@ import { fileURLToPath } from "node:url";
 
 const frontendRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(frontendRoot, "..");
-const python = "D:\\ProgramData\\Anaconda3\\envs\\vtnote\\python.exe";
-const qaRoot = "D:\\Workspace\\Codex\\cache\\VtNote-playwright";
+const python = process.env.VTNOTE_PYTHON || "python";
+const frontendPort = process.env.VTNOTE_FRONTEND_E2E_PORT || "5173";
+const frontendUrl = `http://127.0.0.1:${frontendPort}`;
+const qaRoot = resolve(
+  repositoryRoot,
+  ".vtnote",
+  "Cache",
+  "test",
+  "playwright",
+);
+process.env.PLAYWRIGHT_BROWSERS_PATH ||= resolve(qaRoot, "browsers");
 
 export default defineConfig({
   testDir: "./e2e",
@@ -14,31 +23,28 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   use: {
-    baseURL: "http://127.0.0.1:5173",
+    baseURL: frontendUrl,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    launchOptions: {
-      executablePath:
-        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    },
   },
+  outputDir: resolve(qaRoot, "results"),
   webServer: [
     {
-      command: `"${python}" -m uvicorn vtnote.api:create_app --factory --host 127.0.0.1 --port 8765`,
+      command: `"${python}" -m uvicorn vtnote.api:create_app --factory --host 127.0.0.1 --port 8766`,
       cwd: repositoryRoot,
       env: {
         PYTHONPATH: "src",
         VTNOTE_DATA_ROOT: `${qaRoot}\\data`,
         VTNOTE_RUNTIME_CACHE_ROOT: `${qaRoot}\\runtime`,
       },
-      url: "http://127.0.0.1:8765/api/health",
+      url: "http://127.0.0.1:8766/api/health",
       reuseExistingServer: false,
       timeout: 30_000,
     },
     {
-      command: "npm run dev -- --host 127.0.0.1 --port 5173",
+      command: `npm run dev -- --host 127.0.0.1 --port ${frontendPort}`,
       cwd: frontendRoot,
-      url: "http://127.0.0.1:5173",
+      url: frontendUrl,
       reuseExistingServer: false,
       timeout: 30_000,
     },

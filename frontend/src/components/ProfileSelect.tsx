@@ -1,4 +1,6 @@
 import type { ProfileView } from "../api/types";
+import { availableProfiles } from "../features/profile-selection/model";
+import { SelectMenu } from "./SelectMenu";
 
 export function ProfileSelect({
   id,
@@ -17,34 +19,26 @@ export function ProfileSelect({
   onChange: (value: string) => void;
   required?: boolean;
 }) {
-  const available = profiles.filter(
-    (profile) =>
-      profile.purpose === purpose &&
-      profile.tested &&
-      profile.test_ok === true &&
-      (purpose === "cloud_asr"
-        ? profile.upload_authorized
-        : profile.chat_data_authorized),
-  );
+  const available = availableProfiles(profiles, purpose);
   return (
     <div className="field">
       <label className="field-label" htmlFor={id}>
         {label}
       </label>
-      <select
+      <SelectMenu
         id={id}
-        className="select-input"
+        ariaLabel={label}
         value={value}
         required={required}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        <option value="">选择已测试并授权的配置</option>
-        {available.map((profile) => (
-          <option key={profile.id} value={profile.id}>
-            {profile.name} · {profile.model}
-          </option>
-        ))}
-      </select>
+        onChange={onChange}
+        options={[
+          { value: "", label: "选择已测试并授权的配置" },
+          ...available.map((profile) => ({
+            value: profile.id,
+            label: `${profile.name} · ${profile.model}`,
+          })),
+        ]}
+      />
       {available.length === 0 && (
         <p className="field-hint">还没有可用配置，请先前往设置。</p>
       )}

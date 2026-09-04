@@ -3,28 +3,54 @@
 from __future__ import annotations
 
 import logging
+import importlib.util
 import re
 import secrets as token_secrets
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
+from vtnote.application.task_contracts import MAX_BATCH_SOURCES
 from vtnote.config import Settings
 from vtnote.chat import BailianProfileTester
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
 from vtnote.diagnostics import diagnostic_bundle_bytes
-from vtnote.exports import ExportFormat, render_execution_summary
+from vtnote.exports import render_execution_summary
+from vtnote.http.contracts import (
+    AsrConnectionVerifyInput,
+    ChatConnectionVerifyInput,
+    ChatDataAuthorizationInput,
+    ConnectionCreate,
+    ConnectionPatch,
+    ConnectionTester,
+    ConnectivityResult,
+    DefaultsPatch,
+    NotesPromptView,
+    ProbeInput,
+    ProfileCreate,
+    ProfilePatch,
+    ProfileTester,
+    ProfileTestInput,
+    UploadTaskMetadata,
+)
+from vtnote.http.responses import (
+    dump_model as _dump,
+    error_response as _error,
+)
+from vtnote.http.export_routes import register_export_routes
+from vtnote.http.library_routes import register_library_routes
+from vtnote.http.model_asset_routes import register_model_asset_routes
+from vtnote.http.source_routes import register_source_routes
+from vtnote.http.task_routes import register_task_routes
+from vtnote.folder_picker import DirectoryPicker, pick_directory
 from vtnote.media import (
     MEDIA_EXTENSIONS,
     CommandRunner,
@@ -32,19 +58,30 @@ from vtnote.media import (
     FfmpegMediaProcessor,
     MediaError,
 )
-from vtnote.model_assets import ModelAssetError, ModelAssetService
+from vtnote.model_assets import (
+    ModelAssetService,
+    load_sensevoice_manifest,
+    load_silero_vad_manifest,
+)
+from vtnote.notes import DEFAULT_NOTES_PROMPT
 from vtnote.paths import StoragePaths, UnsafePathError
 from vtnote.platform_sources import build_default_platform_registry
+from vtnote.project_resources import bundled_asset, frontend_dist_path
+from vtnote.provider_chat import (
+    CHAT_PROTOCOLS,
+    MODERN_CHAT_PROTOCOLS,
+    ProviderProfileTester,
+)
 from vtnote.readiness import ReadinessInspector
+from vtnote.youtube_runtime import inspect_youtube_runtime
 from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 from vtnote.secrets import KeyringSecretStore, SecretStore
 from vtnote.sources import (
-    REMOTE_SOURCE_KINDS,
     PlatformSourceError,
     SourceAdapter,
     SourceCapabilityError,
-    SubtitleTrack,
 )
+from vtnote.source_probing import SourceProbeService
 from vtnote.sensitive_text import (
     SensitiveTextMigrationRequired,
     SensitiveTextProtectionError,
@@ -52,7 +89,12 @@ from vtnote.sensitive_text import (
     WindowsDpapiSensitiveTextProtector,
     migrate_sensitive_text,
 )
-from vtnote.tasks import InvalidTaskOperation, LocalSourceValidator, TaskService
+from vtnote.tasks import (
+    InvalidTaskOperation,
+    LocalSourceValidator,
+    TaskDeletionError,
+    TaskService,
+)
 from vtnote.tencent_asr import (
     BUILTIN_ASR_TEST_SAMPLE_ID,
     BuiltinSpeechSampleResolver,
@@ -75,264 +117,12 @@ from vtnote.uploads import (
     UploadService,
     UploadTaskContext,
 )
-from vtnote.url_security import Resolver, SocketResolver, SourceUrlPolicy, UnsafeSourceUrl
-
-
-@dataclass(frozen=True, slots=True)
-class ConnectivityResult:
-    ok: bool
-    message: str | None = None
-
-
-class ConnectionTester(Protocol):
-    def test_connection(
-        self, connection: Any, credentials: Any, *, follow_redirects: Literal[False]
-    ) -> ConnectivityResult: ...
-
-
-class ProfileTester(Protocol):
-    def test_profile(
-        self,
-        profile: Any,
-        credentials: Any,
-        test_input: "ProfileTestInput",
-        *,
-        follow_redirects: Literal[False],
-    ) -> ConnectivityResult: ...
-
-
-class InputModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-
-class ConnectionCreate(InputModel):
-    name: str = Field(min_length=1, max_length=128)
-    protocol: str
-    base_url: str | None = None
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    secret: str | None = Field(default=None, min_length=1)
-    credentials: dict[str, Any] | None = None
-
-
-class ConnectionPatch(InputModel):
-    name: str | None = Field(default=None, min_length=1, max_length=128)
-    base_url: str | None = None
-    parameters: dict[str, Any] | None = None
-    secret: str | None = Field(default=None, min_length=1)
-    credentials: dict[str, Any] | None = None
-    clear_secret: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_explicit_nulls(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            for field in (
-                "name",
-                "base_url",
-                "parameters",
-                "secret",
-                "credentials",
-                "clear_secret",
-            ):
-                if field in value and value[field] is None:
-                    raise ValueError(f"{field} cannot be null")
-        return value
-
-
-class ProfileCreate(InputModel):
-    name: str = Field(min_length=1, max_length=128)
-    purpose: str
-    connection_id: str
-    model: str = Field(min_length=1)
-    context_length: int = Field(default=32768, gt=0)
-    options: dict[str, Any] = Field(default_factory=dict)
-
-
-class ProfilePatch(InputModel):
-    name: str | None = Field(default=None, min_length=1)
-    connection_id: str | None = None
-    model: str | None = Field(default=None, min_length=1)
-    context_length: int | None = Field(default=None, gt=0)
-    options: dict[str, Any] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_explicit_nulls(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            for field in ("name", "connection_id", "model", "context_length", "options"):
-                if field in value and value[field] is None:
-                    raise ValueError(f"{field} cannot be null")
-        return value
-
-
-class ProfileTestInput(InputModel):
-    test_kind: Literal[
-        "provider_profile",
-        "cos_sentinel",
-        "connection_policy_validated",
-        "profile_capability_tested",
-    ] = "provider_profile"
-    acknowledge_billable_request: bool = False
-    speech_sample_upload_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-    )
-
-
-class AsrConnectionVerifyInput(InputModel):
-    acknowledge_billable_request: bool = False
-    authorize_task_audio_upload: bool = False
-
-
-class ChatConnectionVerifyInput(InputModel):
-    acknowledge_billable_request: bool = False
-    authorize_chat_data_upload: bool = False
-
-
-class ChatDataAuthorizationInput(InputModel):
-    acknowledge_chat_data_upload: bool
-
-
-class ModelInstallInput(InputModel):
-    acknowledge_download: bool
-    expected_revision: str = Field(min_length=40, max_length=40)
-
-
-class DefaultsPatch(InputModel):
-    asr_mode: Literal["auto", "cloud", "local"] | None = None
-    cloud_asr_profile_id: str | None = None
-    translation_enabled: bool | None = None
-    translation_profile_id: str | None = None
-    translation_target_language: str | None = Field(default=None, min_length=1)
-    notes_enabled: bool | None = None
-    notes_profile_id: str | None = None
-    notes_template: Literal["summary", "key_points", "custom"] | None = None
-    notes_output_language: str | None = Field(default=None, min_length=1)
-    notes_custom_prompt: str | None = None
-    local_whisper_options: dict[str, Any] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_explicit_nulls(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            for field in (
-                "asr_mode",
-                "translation_enabled",
-                "translation_target_language",
-                "notes_enabled",
-                "notes_template",
-                "notes_output_language",
-                "local_whisper_options",
-            ):
-                if field in value and value[field] is None:
-                    raise ValueError(f"{field} cannot be null")
-        return value
-
-
-class SourceInput(InputModel):
-    kind: Literal["url", "local_media", "local_subtitle"]
-    locator: str = Field(min_length=1)
-
-
-class TaskCreate(InputModel):
-    sources: list[SourceInput]
-    output_type: Literal["audio", "transcript", "notes"] | None = None
-    audio_export_enabled: bool | None = None
-    asr_mode: Literal["auto", "cloud", "local"] | None = None
-    cloud_asr_profile_id: str | None = None
-    translation_enabled: bool | None = None
-    translation_profile_id: str | None = None
-    translation_target_language: str | None = Field(default=None, min_length=1)
-    notes_enabled: bool | None = None
-    notes_profile_id: str | None = None
-    notes_template: Literal["summary", "key_points", "custom"] | None = None
-    notes_output_language: str | None = Field(default=None, min_length=1)
-    notes_custom_prompt: str | None = None
-
-
-class UploadTaskMetadata(InputModel):
-    """The first multipart part; the second and final part is always ``file``."""
-
-    kind: Literal["media", "subtitle"]
-    output_type: Literal["audio", "transcript", "notes"] | None = None
-    audio_export_enabled: bool | None = None
-    asr_mode: Literal["auto", "cloud", "local"] | None = None
-    cloud_asr_profile_id: str | None = None
-    translation_enabled: bool | None = None
-    translation_profile_id: str | None = None
-    translation_target_language: str | None = Field(default=None, min_length=1)
-    notes_enabled: bool | None = None
-    notes_profile_id: str | None = None
-    notes_template: Literal["summary", "key_points", "custom"] | None = None
-    notes_output_language: str | None = Field(default=None, min_length=1)
-    notes_custom_prompt: str | None = None
-
-
-class ProbeInput(InputModel):
-    url: str = Field(min_length=1)
-
-
-class RetryInput(InputModel):
-    item_id: str
-    stage: str
-    expected_attempt: int = Field(gt=0, strict=True)
-    strategy: Literal["same", "local", "cloud_confirmed"] = "same"
-    cloud_profile_id: str | None = Field(default=None, min_length=1, max_length=128)
-    connection_revision: int | None = Field(default=None, gt=0, strict=True)
-    profile_revision: int | None = Field(default=None, gt=0, strict=True)
-    acknowledge_possible_charge: bool = Field(default=False, strict=True)
-
-    @model_validator(mode="after")
-    def validate_strategy_fields(self) -> RetryInput:
-        cloud_fields = {
-            "cloud_profile_id",
-            "connection_revision",
-            "profile_revision",
-        }
-        if self.strategy == "cloud_confirmed":
-            if (
-                self.cloud_profile_id is None
-                or self.connection_revision is None
-                or self.profile_revision is None
-                or self.acknowledge_possible_charge is not True
-            ):
-                raise ValueError(
-                    "cloud_confirmed requires a current profile, revisions, "
-                    "and possible-charge acknowledgement"
-                )
-        elif self.model_fields_set & cloud_fields:
-            raise ValueError(
-                "cloud retry fields are valid only for cloud_confirmed"
-            )
-        elif self.strategy == "local" and self.acknowledge_possible_charge:
-            raise ValueError(
-                "possible-charge acknowledgement is invalid for local retry"
-            )
-        return self
-
-
-def _error(status: int, code: str, message: str, details: Any = None) -> JSONResponse:
-    return JSONResponse(
-        status_code=status,
-        content={"error": {"code": code, "message": message, "details": details}},
-    )
-
-
-def _dump(value: Any) -> Any:
-    return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-
-
-def _dump_subtitle(track: SubtitleTrack) -> dict[str, Any]:
-    return {
-        "id": track.id,
-        "language": track.language,
-        "format": track.format,
-        "kind": track.kind,
-        "ui_label": track.ui_label,
-        "is_translated": track.is_translated,
-        "is_live_chat": track.is_live_chat,
-    }
+from vtnote.url_security import (
+    Resolver,
+    SocketResolver,
+    SourceUrlPolicy,
+    UnsafeSourceUrl,
+)
 
 
 def create_app(
@@ -348,9 +138,11 @@ def create_app(
     upload_limits: UploadLimits | None = None,
     sensitive_text_protector: SensitiveTextProtector | None = None,
     frontend_dist: Path | None = None,
+    directory_picker: DirectoryPicker | None = None,
 ) -> FastAPI:
     selected_settings = settings or Settings()
     paths = StoragePaths.from_settings(selected_settings)
+    model_paths = StoragePaths.managed_assets_from_settings(selected_settings)
     selected_protector = (
         sensitive_text_protector
         or WindowsDpapiSensitiveTextProtector()
@@ -363,12 +155,15 @@ def create_app(
         migrate_sensitive_text(selected_engine, selected_protector)
     selected_secrets = secret_store or KeyringSecretStore()
     selected_resolver = resolver or SocketResolver()
-    source_policy = SourceUrlPolicy(selected_resolver)
+    source_policy = SourceUrlPolicy(
+        selected_resolver,
+        resolve_dns=selected_settings.platform_proxy_url is None,
+    )
     selected_upload_limits = upload_limits or UploadLimits()
     selected_frontend_dist = (
         Path(frontend_dist)
         if frontend_dist is not None
-        else Path(__file__).resolve().parents[2] / "frontend" / "dist"
+        else frontend_dist_path()
     )
     frontend_index = selected_frontend_dist / "index.html"
     frontend_available = frontend_index.is_file()
@@ -385,15 +180,13 @@ def create_app(
         resolver=selected_resolver,
         session_factory=sessions,
     )
+    source_probe_service = SourceProbeService(source_policy, selected_source_probe)
     uploaded_speech_samples = UploadedSpeechSampleResolver(
         engine=selected_engine,
         paths=paths,
     )
     built_in_speech_samples = BuiltinSpeechSampleResolver(
-        Path(__file__).resolve().parents[2]
-        / "assets"
-        / "test-audio"
-        / "tencent-asr-check.wav"
+        bundled_asset("test-audio", "tencent-asr-check.wav")
     )
     default_tencent_tester = TencentConnectivityTester(
         client=TencentRecordingClient(),
@@ -407,15 +200,27 @@ def create_app(
     )
     default_bailian_tester = BailianProfileTester()
     default_tokenhub_tester = TokenHubProfileTester()
+    default_provider_tester = ProviderProfileTester()
     model_assets = ModelAssetService(
         engine=selected_engine,
-        paths=paths,
-        manifest_path=(
-            Path(__file__).resolve().parents[2]
-            / "assets"
-            / "models"
-            / "large-v3-turbo.manifest.json"
+        paths=model_paths,
+        manifest_path=bundled_asset(
+            "models", "large-v3-turbo.manifest.json"
         ),
+    )
+    sensevoice_assets = ModelAssetService(
+        engine=selected_engine,
+        paths=model_paths,
+        manifest_path=bundled_asset(
+            "models", "sensevoice-small-int8.manifest.json"
+        ),
+        manifest_loader=load_sensevoice_manifest,
+    )
+    silero_vad_assets = ModelAssetService(
+        engine=selected_engine,
+        paths=model_paths,
+        manifest_path=bundled_asset("models", "silero-vad.manifest.json"),
+        manifest_loader=load_silero_vad_manifest,
     )
     expected_host = f"{selected_settings.bind_host}:{selected_settings.bind_port}"
     expected_origin = f"http://{expected_host}"
@@ -429,20 +234,6 @@ def create_app(
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     logger = logging.getLogger("vtnote.api")
-
-    def model_status_payload(status: Any) -> dict[str, Any]:
-        return {
-            "model_name": status.model_name,
-            "revision": status.revision,
-            "state": status.state,
-            "total_bytes": status.total_bytes,
-            "downloaded_bytes": status.downloaded_bytes,
-            "completed_files": status.completed_files,
-            "current_file": status.current_file,
-            "current_file_bytes": status.current_file_bytes,
-            "cancel_requested": status.cancel_requested,
-            "error_code": status.error_code,
-        }
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
@@ -516,6 +307,30 @@ def create_app(
             "runtime asset operation failed",
         )
 
+    @app.exception_handler(TaskDeletionError)
+    async def task_deletion_error(_: Request, error: TaskDeletionError):
+        status = {
+            "invalid_task_count": 400,
+            "invalid_task_id": 400,
+            "duplicate_task_ids": 400,
+            "task_not_terminal": 409,
+            "task_delete_active_lease": 409,
+            "task_remote_cleanup_pending": 409,
+            "task_delete_pending_changes": 409,
+            "task_delete_database_busy": 409,
+            "task_delete_staging_conflict": 409,
+            "task_delete_cross_device": 409,
+            "task_delete_asset_state_invalid": 409,
+            "task_delete_filesystem_error": 500,
+            "task_delete_recovery_failed": 500,
+        }.get(error.code, 409)
+        message = {
+            "task_not_terminal": "processing tasks cannot be deleted",
+            "task_delete_active_lease": "task work is still being released",
+            "task_remote_cleanup_pending": "cloud cleanup must finish before deletion",
+        }.get(error.code, "task deletion failed")
+        return _error(status, error.code, message)
+
     async def operation_error(_: Request, error: Exception):
         code = "unsafe_source_url" if isinstance(error, UnsafeSourceUrl) else "invalid_task"
         return _error(400, code, str(error))
@@ -542,7 +357,18 @@ def create_app(
             "adapter_drift": 502,
             "invalid_content": 422,
         }[error.code]
-        return _error(status, error.code, "platform source request failed")
+        message = {
+            "removed": "platform content is unavailable",
+            "temporary": "platform is temporarily unavailable",
+            "auth_required": (
+                "platform requires authentication or fresh verification cookies"
+            ),
+            "region_restricted": "platform content is unavailable in this region",
+            "unsupported": "platform URL is unsupported",
+            "adapter_drift": "platform adapter needs an update",
+            "invalid_content": "platform returned invalid content",
+        }[error.code]
+        return _error(status, error.code, message)
 
     def services() -> tuple[Session, ConfigurationService, TaskService]:
         session = sessions()
@@ -550,6 +376,7 @@ def create_app(
             session,
             selected_secrets,
             paths=paths,
+            model_paths=model_paths,
             sensitive_text_protector=selected_protector,
         )
         tasks = TaskService(
@@ -582,14 +409,38 @@ def create_app(
 
     @app.get("/api/readiness")
     def readiness():
+        def sensevoice_state() -> str:
+            states = {
+                sensevoice_assets.status().state,
+                silero_vad_assets.status().state,
+            }
+            if states == {"installed"}:
+                return (
+                    "installed"
+                    if importlib.util.find_spec("sherpa_onnx") is not None
+                    else "runtime_unavailable"
+                )
+            if "failed" in states:
+                return "failed"
+            if states & {"queued", "downloading", "verifying"}:
+                return "installing"
+            return "not_installed"
+
         report = ReadinessInspector(
             engine=selected_engine,
             paths=paths,
             model_probe=lambda: model_assets.status().state,
+            local_asr_engine_probes={
+                "sensevoice_sherpa_onnx": sensevoice_state,
+            },
+            youtube_probe=lambda: inspect_youtube_runtime(
+                selected_settings
+            ).youtube_ready,
         ).inspect()
         payload = report.model_dump(mode="json")
         payload["limits"] = {
             "max_task_sources": 1,
+            "max_batch_sources": MAX_BATCH_SOURCES,
             "max_media_bytes": selected_upload_limits.max_media_bytes,
             "max_subtitle_bytes": selected_upload_limits.max_subtitle_bytes,
         }
@@ -605,29 +456,12 @@ def create_app(
         )
         return response
 
-    @app.get("/api/assets/local-whisper")
-    def get_local_whisper_asset():
-        return model_status_payload(model_assets.status())
-
-    @app.post("/api/assets/local-whisper/install", status_code=202)
-    def install_local_whisper_asset(payload: ModelInstallInput):
-        try:
-            status = model_assets.request_install(
-                acknowledge_download=payload.acknowledge_download,
-                expected_revision=payload.expected_revision,
-                now=datetime.now(timezone.utc),
-            )
-        except ModelAssetError as error:
-            return _error(400, error.code, "model installation request rejected")
-        return model_status_payload(status)
-
-    @app.post("/api/assets/local-whisper/cancel")
-    def cancel_local_whisper_asset():
-        try:
-            status = model_assets.cancel(now=datetime.now(timezone.utc))
-        except ModelAssetError as error:
-            return _error(400, error.code, "model installation cancel rejected")
-        return model_status_payload(status)
+    register_model_asset_routes(
+        app,
+        local_whisper=model_assets,
+        sensevoice=sensevoice_assets,
+        silero_vad=silero_vad_assets,
+    )
 
     @app.get("/api/connections")
     def list_connections():
@@ -698,7 +532,7 @@ def create_app(
         session, configuration, _ = services()
         try:
             view = configuration.get_connection(connection_id)
-            if view.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
+            if view.protocol in CHAT_PROTOCOLS:
                 return _dump(
                     configuration.record_connection_test(
                         connection_id,
@@ -973,7 +807,7 @@ def create_app(
         sample_to_cleanup: str | None = None
         try:
             profile = configuration.get_profile(profile_id)
-            if profile.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
+            if profile.protocol in CHAT_PROTOCOLS:
                 if payload.test_kind == "connection_policy_validated":
                     return _dump(profile)
                 if payload.test_kind != "profile_capability_tested":
@@ -996,8 +830,7 @@ def create_app(
                 and profile.protocol
                 not in {
                     "tencent_recording_asr",
-                    "aliyun_bailian",
-                    "tencent_tokenhub",
+                    *CHAT_PROTOCOLS,
                 }
             ):
                 return _error(
@@ -1056,7 +889,11 @@ def create_app(
                 else (
                     default_tokenhub_tester
                     if profile.protocol == "tencent_tokenhub"
-                    else default_tencent_tester
+                    else (
+                        default_provider_tester
+                        if profile.protocol in MODERN_CHAT_PROTOCOLS
+                        else default_tencent_tester
+                    )
                 )
             )
             try:
@@ -1126,6 +963,33 @@ def create_app(
         finally:
             session.close()
 
+    @app.post("/api/defaults/notes-prompt/reveal")
+    def reveal_default_notes_prompt():
+        session, configuration, _ = services()
+        try:
+            defaults = configuration.get_defaults()
+            custom_prompt = (
+                configuration.resolve_default_custom_prompt()
+                if defaults.has_custom_prompt
+                else None
+            )
+            payload = NotesPromptView(
+                prompt=custom_prompt or DEFAULT_NOTES_PROMPT,
+                is_custom=(
+                    defaults.notes_template == "custom"
+                    and custom_prompt is not None
+                ),
+            )
+            return JSONResponse(
+                payload.model_dump(mode="json"),
+                headers={
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                },
+            )
+        finally:
+            session.close()
+
     @app.patch("/api/defaults")
     def patch_defaults(payload: DefaultsPatch):
         session, configuration, _ = services()
@@ -1144,23 +1008,7 @@ def create_app(
 
     @app.post("/api/sources/probe")
     def probe_source(payload: ProbeInput):
-        canonical_source = source_policy.validate(payload.url)
-        result = selected_source_probe.probe(canonical_source)
-        if result.source_kind not in REMOTE_SOURCE_KINDS or result.canonical_url is None:
-            raise ValueError("URL probe returned a non-remote source")
-        redirect_targets = list(result.redirect_trace)
-        if not redirect_targets or redirect_targets[-1] != result.canonical_url:
-            redirect_targets.append(result.canonical_url)
-        source_policy.validate_redirect_chain(payload.url, redirect_targets)
-        return {
-            "source_kind": result.source_kind,
-            "canonical_url": result.canonical_url,
-            "title": result.title,
-            "duration_ms": result.duration_ms,
-            "subtitle_tracks": [
-                _dump_subtitle(track) for track in result.subtitle_tracks
-            ],
-        }
+        return source_probe_service.probe(payload.url)
 
     @app.post("/api/test-samples", status_code=201)
     async def upload_profile_test_sample(request: Request):
@@ -1261,228 +1109,21 @@ def create_app(
         finally:
             session.close()
 
-    @app.get("/api/tasks")
-    def list_tasks(
-        limit: int = Query(default=50, ge=1, le=100),
-        cursor: str | None = None,
-        status: str | None = Query(default=None, min_length=1, max_length=32),
-    ):
-        session, _, tasks = services()
-        try:
-            page, next_cursor = tasks.list_tasks_page(
-                limit=limit,
-                cursor=cursor,
-                status=status,
-            )
-            headers = (
-                {"X-Next-Cursor": next_cursor}
-                if next_cursor is not None
-                else None
-            )
-            return JSONResponse(
-                [_dump(item) for item in page],
-                headers=headers,
-            )
-        finally:
-            session.close()
-
-    @app.post("/api/tasks", status_code=201)
-    async def create_task(request: Request):
-        session, _, tasks = services()
-        try:
-            content_type = request.headers.get("content-type", "")
-            media_type = content_type.split(";", 1)[0].strip().casefold()
-            if media_type == "application/json":
-                try:
-                    raw_payload = await request.json()
-                except ValueError:
-                    return _error(
-                        422,
-                        "validation_error",
-                        "request validation failed",
-                    )
-                try:
-                    payload = TaskCreate.model_validate(raw_payload)
-                except ValidationError as error:
-                    details = [
-                        {
-                            "location": ["body", *item["loc"]],
-                            "type": item["type"],
-                        }
-                        for item in error.errors()
-                    ]
-                    return _error(
-                        422,
-                        "validation_error",
-                        "request validation failed",
-                        details,
-                    )
-                sources = [item.model_dump() for item in payload.sources]
-                options = payload.model_dump(
-                    exclude={"sources"}, exclude_unset=True, exclude_none=True
-                )
-                return _dump(tasks.create_task(sources=sources, options=options))
-            if media_type != "multipart/form-data":
-                return _error(
-                    415,
-                    "unsupported_media_type",
-                    "request must be JSON or multipart form data",
-                )
-
-            raw_length = request.headers.get("content-length")
-            try:
-                content_length = int(raw_length) if raw_length is not None else None
-            except ValueError:
-                return _error(400, "invalid_content_length", "invalid Content-Length")
-            uploads = UploadService(
-                session=session,
-                paths=paths,
-                tasks=tasks,
-                assets=RuntimeAssetService(session, paths),
-                local_sources=selected_local_sources,
-            )
-
-            def accept_metadata(
-                metadata: dict[str, Any], upload_id: str
-            ) -> UploadTaskContext:
-                payload = UploadTaskMetadata.model_validate(metadata)
-                options = payload.model_dump(
-                    exclude={"kind"}, exclude_unset=True, exclude_none=True
-                )
-                created = tasks.create_upload_task(
-                    upload_kind=payload.kind,
-                    upload_id=upload_id,
-                    options=options,
-                )
-                return UploadTaskContext(
-                    task_id=created.id,
-                    item_id=created.items[0].id,
-                )
-
-            try:
-                state = await MultipartUploadStager(
-                    paths, selected_upload_limits
-                ).consume(
-                    request.stream(),
-                    content_type=content_type,
-                    content_length=content_length,
-                    accept_metadata=accept_metadata,
-                )
-                return _dump(uploads.complete(state))
-            except UploadError as error:
-                uploads.fail(error.state, code=error.code)
-                details = (
-                    {"task_id": error.state.context.task_id}
-                    if error.state.context is not None
-                    else None
-                )
-                return _error(
-                    error.status_code,
-                    error.code,
-                    "upload failed",
-                    details,
-                )
-        finally:
-            session.close()
-
-    @app.get("/api/tasks/{task_id}")
-    def get_task(task_id: str):
-        session, _, tasks = services()
-        try:
-            return _dump(tasks.get_task(task_id))
-        finally:
-            session.close()
-
-    @app.post("/api/tasks/{task_id}/cancel")
-    def cancel_task(task_id: str):
-        session, _, tasks = services()
-        try:
-            return _dump(tasks.cancel_task(task_id))
-        finally:
-            session.close()
-
-    @app.post("/api/tasks/{task_id}/retry", status_code=201)
-    def retry_task_stage(task_id: str, payload: RetryInput):
-        session, _, tasks = services()
-        try:
-            task = tasks.get_task(task_id)
-            if payload.item_id not in {item.id for item in task.items}:
-                raise KeyError(payload.item_id)
-            override = tasks.build_retry_override(
-                strategy=payload.strategy,
-                cloud_profile_id=payload.cloud_profile_id,
-                connection_revision=payload.connection_revision,
-                profile_revision=payload.profile_revision,
-                acknowledge_possible_charge=payload.acknowledge_possible_charge,
-            )
-            return _dump(
-                tasks.retry_stage(
-                    payload.item_id,
-                    payload.stage,
-                    expected_attempt=payload.expected_attempt,
-                    override=override,
-                    acknowledge_possible_charge=(
-                        payload.acknowledge_possible_charge
-                    ),
-                )
-            )
-        finally:
-            session.close()
-
-    @app.get("/api/items/{item_id}/export")
-    def export_item(
-        item_id: str,
-        variant: Literal["original", "translation"],
-        format: ExportFormat,
-        language: str | None = None,
-    ):
-        session, _, tasks = services()
-        try:
-            rendered = tasks.export_item(
-                item_id, variant=variant, export_format=format, language=language
-            )
-            content_types = {
-                ExportFormat.JSON: "application/json",
-                ExportFormat.SRT: "application/x-subrip",
-                ExportFormat.VTT: "text/vtt",
-                ExportFormat.TXT: "text/plain",
-                ExportFormat.MARKDOWN: "text/markdown",
-            }
-            extension = "md" if format is ExportFormat.MARKDOWN else format.value
-            filename = f"vtnote-{item_id[:8]}-{variant}.{extension}"
-            return Response(
-                rendered,
-                media_type=content_types[format],
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"'
-                },
-            )
-        finally:
-            session.close()
-
-    @app.get("/api/items/{item_id}/transcript")
-    def get_item_transcript(item_id: str):
-        session, _, tasks = services()
-        try:
-            return _dump(tasks.get_item_transcript(item_id))
-        finally:
-            session.close()
-
-    @app.get("/api/items/{item_id}/translations/{language}")
-    def get_item_translation(item_id: str, language: str):
-        session, _, tasks = services()
-        try:
-            return _dump(tasks.get_item_translation(item_id, language))
-        finally:
-            session.close()
-
-    @app.get("/api/items/{item_id}/notes")
-    def list_item_notes(item_id: str):
-        session, _, tasks = services()
-        try:
-            return tasks.list_item_notes(item_id)
-        finally:
-            session.close()
+    register_task_routes(
+        app,
+        services=services,
+        paths=paths,
+        selected_local_sources=selected_local_sources,
+        selected_upload_limits=selected_upload_limits,
+    )
+    register_source_routes(app, service=source_probe_service)
+    register_library_routes(app, services=services, paths=paths)
+    register_export_routes(
+        app,
+        services=services,
+        paths=paths,
+        directory_picker=directory_picker or pick_directory,
+    )
 
     def item_audio_source(
         assets: RuntimeAssetService, item_id: str
@@ -1516,6 +1157,7 @@ def create_app(
     def download_item_audio(
         item_id: str,
         format: Literal["m4a", "mp3"] = "m4a",
+        inline: bool = False,
     ):
         session, _, tasks = services()
         try:
@@ -1533,7 +1175,10 @@ def create_app(
             return FileResponse(
                 prepared.path,
                 media_type="audio/mp4" if format == "m4a" else "audio/mpeg",
-                filename=f"vtnote-{item_id[:8]}-audio.{format}",
+                filename=(
+                    None if inline else f"vtnote-{item_id[:8]}-audio.{format}"
+                ),
+                headers={"Cache-Control": "private, max-age=0"},
             )
         finally:
             session.close()
@@ -1641,6 +1286,16 @@ def create_app(
                 name="frontend-assets",
             )
 
+        frontend_favicon = selected_frontend_dist / "favicon.svg"
+        if frontend_favicon.is_file():
+            @app.api_route(
+                "/favicon.svg",
+                methods=["GET", "HEAD"],
+                include_in_schema=False,
+            )
+            def serve_favicon():
+                return FileResponse(frontend_favicon, media_type="image/svg+xml")
+
         task_detail_route = re.compile(
             r"^tasks/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
             r"[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -1649,6 +1304,8 @@ def create_app(
             "",
             "tasks",
             "settings",
+            "settings/export",
+            "settings/models",
             "settings/setup",
             "settings/connections",
             "settings/ai-connections",

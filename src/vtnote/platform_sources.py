@@ -1,4 +1,4 @@
-"""Strict Bilibili and YouTube source adapters over controlled yt-dlp operations."""
+"""Strict platform source adapters over controlled yt-dlp operations."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ from uuid import uuid4
 from yt_dlp.utils import ExtractorError
 
 from vtnote.artifacts import validate_source_subtitle
+from vtnote.bilibili_collections import (
+    BilibiliCollectionAdapter,
+    request_bilibili_json,
+)
 from vtnote.config import Settings
 from vtnote.media import (
     CommandRunner,
@@ -24,6 +28,7 @@ from vtnote.media import (
     MediaInfo,
 )
 from vtnote.platform_transport import (
+    LoopbackHttpProxyConnector,
     PinnedHttpsTransport,
     SourceHttpRequest,
     TransportSecurityError,
@@ -35,11 +40,13 @@ from vtnote.sources import (
     PlatformSourceError,
     SourceAdapter,
     SourceCapabilityError,
+    SourceCollectionProbeResult,
     SourceProbeResult,
     SubtitleCandidateError,
     SubtitleKind,
     SubtitleOutcome,
     SubtitleTrack,
+    ThumbnailOutcome,
     make_subtitle_track,
 )
 from vtnote.url_security import (
@@ -51,14 +58,17 @@ from vtnote.url_security import (
 )
 from vtnote.youtube_runtime import YoutubeRuntime, inspect_youtube_runtime
 from vtnote.ytdlp_bridge import (
+    BrowserCookieStore,
     BoundTransportScope,
+    NetscapeCookieFileStore,
+    PlatformCookieStore,
     build_controlled_platform_ytdlp,
     controlled_public_headers,
 )
 
 
-Platform = Literal["bilibili", "youtube"]
-_PLATFORMS = frozenset({"bilibili", "youtube"})
+Platform = Literal["bilibili", "douyin", "youtube"]
+_PLATFORMS = frozenset({"bilibili", "douyin", "youtube"})
 _PLATFORM_ERROR_CODES = frozenset(
     {
         "removed",
@@ -72,11 +82,14 @@ _PLATFORM_ERROR_CODES = frozenset(
 )
 _SUBTITLE_EXTENSIONS = frozenset({"vtt", "srt", "ass", "json"})
 _AUDIO_EXTENSIONS = frozenset(
-    {"wav", "mp3", "m4a", "flac", "ogg", "opus", "webm"}
+    {"wav", "mp3", "m4a", "flac", "ogg", "opus", "webm", "mp4"}
 )
 _YOUTUBE_ID = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 _BILIBILI_ID = re.compile(r"^(?:BV[A-Za-z0-9]+|av[0-9]+)$", re.IGNORECASE)
+_DOUYIN_ID = re.compile(r"^[0-9]{6,32}$")
+_DOUYIN_SHORT_CODE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
 _MAX_SUBTITLE_BYTES = 64 * 1024 * 1024
+_MAX_THUMBNAIL_BYTES = 16 * 1024 * 1024
 _MAX_AUDIO_BYTES = 8 * 1024 * 1024 * 1024
 
 
@@ -112,6 +125,12 @@ class YtDlpOperationFailure(RuntimeError):
             raise ValueError("invalid yt-dlp operation failure code")
         self.code = code
         super().__init__(code)
+
+
+def _transport_failure_code(error: TransportSecurityError) -> str:
+    if error.category in {"connection_failed", "read_failed"}:
+        return "temporary"
+    return "adapter_drift"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +179,11 @@ def classify_extractor_failure(error: BaseException) -> str:
             "members-only",
             "confirm your age",
             "authentication",
+            "fresh cookies",
+            "cookies are needed",
+            "could not copy chrome cookie database",
+            "could not copy edge cookie database",
+            "failed to load cookies",
         )
     ):
         return "auth_required"
@@ -176,6 +200,7 @@ def classify_extractor_failure(error: BaseException) -> str:
             "temporarily unavailable",
             "timed out",
             "timeout",
+            "unable to extract initial state",
         )
     ):
         return "temporary"
@@ -299,6 +324,76 @@ def _bilibili_initial(source: str) -> _InitialSource:
     )
 
 
+def _canonical_douyin(video_id: str) -> str:
+    return f"https://www.douyin.com/video/{video_id}"
+
+
+def _douyin_search_modal_id(
+    source: str,
+    components: list[str],
+) -> str | None:
+    reviewed_path = (
+        len(components) >= 2
+        and components[0] == "search"
+    ) or (
+        len(components) >= 4
+        and components[0] == "video"
+        and _DOUYIN_ID.fullmatch(components[1]) is not None
+        and components[2] == "search"
+    )
+    if not reviewed_path:
+        return None
+    try:
+        values = parse_qs(
+            urlsplit(source).query,
+            keep_blank_values=True,
+        ).get("modal_id", ())
+    except ValueError:
+        return None
+    if len(values) != 1 or _DOUYIN_ID.fullmatch(values[0]) is None:
+        return None
+    return values[0]
+
+
+def _douyin_initial(source: str) -> _InitialSource:
+    try:
+        parts = urlsplit(source)
+        port = parts.port
+    except ValueError:
+        raise PlatformSourceError("unsupported") from None
+    if (
+        parts.scheme.casefold() != "https"
+        or port not in {None, 443}
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+    ):
+        raise PlatformSourceError("unsupported")
+    host = (parts.hostname or "").casefold().rstrip(".")
+    components = [part for part in parts.path.split("/") if part]
+    if (
+        host == "v.douyin.com"
+        and len(components) == 1
+        and _DOUYIN_SHORT_CODE.fullmatch(components[0]) is not None
+    ):
+        return _InitialSource(
+            urlunsplit(("https", "v.douyin.com", f"/{components[0]}/", "", "")),
+            None,
+        )
+    if host in {"douyin.com", "www.douyin.com"}:
+        modal_id = _douyin_search_modal_id(source, components)
+        if modal_id is not None:
+            return _InitialSource(_canonical_douyin(modal_id), modal_id)
+    if (
+        host not in {"douyin.com", "www.douyin.com"}
+        or len(components) != 2
+        or components[0] != "video"
+        or _DOUYIN_ID.fullmatch(components[1]) is None
+    ):
+        raise PlatformSourceError("unsupported")
+    return _InitialSource(_canonical_douyin(components[1]), components[1])
+
+
 def _duration_ms(value: object) -> int | None:
     if value is None:
         return None
@@ -319,6 +414,86 @@ def _title(value: object) -> str:
     if not normalized or len(normalized) > 4096:
         raise PlatformSourceError("adapter_drift")
     return normalized
+
+
+def _optional_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return None
+    return normalized[:maximum]
+
+
+def _published_date(info: dict[str, object]) -> str | None:
+    raw_timestamp = info.get("release_timestamp", info.get("timestamp"))
+    if (
+        not isinstance(raw_timestamp, bool)
+        and isinstance(raw_timestamp, (int, float))
+        and math.isfinite(raw_timestamp)
+        and 0 < raw_timestamp < 4_102_444_800
+    ):
+        return datetime.fromtimestamp(raw_timestamp, tz=timezone.utc).date().isoformat()
+    raw_date = info.get("upload_date", info.get("release_date"))
+    if isinstance(raw_date, str) and re.fullmatch(r"[0-9]{8}", raw_date):
+        try:
+            return datetime.strptime(raw_date, "%Y%m%d").date().isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _thumbnail_url(info: dict[str, object]) -> str | None:
+    candidates: list[object] = [info.get("thumbnail")]
+    thumbnails = info.get("thumbnails")
+    if isinstance(thumbnails, list):
+        candidates.extend(
+            entry.get("url")
+            for entry in reversed(thumbnails)
+            if isinstance(entry, dict)
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, str) or len(candidate) > 4_096:
+            continue
+        normalized = f"https:{candidate}" if candidate.startswith("//") else candidate
+        try:
+            parts = urlsplit(normalized)
+            port = parts.port
+        except ValueError:
+            continue
+        host = (parts.hostname or "").casefold().rstrip(".")
+        if (
+            parts.scheme.casefold() == "http"
+            and (host == "hdslb.com" or host.endswith(".hdslb.com"))
+            and port in {None, 80}
+            and parts.username is None
+            and parts.password is None
+            and not parts.fragment
+        ):
+            normalized = urlunsplit(("https", host, parts.path, parts.query, ""))
+        try:
+            return _safe_https_url(normalized)
+        except PlatformSourceError:
+            continue
+    return None
+
+
+def _thumbnail_media_type(content: bytes) -> str:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    if (
+        len(content) >= 12
+        and content[4:8] == b"ftyp"
+        and content[8:12] in {b"avif", b"avis"}
+    ):
+        return "image/avif"
+    raise PlatformSourceError("invalid_content")
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -346,13 +521,16 @@ class YtDlpSourceAdapter(SourceAdapter):
         self.paths = paths
         self.media_validator = media_validator
         self.audio_registrar = audio_registrar
+        self._probe_cache = threading.local()
 
     def _initial(self, source: str) -> _InitialSource:
         if not isinstance(source, str):
             raise PlatformSourceError("unsupported")
         if self.platform == "youtube":
             return _youtube_initial(source)
-        return _bilibili_initial(source)
+        if self.platform == "bilibili":
+            return _bilibili_initial(source)
+        return _douyin_initial(source)
 
     def _run_extract(self, url: str) -> dict[str, object]:
         try:
@@ -385,7 +563,7 @@ class YtDlpSourceAdapter(SourceAdapter):
                 raise PlatformSourceError("adapter_drift")
             normalized_id = raw_id
             canonical = f"https://www.youtube.com/watch?{urlencode({'v': raw_id})}"
-        else:
+        elif self.platform == "bilibili":
             if raw_id.casefold().startswith("av"):
                 candidate = raw_id
             elif raw_id.isdigit():
@@ -400,6 +578,11 @@ class YtDlpSourceAdapter(SourceAdapter):
                 _bilibili_page(info.get("webpage_url"))
                 or _bilibili_page(initial.extraction_url),
             )
+        else:
+            if _DOUYIN_ID.fullmatch(raw_id) is None:
+                raise PlatformSourceError("adapter_drift")
+            normalized_id = raw_id
+            canonical = _canonical_douyin(raw_id)
         if initial.expected_id is not None and (
             normalized_id.casefold() != initial.expected_id.casefold()
         ):
@@ -491,15 +674,72 @@ class YtDlpSourceAdapter(SourceAdapter):
 
     def probe(self, canonical_source: str) -> SourceProbeResult:
         extraction = self._extraction(canonical_source)
-        return SourceProbeResult(
+        author = next(
+            (
+                value
+                for value in (
+                    _optional_text(extraction.info.get("uploader"), maximum=512),
+                    _optional_text(extraction.info.get("channel"), maximum=512),
+                    _optional_text(extraction.info.get("creator"), maximum=512),
+                )
+                if value is not None
+            ),
+            None,
+        )
+        probe = SourceProbeResult(
             source_kind=self.platform,
             canonical_url=extraction.canonical_url,
             title=extraction.title,
             duration_ms=extraction.duration_ms,
+            author=author,
+            published_at=_published_date(extraction.info),
+            thumbnail_url=_thumbnail_url(extraction.info),
+            description=_optional_text(
+                extraction.info.get("description"), maximum=20_000
+            ),
             subtitle_tracks=tuple(
                 resource.track for resource in extraction.tracks
             ),
             redirect_trace=(extraction.canonical_url,),
+        )
+        self._probe_cache.probe = probe
+        self._probe_cache.extraction = extraction
+        return probe
+
+    def _extraction_for_probe(self, probe: SourceProbeResult) -> _Extraction:
+        cached_probe = getattr(self._probe_cache, "probe", None)
+        cached_extraction = getattr(self._probe_cache, "extraction", None)
+        if cached_probe is probe and isinstance(cached_extraction, _Extraction):
+            return cached_extraction
+        if probe.canonical_url is None:
+            raise PlatformSourceError("adapter_drift")
+        extraction = self._extraction(probe.canonical_url)
+        if not self._same_probe(probe, extraction):
+            raise PlatformSourceError("adapter_drift")
+        return extraction
+
+    def fetch_thumbnail(self, canonical_source: str) -> ThumbnailOutcome:
+        extraction = self._extraction(canonical_source)
+        resource_url = _thumbnail_url(extraction.info)
+        if resource_url is None:
+            raise PlatformSourceError("invalid_content")
+        try:
+            content = self.operations.fetch_resource(
+                resource_url,
+                max_bytes=_MAX_THUMBNAIL_BYTES,
+            )
+        except YtDlpOperationFailure as error:
+            raise PlatformSourceError(error.code) from None
+        except Exception:
+            raise PlatformSourceError("adapter_drift") from None
+        if not isinstance(content, bytes) or not content:
+            raise PlatformSourceError("invalid_content")
+        return ThumbnailOutcome(
+            content=content,
+            media_type=cast(
+                Literal["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"],
+                _thumbnail_media_type(content),
+            ),
         )
 
     def fetch_subtitle(
@@ -513,9 +753,7 @@ class YtDlpSourceAdapter(SourceAdapter):
             or probe.canonical_url is None
         ):
             raise PlatformSourceError("adapter_drift")
-        extraction = self._extraction(probe.canonical_url)
-        if not self._same_probe(probe, extraction):
-            raise PlatformSourceError("adapter_drift")
+        extraction = self._extraction_for_probe(probe)
         matching = [
             resource
             for resource in extraction.tracks
@@ -544,9 +782,9 @@ class YtDlpSourceAdapter(SourceAdapter):
             raise SubtitleCandidateError("subtitle_invalid") from None
         return SubtitleOutcome(track, content)
 
-    @staticmethod
-    def _best_audio(info: dict[str, object]) -> tuple[str, str]:
+    def _best_audio(self, info: dict[str, object]) -> tuple[str, str]:
         candidates: list[tuple[float, int, str, str]] = []
+        media_candidates: list[tuple[float, int, str, str]] = []
         formats = info.get("formats")
         if not isinstance(formats, list):
             raise PlatformSourceError("adapter_drift")
@@ -556,8 +794,7 @@ class YtDlpSourceAdapter(SourceAdapter):
             entry = cast(dict[str, object], raw_format)
             extension = entry.get("ext")
             if (
-                entry.get("vcodec") != "none"
-                or entry.get("acodec") in {None, "none"}
+                entry.get("acodec") in {None, "none"}
                 or not isinstance(extension, str)
                 or extension.casefold() not in _AUDIO_EXTENSIONS
             ):
@@ -567,14 +804,25 @@ class YtDlpSourceAdapter(SourceAdapter):
             except PlatformSourceError:
                 continue
             abr = entry.get("abr")
+            tbr = entry.get("tbr")
             score = (
                 float(abr)
                 if isinstance(abr, (int, float))
                 and not isinstance(abr, bool)
                 and math.isfinite(abr)
+                else float(tbr)
+                if isinstance(tbr, (int, float))
+                and not isinstance(tbr, bool)
+                and math.isfinite(tbr)
                 else -1.0
             )
-            candidates.append((score, -ordinal, url, extension.casefold()))
+            candidate = (score, -ordinal, url, extension.casefold())
+            if entry.get("vcodec") == "none":
+                candidates.append(candidate)
+            elif self.platform in {"bilibili", "douyin"}:
+                media_candidates.append(candidate)
+        if not candidates and self.platform in {"bilibili", "douyin"}:
+            candidates = media_candidates
         if not candidates:
             raise PlatformSourceError("invalid_content")
         _, _, url, extension = max(candidates)
@@ -587,9 +835,7 @@ class YtDlpSourceAdapter(SourceAdapter):
     ) -> AudioOutcome:
         if probe.source_kind != self.platform or probe.canonical_url is None:
             raise PlatformSourceError("adapter_drift")
-        extraction = self._extraction(probe.canonical_url)
-        if not self._same_probe(probe, extraction):
-            raise PlatformSourceError("adapter_drift")
+        extraction = self._extraction_for_probe(probe)
         resource_url, extension = self._best_audio(extraction.info)
         try:
             destination = self.paths.downloaded_audio(item_id, extension)
@@ -640,10 +886,14 @@ class PlatformSourceRegistry(SourceAdapter):
         *,
         bilibili: SourceAdapter | None,
         youtube: SourceAdapter | None,
+        douyin: SourceAdapter | None = None,
+        bilibili_collections: BilibiliCollectionAdapter | None = None,
         youtube_unavailable_code: str = "youtube_runtime_unavailable",
     ) -> None:
         self.bilibili = bilibili
         self.youtube = youtube
+        self.douyin = douyin
+        self.bilibili_collections = bilibili_collections
         self.youtube_unavailable_code = youtube_unavailable_code
 
     @staticmethod
@@ -654,12 +904,18 @@ class PlatformSourceRegistry(SourceAdapter):
             raise PlatformSourceError("unsupported") from None
         if host in {"youtube.com", "www.youtube.com", "youtu.be"}:
             return "youtube"
-        if host in {"www.bilibili.com", "b23.tv"}:
+        if host in {"www.bilibili.com", "space.bilibili.com", "b23.tv"}:
             return "bilibili"
+        if host in {"douyin.com", "www.douyin.com", "v.douyin.com"}:
+            return "douyin"
         raise PlatformSourceError("unsupported")
 
     def _adapter(self, kind: Platform) -> SourceAdapter:
-        selected = self.youtube if kind == "youtube" else self.bilibili
+        selected = {
+            "bilibili": self.bilibili,
+            "douyin": self.douyin,
+            "youtube": self.youtube,
+        }[kind]
         if selected is None:
             code = (
                 self.youtube_unavailable_code
@@ -672,12 +928,25 @@ class PlatformSourceRegistry(SourceAdapter):
     def probe(self, canonical_source: str) -> SourceProbeResult:
         return self._adapter(self._kind(canonical_source)).probe(canonical_source)
 
+    def fetch_thumbnail(self, canonical_source: str) -> ThumbnailOutcome:
+        return self._adapter(self._kind(canonical_source)).fetch_thumbnail(
+            canonical_source
+        )
+
+    def probe_collection(
+        self,
+        canonical_source: str,
+    ) -> SourceCollectionProbeResult | None:
+        if self.bilibili_collections is None:
+            return None
+        return self.bilibili_collections.probe_collection(canonical_source)
+
     def fetch_subtitle(
         self,
         probe: SourceProbeResult,
         track: SubtitleTrack,
     ) -> SubtitleOutcome:
-        if probe.source_kind not in {"bilibili", "youtube"}:
+        if probe.source_kind not in _PLATFORMS:
             raise PlatformSourceError("unsupported")
         return self._adapter(cast(Platform, probe.source_kind)).fetch_subtitle(
             probe,
@@ -689,7 +958,7 @@ class PlatformSourceRegistry(SourceAdapter):
         probe: SourceProbeResult,
         item_id: str,
     ) -> AudioOutcome:
-        if probe.source_kind not in {"bilibili", "youtube"}:
+        if probe.source_kind not in _PLATFORMS:
             raise PlatformSourceError("unsupported")
         return self._adapter(cast(Platform, probe.source_kind)).fetch_audio(
             probe,
@@ -707,24 +976,29 @@ class ControlledYtDlpOperations:
         transport: PinnedHttpsTransport,
         output_root: Path,
         youtube_runtime: YoutubeRuntime | None = None,
+        browser_cookies: PlatformCookieStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if platform not in _PLATFORMS:
             raise ValueError("invalid controlled yt-dlp platform")
         if platform == "youtube" and youtube_runtime is None:
             raise ValueError("YouTube operations require a managed runtime")
-        if platform == "bilibili" and youtube_runtime is not None:
-            raise ValueError("Bilibili operations cannot use a YouTube runtime")
+        if platform != "youtube" and youtube_runtime is not None:
+            raise ValueError("non-YouTube operations cannot use a YouTube runtime")
         self.platform = platform
         self.transport = transport
         self.output_root = Path(output_root)
         self.youtube_runtime = youtube_runtime
+        self.browser_cookies = browser_cookies
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._current = threading.local()
 
     @staticmethod
     def _resource_urls_from(info: dict[str, object]) -> frozenset[str]:
         urls: set[str] = set()
+        thumbnail = _thumbnail_url(info)
+        if thumbnail is not None:
+            urls.add(thumbnail)
         for group_name in ("subtitles", "automatic_captions"):
             group = info.get(group_name)
             if not isinstance(group, dict):
@@ -750,6 +1024,215 @@ class ControlledYtDlpOperations:
                     continue
         return frozenset(urls)
 
+    def _bilibili_api_extract(self, canonical_url: str) -> dict[str, object]:
+        """Recover a public video when Bilibili serves yt-dlp a risk-control page."""
+
+        try:
+            initial = _bilibili_initial(canonical_url)
+            if initial.expected_id is None:
+                raise PlatformSourceError("adapter_drift")
+            components = [
+                component
+                for component in urlsplit(initial.extraction_url).path.split("/")
+                if component
+            ]
+            if len(components) != 2:
+                raise PlatformSourceError("adapter_drift")
+            submitted_id = components[1]
+            identity_query = (
+                {"aid": submitted_id[2:]}
+                if submitted_id[:2].casefold() == "av"
+                else {"bvid": submitted_id}
+            )
+            view_payload = request_bilibili_json(
+                self.transport,
+                "https://api.bilibili.com/x/web-interface/view?"
+                + urlencode(identity_query),
+                referer=initial.extraction_url,
+            )
+            view = _mapping(view_payload.get("data"))
+            bvid = view.get("bvid")
+            aid = view.get("aid")
+            if (
+                not isinstance(bvid, str)
+                or _BILIBILI_ID.fullmatch(bvid) is None
+                or isinstance(aid, bool)
+                or not isinstance(aid, int)
+                or aid <= 0
+            ):
+                raise PlatformSourceError("adapter_drift")
+            if submitted_id[:2].casefold() == "av":
+                if submitted_id[2:] != str(aid):
+                    raise PlatformSourceError("adapter_drift")
+            elif submitted_id.casefold() != bvid.casefold():
+                raise PlatformSourceError("adapter_drift")
+
+            pages = view.get("pages")
+            if not isinstance(pages, list) or not pages:
+                raise PlatformSourceError("adapter_drift")
+            requested_page = _bilibili_page(initial.extraction_url) or 1
+            selected_page = next(
+                (
+                    _mapping(page)
+                    for page in pages
+                    if _mapping(page).get("page") == requested_page
+                ),
+                {},
+            )
+            cid = selected_page.get("cid")
+            duration = selected_page.get("duration", view.get("duration"))
+            if (
+                isinstance(cid, bool)
+                or not isinstance(cid, int)
+                or cid <= 0
+                or isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration <= 0
+            ):
+                raise PlatformSourceError("adapter_drift")
+
+            title = _title(view.get("title"))
+            if len(pages) > 1:
+                part = _optional_text(selected_page.get("part"), maximum=1_024)
+                title = f"{title} p{requested_page:02d}{f' {part}' if part else ''}"
+            webpage_url = _canonical_bilibili(
+                submitted_id,
+                _bilibili_page(initial.extraction_url),
+            )
+            play_payload = request_bilibili_json(
+                self.transport,
+                "https://api.bilibili.com/x/player/playurl?"
+                + urlencode(
+                    {
+                        "bvid": bvid,
+                        "cid": cid,
+                        "fnval": 16,
+                        "fourk": 1,
+                    }
+                ),
+                referer=webpage_url,
+            )
+            play = _mapping(play_payload.get("data"))
+            dash = _mapping(play.get("dash"))
+            raw_audio = dash.get("audio")
+            formats: list[dict[str, object]] = []
+            if isinstance(raw_audio, list):
+                for ordinal, raw_entry in enumerate(raw_audio):
+                    entry = _mapping(raw_entry)
+                    mime_type = entry.get("mimeType", entry.get("mime_type"))
+                    extension = {
+                        "audio/mp4": "m4a",
+                        "audio/webm": "webm",
+                    }.get(mime_type)
+                    resource_url = entry.get("baseUrl", entry.get("base_url"))
+                    codec = entry.get("codecs")
+                    bandwidth = entry.get("bandwidth")
+                    try:
+                        safe_url = _safe_https_url(resource_url)
+                    except PlatformSourceError:
+                        continue
+                    if extension is None:
+                        continue
+                    formats.append(
+                        {
+                            "format_id": str(entry.get("id", f"audio-{ordinal}")),
+                            "url": safe_url,
+                            "ext": extension,
+                            "acodec": codec if isinstance(codec, str) and codec else "unknown",
+                            "vcodec": "none",
+                            "abr": (
+                                bandwidth / 1_000
+                                if isinstance(bandwidth, (int, float))
+                                and not isinstance(bandwidth, bool)
+                                and math.isfinite(bandwidth)
+                                else -1
+                            ),
+                        }
+                    )
+            if not formats:
+                raw_combined = play.get("durl")
+                if isinstance(raw_combined, list):
+                    for ordinal, raw_entry in enumerate(raw_combined):
+                        entry = _mapping(raw_entry)
+                        try:
+                            safe_url = _safe_https_url(entry.get("url"))
+                        except PlatformSourceError:
+                            continue
+                        formats.append(
+                            {
+                                "format_id": f"combined-{ordinal}",
+                                "url": safe_url,
+                                "ext": "mp4",
+                                "acodec": "unknown",
+                                "vcodec": "unknown",
+                                "tbr": -1,
+                            }
+                        )
+            if not formats:
+                raise PlatformSourceError("invalid_content")
+
+            subtitles: dict[str, list[dict[str, object]]] = {}
+            try:
+                subtitle_payload = request_bilibili_json(
+                    self.transport,
+                    "https://api.bilibili.com/x/player/v2?"
+                    + urlencode({"bvid": bvid, "cid": cid}),
+                    referer=webpage_url,
+                )
+            except PlatformSourceError as error:
+                if error.code not in {"auth_required", "invalid_content", "temporary"}:
+                    raise
+            else:
+                raw_subtitles = _mapping(
+                    _mapping(subtitle_payload.get("data")).get("subtitle")
+                ).get("subtitles")
+                if isinstance(raw_subtitles, list):
+                    for raw_entry in raw_subtitles:
+                        entry = _mapping(raw_entry)
+                        language = entry.get("lan")
+                        resource_url = entry.get(
+                            "subtitle_url",
+                            entry.get("subtitleUrl"),
+                        )
+                        if isinstance(resource_url, str) and resource_url.startswith("//"):
+                            resource_url = f"https:{resource_url}"
+                        try:
+                            safe_url = _safe_https_url(resource_url)
+                        except PlatformSourceError:
+                            continue
+                        if not isinstance(language, str) or not language or len(language) > 64:
+                            continue
+                        subtitles.setdefault(language, []).append(
+                            {
+                                "ext": "json",
+                                "url": safe_url,
+                                "kind": "manual",
+                            }
+                        )
+
+            owner = _mapping(view.get("owner"))
+            return {
+                "id": submitted_id if submitted_id[:2].casefold() == "av" else bvid,
+                "extractor_key": "BiliBili",
+                "webpage_url": webpage_url,
+                "title": title,
+                "duration": duration,
+                "uploader": owner.get("name"),
+                "timestamp": view.get("pubdate"),
+                "thumbnail": view.get("pic"),
+                "description": view.get("desc"),
+                "subtitles": subtitles,
+                "automatic_captions": {},
+                "formats": formats,
+            }
+        except YtDlpOperationFailure:
+            raise
+        except PlatformSourceError as error:
+            raise YtDlpOperationFailure(error.code) from None
+        except Exception:
+            raise YtDlpOperationFailure("adapter_drift") from None
+
     def extract(self, canonical_url: str) -> dict[str, object]:
         scope = BoundTransportScope.for_probe(
             page_host_policy(self.platform),
@@ -761,13 +1244,33 @@ class ControlledYtDlpOperations:
                 self.output_root,
                 scope=scope,
                 runtime=self.youtube_runtime,
+                browser_cookiejar=(
+                    self.browser_cookies.new_cookiejar()
+                    if self.browser_cookies is not None
+                    else None
+                ),
             )
-        except (OSError, RuntimeError, TransportSecurityError, ValueError):
-            raise YtDlpOperationFailure("adapter_drift") from None
+        except Exception as error:
+            raise YtDlpOperationFailure(classify_extractor_failure(error)) from None
         try:
             info = bridge.probe(canonical_url)
         except Exception as error:
-            raise YtDlpOperationFailure(classify_extractor_failure(error)) from None
+            message = str(error).casefold()
+            classified = classify_extractor_failure(error)
+            if self.platform == "bilibili" and (
+                classified in {"adapter_drift", "temporary"}
+                or any(
+                    marker in message
+                    for marker in (
+                        "unable to extract initial state",
+                        "http error 412",
+                        "precondition failed",
+                    )
+                )
+            ):
+                info = self._bilibili_api_extract(canonical_url)
+            else:
+                raise YtDlpOperationFailure(classified) from None
         finally:
             bridge.close()
         if not isinstance(info, dict):
@@ -813,25 +1316,32 @@ class ControlledYtDlpOperations:
         return None
 
     def _request(self, resource_url: str, *, max_bytes: int):
-        try:
-            referer = getattr(self._current, "referer", None)
-            if not isinstance(referer, str):
-                raise ValueError
-            response = self.transport.request(
-                SourceHttpRequest(
-                    url=resource_url,
-                    headers=controlled_public_headers(referer=referer),
-                    max_wire_bytes=max_bytes,
-                    max_decoded_bytes=max_bytes,
-                ),
-                self._resource_policy(resource_url),
-            )
-        except YtDlpOperationFailure:
-            raise
-        except TransportSecurityError:
-            raise YtDlpOperationFailure("adapter_drift") from None
-        except (OSError, ValueError):
-            raise YtDlpOperationFailure("temporary") from None
+        for attempt in range(2):
+            try:
+                referer = getattr(self._current, "referer", None)
+                if not isinstance(referer, str):
+                    raise ValueError
+                response = self.transport.request(
+                    SourceHttpRequest(
+                        url=resource_url,
+                        headers=controlled_public_headers(referer=referer),
+                        max_wire_bytes=max_bytes,
+                        max_decoded_bytes=max_bytes,
+                    ),
+                    self._resource_policy(resource_url),
+                )
+            except YtDlpOperationFailure:
+                raise
+            except TransportSecurityError as error:
+                code = _transport_failure_code(error)
+                if code == "temporary" and attempt == 0:
+                    continue
+                raise YtDlpOperationFailure(code) from None
+            except (OSError, ValueError):
+                if attempt == 0:
+                    continue
+                raise YtDlpOperationFailure("temporary") from None
+            break
         code = self._status_error(response.status)
         if code is not None:
             response.close()
@@ -839,15 +1349,22 @@ class ControlledYtDlpOperations:
         return response
 
     def fetch_resource(self, resource_url: str, *, max_bytes: int) -> bytes:
-        response = self._request(resource_url, max_bytes=max_bytes)
-        try:
-            content = response.read()
-        except TransportSecurityError:
-            raise YtDlpOperationFailure("adapter_drift") from None
-        except (OSError, ValueError):
-            raise YtDlpOperationFailure("temporary") from None
-        finally:
-            response.close()
+        for attempt in range(2):
+            response = self._request(resource_url, max_bytes=max_bytes)
+            try:
+                content = response.read()
+            except TransportSecurityError as error:
+                code = _transport_failure_code(error)
+                if code == "temporary" and attempt == 0:
+                    continue
+                raise YtDlpOperationFailure(code) from None
+            except (OSError, ValueError):
+                if attempt == 0:
+                    continue
+                raise YtDlpOperationFailure("temporary") from None
+            finally:
+                response.close()
+            break
         if not isinstance(content, bytes) or len(content) > max_bytes:
             raise YtDlpOperationFailure("invalid_content")
         return content
@@ -859,34 +1376,45 @@ class ControlledYtDlpOperations:
         *,
         max_bytes: int,
     ) -> None:
-        response = self._request(resource_url, max_bytes=max_bytes)
-        written = 0
         destination_path = Path(target)
-        staging = destination_path.with_name(
-            f".{destination_path.name}.{uuid4()}.partial"
-        )
-        try:
-            if destination_path.exists():
+        for attempt in range(2):
+            response = self._request(resource_url, max_bytes=max_bytes)
+            written = 0
+            staging = destination_path.with_name(
+                f".{destination_path.name}.{uuid4()}.partial"
+            )
+            try:
+                if destination_path.exists():
+                    raise YtDlpOperationFailure("invalid_content")
+                with staging.open("xb") as destination:
+                    for chunk in response:
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise YtDlpOperationFailure("invalid_content")
+                        destination.write(chunk)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.rename(staging, destination_path)
+            except YtDlpOperationFailure:
+                raise
+            except TransportSecurityError as error:
+                code = _transport_failure_code(error)
+                if code == "temporary" and attempt == 0:
+                    continue
+                raise YtDlpOperationFailure(code) from None
+            except (OSError, ValueError):
+                if attempt == 0:
+                    continue
+                raise YtDlpOperationFailure("temporary") from None
+            finally:
+                response.close()
+                try:
+                    staging.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if written <= 0:
                 raise YtDlpOperationFailure("invalid_content")
-            with staging.open("xb") as destination:
-                for chunk in response:
-                    written += len(chunk)
-                    if written > max_bytes:
-                        raise YtDlpOperationFailure("invalid_content")
-                    destination.write(chunk)
-                destination.flush()
-                os.fsync(destination.fileno())
-            os.rename(staging, destination_path)
-        except YtDlpOperationFailure:
-            raise
-        except TransportSecurityError:
-            raise YtDlpOperationFailure("adapter_drift") from None
-        except (OSError, ValueError):
-            raise YtDlpOperationFailure("temporary") from None
-        finally:
-            response.close()
-        if written <= 0:
-            raise YtDlpOperationFailure("invalid_content")
+            return
 
 
 class FfmpegMediaValidator:
@@ -949,7 +1477,12 @@ def build_default_platform_registry(
     """Build production adapters without downloading or probing any platform."""
 
     paths = StoragePaths.from_settings(settings)
-    transport = PinnedHttpsTransport(resolver=resolver)
+    connector = (
+        LoopbackHttpProxyConnector(settings.platform_proxy_url)
+        if settings.platform_proxy_url is not None
+        else None
+    )
+    transport = PinnedHttpsTransport(resolver=resolver, connector=connector)
     media_validator = FfmpegMediaValidator(
         FfmpegMediaProcessor(
             runner=CommandRunner(),
@@ -960,12 +1493,52 @@ def build_default_platform_registry(
         session_factory=session_factory,
         paths=paths,
     )
+    browser_cookies: BrowserCookieStore | None = None
+    if settings.platform_cookie_browser is not None:
+        try:
+            browser_cookies = BrowserCookieStore(
+                settings.platform_cookie_browser
+            )
+        except RuntimeError:
+            # Cookie import is optional platform capability and must not make
+            # the local API or durable worker unavailable.
+            browser_cookies = None
+    douyin_cookies: PlatformCookieStore | None = browser_cookies
+    youtube_cookies: PlatformCookieStore | None = browser_cookies
+    if settings.platform_douyin_cookie_file is not None:
+        try:
+            douyin_cookies = NetscapeCookieFileStore(
+                settings.platform_douyin_cookie_file,
+                "douyin",
+            )
+        except RuntimeError:
+            douyin_cookies = None
+    if settings.platform_youtube_cookie_file is not None:
+        try:
+            youtube_cookies = NetscapeCookieFileStore(
+                settings.platform_youtube_cookie_file,
+                "youtube",
+            )
+        except RuntimeError:
+            youtube_cookies = None
     bilibili = YtDlpSourceAdapter(
         platform="bilibili",
         operations=ControlledYtDlpOperations(
             platform="bilibili",
             transport=transport,
             output_root=paths.runtime("yt-dlp", "bilibili"),
+        ),
+        paths=paths,
+        media_validator=media_validator,
+        audio_registrar=registrar,
+    )
+    douyin = YtDlpSourceAdapter(
+        platform="douyin",
+        operations=ControlledYtDlpOperations(
+            platform="douyin",
+            transport=transport,
+            output_root=paths.runtime("yt-dlp", "douyin"),
+            browser_cookies=douyin_cookies,
         ),
         paths=paths,
         media_validator=media_validator,
@@ -981,6 +1554,7 @@ def build_default_platform_registry(
                 transport=transport,
                 output_root=paths.runtime("yt-dlp", "youtube"),
                 youtube_runtime=runtime_status.runtime,
+                browser_cookies=youtube_cookies,
             ),
             paths=paths,
             media_validator=media_validator,
@@ -988,6 +1562,8 @@ def build_default_platform_registry(
         )
     return PlatformSourceRegistry(
         bilibili=bilibili,
+        bilibili_collections=BilibiliCollectionAdapter(transport),
+        douyin=douyin,
         youtube=youtube,
         youtube_unavailable_code="youtube_runtime_unavailable",
     )

@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session
 from vtnote.config import Settings
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
 from vtnote.database import initialize_database
-from vtnote.models import ProcessorProfileRecord, ProviderConnectionRecord
+from vtnote.models import (
+    DefaultSettingsRecord,
+    ProcessorProfileRecord,
+    ProviderConnectionRecord,
+)
+from vtnote.paths import StoragePaths
 from vtnote.secrets import MemorySecretStore
 
 
@@ -56,6 +61,78 @@ def test_configuration_defaults_follow_platform_storage_roots(tmp_path: Path) ->
         )
     finally:
         session.bind.dispose()
+        session.close()
+
+
+def test_configuration_can_keep_large_model_assets_outside_primary_storage(
+    tmp_path: Path,
+) -> None:
+    engine = initialize_database(tmp_path / "vtnote.db")
+    session = Session(engine)
+    settings = Settings(
+        data_root=tmp_path / "primary-data",
+        runtime_cache_root=tmp_path / "primary-cache",
+        managed_assets_root=tmp_path / "managed-assets",
+    )
+    service = ConfigurationService(
+        session,
+        MemorySecretStore(),
+        paths=StoragePaths.from_settings(settings),
+        model_paths=StoragePaths.managed_assets_from_settings(settings),
+    )
+    try:
+        defaults = service.get_defaults()
+        assert Path(defaults.local_whisper_options["model_root"]) == (
+            settings.managed_assets_root
+            / "Data"
+            / "models"
+            / "faster-whisper"
+        )
+        assert Path(defaults.local_whisper_options["cache_root"]) == (
+            settings.managed_assets_root
+            / "Cache"
+            / "models"
+            / "faster-whisper"
+        )
+    finally:
+        engine.dispose()
+        session.close()
+
+
+def test_configuration_repairs_stale_local_model_roots(tmp_path: Path) -> None:
+    engine = initialize_database(tmp_path / "vtnote.db")
+    session = Session(engine)
+    settings = Settings(
+        data_root=tmp_path / "primary-data",
+        runtime_cache_root=tmp_path / "primary-cache",
+        managed_assets_root=tmp_path / "managed-assets",
+    )
+    service = ConfigurationService(
+        session,
+        MemorySecretStore(),
+        paths=StoragePaths.from_settings(settings),
+        model_paths=StoragePaths.managed_assets_from_settings(settings),
+    )
+    try:
+        service.get_defaults()
+        row = session.get(DefaultSettingsRecord, 1)
+        assert row is not None
+        stale = dict(row.local_whisper_options)
+        stale["model_root"] = str(tmp_path / "old-model")
+        stale["cache_root"] = str(tmp_path / "old-cache")
+        row.local_whisper_options = stale
+        session.commit()
+
+        repaired = service.get_defaults().local_whisper_options
+
+        assert Path(repaired["model_root"]) == (
+            settings.managed_assets_root / "Data" / "models" / "faster-whisper"
+        )
+        assert Path(repaired["cache_root"]) == (
+            settings.managed_assets_root / "Cache" / "models" / "faster-whisper"
+        )
+    finally:
+        engine.dispose()
         session.close()
 
 

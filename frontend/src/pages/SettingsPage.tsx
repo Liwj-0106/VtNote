@@ -1,57 +1,49 @@
 import { useEffect, useState } from "react";
-import { api } from "../api/client";
-import type { ConnectionView, DefaultsView, ProfileView } from "../api/types";
-import { AppLink } from "../app/router";
+import { ApiError, api } from "../api/client";
+import type { ExportSettings } from "../api/types";
+import { useInterfacePreferences } from "../app/interfacePreferences";
 import {
   loadPreferences,
   savePreferences,
   type AppPreferences,
   type ExportItem,
 } from "../app/preferences";
+import { SelectMenu } from "../components/SelectMenu";
+import { MotionPresence } from "../components/MotionPresence";
+import { Skeleton, SkeletonStatus } from "../components/Skeleton";
 
-const exportItems: Array<{ value: ExportItem; label: string }> = [
-  { value: "audio", label: "音频" },
-  { value: "transcript", label: "字幕原文" },
-  { value: "notes", label: "AI 笔记" },
-];
+const exportItems: ExportItem[] = ["audio", "transcript", "notes"];
 
 export function SettingsPage() {
+  const { text } = useInterfacePreferences();
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
-  const [defaults, setDefaults] = useState<DefaultsView | null>(null);
-  const [profiles, setProfiles] = useState<ProfileView[]>([]);
-  const [connections, setConnections] = useState<ConnectionView[]>([]);
-  const [asrSelection, setAsrSelection] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [exportSettings, setExportSettings] = useState<ExportSettings | null>(null);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
+  const [selectingDirectory, setSelectingDirectory] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
-    Promise.all([
-      api.request<DefaultsView>("/api/defaults", { signal: controller.signal }),
-      api.request<ProfileView[]>("/api/profiles", { signal: controller.signal }),
-      api.request<ConnectionView[]>("/api/connections", {
-        signal: controller.signal,
-      }),
-    ]).then(([nextDefaults, nextProfiles, nextConnections]) => {
-      if (!controller.signal.aborted) {
-        setDefaults(nextDefaults);
-        setProfiles(nextProfiles);
-        setConnections(nextConnections);
-        const firstTencent = nextConnections.find(
-          (connection) => connection.protocol === "tencent_recording_asr",
-        );
-        setAsrSelection(
-          nextDefaults.cloud_asr_profile_id ??
-            (firstTencent ? `connection:${firstTencent.id}` : ""),
-        );
-      }
-    });
+    api
+      .request<ExportSettings>("/api/export-settings", { signal: controller.signal })
+      .then(setExportSettings)
+      .catch((caught: unknown) => {
+        if (!controller.signal.aborted) {
+          setDirectoryError(
+            caught instanceof ApiError ? caught.message : text("export.readError"),
+          );
+        }
+      });
     return () => controller.abort();
-  }, []);
+  }, [text]);
 
-  const markSaved = () => {
-    setSaved(true);
-    window.setTimeout(() => setSaved(false), 1600);
-  };
+  const exportItemLabel = (item: ExportItem) =>
+    text(
+      item === "audio"
+        ? "export.audio"
+        : item === "transcript"
+          ? "export.transcript"
+          : "export.notes",
+    );
 
   const updatePreference = <Key extends keyof AppPreferences>(
     key: Key,
@@ -60,7 +52,6 @@ export function SettingsPage() {
     const next = { ...preferences, [key]: value };
     setPreferences(next);
     savePreferences(next);
-    markSaved();
   };
 
   const toggleExportItem = (item: ExportItem) => {
@@ -70,217 +61,193 @@ export function SettingsPage() {
       "defaultExportItems",
       selected
         ? preferences.defaultExportItems.filter((value) => value !== item)
-        : exportItems
-            .map((option) => option.value)
-            .filter(
-              (value) =>
-                value === item || preferences.defaultExportItems.includes(value),
-            ),
+        : exportItems.filter(
+            (value) =>
+              value === item || preferences.defaultExportItems.includes(value),
+          ),
     );
   };
 
-  const patchDefaults = async (changes: Record<string, unknown>) => {
-    const next = await api.request<DefaultsView>("/api/defaults", {
-      method: "PATCH",
-      body: changes,
-    });
-    setDefaults(next);
-    markSaved();
+  const chooseDirectory = async () => {
+    setSelectingDirectory(true);
+    setDirectoryError(null);
+    try {
+      const selected = await api.request<{ canceled: boolean; directory: string | null }>(
+        "/api/system/pick-directory",
+        { method: "POST" },
+      );
+      if (!selected.canceled && selected.directory) {
+        setExportSettings(
+          await api.request<ExportSettings>("/api/export-settings", {
+            method: "PATCH",
+            body: { directory: selected.directory },
+          }),
+        );
+      }
+    } catch (caught) {
+      setDirectoryError(
+        caught instanceof ApiError ? caught.message : text("export.chooseError"),
+      );
+    } finally {
+      setSelectingDirectory(false);
+    }
   };
 
-  const asrProfiles = profiles.filter(
-    (profile) =>
-      profile.purpose === "cloud_asr" &&
-      profile.tested &&
-      profile.test_ok === true &&
-      profile.upload_authorized,
-  );
-  const asrOptions = connections
-    .filter((connection) => connection.protocol === "tencent_recording_asr")
-    .map((connection) => {
-      const readyProfile = asrProfiles.find(
-        (profile) => profile.connection_id === connection.id,
+  const restoreDefaultDirectory = async () => {
+    setDirectoryError(null);
+    try {
+      setExportSettings(
+        await api.request<ExportSettings>("/api/export-settings", {
+          method: "PATCH",
+          body: { use_default: true },
+        }),
       );
-      return {
-        connection,
-        profile: readyProfile,
-        value: readyProfile?.id ?? `connection:${connection.id}`,
-      };
-    });
-  const noteProfiles = profiles.filter(
-    (profile) =>
-      profile.purpose === "notes" &&
-      profile.tested &&
-      profile.test_ok === true &&
-      profile.chat_data_authorized,
-  );
+    } catch (caught) {
+      setDirectoryError(
+        caught instanceof ApiError ? caught.message : text("export.restoreError"),
+      );
+    }
+  };
 
   return (
-    <div className="page settings-page compact-settings">
-      <header className="page-header">
+    <div className="settings-page">
+      <header className="settings-page-header">
         <div>
-          <h1>设置</h1>
+          <h2>{text("settings.export")}</h2>
         </div>
-        <span className="settings-saved" role="status" aria-live="polite">
-          {saved ? "已保存" : ""}
-        </span>
       </header>
 
-      <section className="settings-group" aria-labelledby="export-settings">
-        <div className="settings-group-heading">
-          <h2 id="export-settings">处理与导出</h2>
+      <section
+        className="preference-section settings-card"
+        aria-labelledby="default-export"
+      >
+        <h3 id="default-export">{text("export.default")}</h3>
+        <div className="preference-list">
+          {exportItems.map((item) => (
+            <label className="preference-row" key={item}>
+              <span className="preference-name">{exportItemLabel(item)}</span>
+              <span className="settings-switch">
+                <input
+                  type="checkbox"
+                  checked={preferences.defaultExportItems.includes(item)}
+                  disabled={
+                    preferences.defaultExportItems.length === 1 &&
+                    preferences.defaultExportItems.includes(item)
+                  }
+                  onChange={() => toggleExportItem(item)}
+                />
+                <span aria-hidden="true" />
+              </span>
+            </label>
+          ))}
         </div>
-        <div className="settings-fields">
-          <fieldset className="field export-default-field">
-            <legend className="field-label">默认生成与导出类型</legend>
-            <div className="export-default-options">
-              {exportItems.map((item) => (
-                <label key={item.value}>
-                  <input
-                    type="checkbox"
-                    checked={preferences.defaultExportItems.includes(item.value)}
-                    disabled={
-                      preferences.defaultExportItems.length === 1 &&
-                      preferences.defaultExportItems.includes(item.value)
-                    }
-                    onChange={() => toggleExportItem(item.value)}
-                  />
-                  <span>{item.label}</span>
-                </label>
-              ))}
-            </div>
-            <p className="field-hint">
-              新任务只生成所选内容；未选择 AI 笔记时不会安排大模型总结。
-            </p>
-          </fieldset>
-          <label className="field">
-            <span className="field-label">音频格式</span>
-            <select
-              className="select-input"
+      </section>
+
+      <section
+        className="preference-section settings-card"
+        aria-labelledby="export-format"
+      >
+        <h3 id="export-format">{text("export.format")}</h3>
+        <div className="preference-list">
+          <div className="preference-row">
+            <span className="preference-name">{text("export.audio")}</span>
+            <SelectMenu
+              className="preference-menu"
+              ariaLabel={text("export.audioFormat")}
               value={preferences.audioFormat}
-              onChange={(event) =>
+              onChange={(value) =>
                 updatePreference(
                   "audioFormat",
-                  event.target.value as AppPreferences["audioFormat"],
+                  value as AppPreferences["audioFormat"],
                 )
               }
-            >
-              <option value="m4a">M4A（推荐）</option>
-              <option value="mp3">MP3</option>
-            </select>
-          </label>
-          <label className="field">
-            <span className="field-label">字幕格式</span>
-            <select
-              className="select-input"
+              options={[
+                { value: "m4a", label: "M4A" },
+                { value: "mp3", label: "MP3" },
+              ]}
+            />
+          </div>
+          <div className="preference-row">
+            <span className="preference-name">{text("export.transcript")}</span>
+            <SelectMenu
+              className="preference-menu"
+              ariaLabel={text("export.transcriptFormat")}
               value={preferences.subtitleFormat}
-              onChange={(event) =>
+              onChange={(value) =>
                 updatePreference(
                   "subtitleFormat",
-                  event.target.value as AppPreferences["subtitleFormat"],
+                  value as AppPreferences["subtitleFormat"],
                 )
               }
-            >
-              <option value="srt">SRT</option>
-              <option value="txt">纯文本 TXT</option>
-            </select>
-          </label>
-          <label className="field">
-            <span className="field-label">笔记格式</span>
-            <select
-              className="select-input"
+              options={[
+                { value: "srt", label: "SRT" },
+                { value: "txt", label: "TXT" },
+              ]}
+            />
+          </div>
+          <div className="preference-row">
+            <span className="preference-name">{text("export.notes")}</span>
+            <SelectMenu
+              className="preference-menu"
+              ariaLabel={text("export.notesFormat")}
               value={preferences.noteFormat}
-              onChange={(event) =>
+              onChange={(value) =>
                 updatePreference(
                   "noteFormat",
-                  event.target.value as AppPreferences["noteFormat"],
+                  value as AppPreferences["noteFormat"],
                 )
               }
-            >
-              <option value="markdown">Markdown</option>
-              <option value="txt">纯文本 TXT</option>
-            </select>
-          </label>
-        </div>
-      </section>
-
-      <section className="settings-group" aria-labelledby="asr-settings">
-        <div className="settings-group-heading">
-          <h2 id="asr-settings">语音识别</h2>
-        </div>
-        <div className="settings-fields">
-          <label className="field">
-            <span className="field-label">默认 ASR</span>
-            <select
-              className="select-input"
-              value={asrSelection}
-              onChange={(event) => {
-                const value = event.target.value;
-                setAsrSelection(value);
-                if (value.startsWith("connection:")) return;
-                void patchDefaults({
-                  asr_mode: "auto",
-                  cloud_asr_profile_id: value || null,
-                });
-              }}
-            >
-              <option value="">未配置</option>
-              {asrOptions.map(({ connection, profile, value }) => (
-                <option
-                  key={connection.id}
-                  value={value}
-                  disabled={!profile}
-                >
-                  {connection.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="field">
-            <span className="field-label">服务管理</span>
-            <AppLink className="button" to="/settings/connections">
-              管理 ASR
-            </AppLink>
+              options={[
+                { value: "markdown", label: "Markdown" },
+                { value: "txt", label: "TXT" },
+              ]}
+            />
           </div>
         </div>
       </section>
 
-      <section className="settings-group" aria-labelledby="model-settings">
-        <div className="settings-group-heading">
-          <h2 id="model-settings">AI 笔记</h2>
-        </div>
-        <div className="settings-fields">
-          <label className="field">
-            <span className="field-label">默认模型</span>
-            <select
-              className="select-input"
-              value={defaults?.notes_profile_id ?? ""}
-              onChange={(event) =>
-                void patchDefaults({
-                  notes_enabled: Boolean(event.target.value),
-                  notes_profile_id: event.target.value || null,
-                })
-              }
+      <section
+        className="preference-section settings-card"
+        aria-labelledby="export-directory"
+      >
+        <h3 id="export-directory">{text("export.directory")}</h3>
+        <div className="export-directory-row">
+          {exportSettings ? (
+            <output title={exportSettings.directory}>
+              {exportSettings.directory}
+            </output>
+          ) : directoryError ? (
+            <span aria-hidden="true" />
+          ) : (
+            <SkeletonStatus label={text("export.reading")}>
+              <Skeleton style={{ width: "min(72%, 28rem)" }} />
+            </SkeletonStatus>
+          )}
+          <div className="export-directory-actions">
+            {!exportSettings?.is_default && (
+              <button
+                type="button"
+                className="button button-quiet"
+                onClick={() => void restoreDefaultDirectory()}
+              >
+                {text("export.restoreDefault")}
+              </button>
+            )}
+            <button
+              type="button"
+              className="button"
+              disabled={selectingDirectory}
+              onClick={() => void chooseDirectory()}
             >
-              <option value="">未配置</option>
-              {noteProfiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profile.model === "glm-5.1"
-                    ? "GLM-5.1"
-                    : profile.model === "deepseek-v4-flash"
-                      ? "DeepSeek V4 Flash"
-                      : profile.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="field">
-            <span className="field-label">模型管理</span>
-            <AppLink className="button" to="/settings/ai-connections">
-              管理模型
-            </AppLink>
+              {selectingDirectory
+                ? text("export.choosing")
+                : text("export.choose")}
+            </button>
           </div>
         </div>
+        <MotionPresence present={Boolean(directoryError)}>
+          {directoryError ? <p className="field-error">{directoryError}</p> : null}
+        </MotionPresence>
       </section>
     </div>
   );

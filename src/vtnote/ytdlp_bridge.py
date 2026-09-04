@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import io
 import os
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 import yt_dlp
 import yt_dlp.globals
 import yt_dlp.plugins
+from yt_dlp.cookies import YoutubeDLCookieJar, extract_cookies_from_browser
 from yt_dlp.networking import RequestDirector
 from yt_dlp.networking.common import Request, RequestHandler, Response
 from yt_dlp.networking.exceptions import (
@@ -24,6 +26,7 @@ from yt_dlp.utils.networking import std_headers
 from vtnote.platform_transport import (
     PinnedHttpsTransport,
     SourceHttpRequest,
+    is_youtube_browser_authorization,
 )
 from vtnote.url_security import UpstreamHostPolicy, normalize_host
 from vtnote.youtube_runtime import YoutubeRuntime
@@ -40,6 +43,16 @@ _CONTROLLED_DEFAULT_HEADERS = {
     )
 }
 _REPARSE_POINT = 0x400
+_PLATFORM_COOKIE_DOMAINS = {
+    "douyin": ("douyin.com", "iesdouyin.com"),
+    "youtube": ("youtube.com",),
+}
+_BROWSER_COOKIE_DOMAINS = tuple(
+    domain
+    for domains in _PLATFORM_COOKIE_DOMAINS.values()
+    for domain in domains
+)
+_MAX_COOKIE_FILE_BYTES = 8 * 1024 * 1024
 
 
 def controlled_public_headers(*, referer: str | None = None) -> dict[str, str]:
@@ -77,8 +90,120 @@ class _BridgeLogger:
         pass
 
 
+class _BrowserCookieLogger:
+    def debug(self, *_: object, **__: object) -> None:
+        pass
+
+    def info(self, *_: object, **__: object) -> None:
+        pass
+
+    def warning(self, *_: object, **__: object) -> None:
+        pass
+
+    def error(self, *_: object, **__: object) -> None:
+        pass
+
+
+class PlatformCookieStore(Protocol):
+    """Return a new in-memory cookie jar for one controlled operation."""
+
+    def new_cookiejar(self) -> YoutubeDLCookieJar: ...
+
+
+def _copy_allowed_cookies(
+    source: YoutubeDLCookieJar,
+    domains: tuple[str, ...],
+) -> tuple[Any, ...]:
+    return tuple(
+        copy(cookie)
+        for cookie in source
+        if any(
+            cookie.domain.lstrip(".").casefold() == domain
+            or cookie.domain.lstrip(".").casefold().endswith(f".{domain}")
+            for domain in domains
+        )
+    )
+
+
+class BrowserCookieStore:
+    """One startup-only, domain-filtered browser cookie snapshot in memory."""
+
+    def __init__(self, browser: str) -> None:
+        if browser not in {"chrome", "edge", "firefox"}:
+            raise ValueError("unsupported platform cookie browser")
+        try:
+            source = extract_cookies_from_browser(
+                browser,
+                logger=_BrowserCookieLogger(),
+            )
+        except Exception:
+            raise RuntimeError("browser cookie import failed") from None
+        self.browser = browser
+        self._cookies = _copy_allowed_cookies(source, _BROWSER_COOKIE_DOMAINS)
+        source.clear()
+
+    def new_cookiejar(self) -> YoutubeDLCookieJar:
+        cookiejar = YoutubeDLCookieJar()
+        for cookie in self._cookies:
+            cookiejar.set_cookie(copy(cookie))
+        return cookiejar
+
+
+class NetscapeCookieFileStore:
+    """Startup-only, platform-scoped snapshot of an exported cookie file."""
+
+    def __init__(
+        self,
+        cookie_file: Path,
+        platform: Literal["douyin", "youtube"],
+    ) -> None:
+        if platform not in _PLATFORM_COOKIE_DOMAINS:
+            raise ValueError("unsupported cookie file platform")
+        path = Path(cookie_file)
+        try:
+            if not path.is_absolute() or not path.is_file():
+                raise OSError
+            size = path.stat().st_size
+            if size <= 0 or size > _MAX_COOKIE_FILE_BYTES:
+                raise OSError
+            source = YoutubeDLCookieJar(str(path))
+            source.load(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            raise RuntimeError("platform cookie file import failed") from None
+        self._cookies = _copy_allowed_cookies(
+            source,
+            _PLATFORM_COOKIE_DOMAINS[platform],
+        )
+        source.clear()
+        if not self._cookies:
+            raise RuntimeError("platform cookie file import failed")
+
+    def new_cookiejar(self) -> YoutubeDLCookieJar:
+        cookiejar = YoutubeDLCookieJar()
+        for cookie in self._cookies:
+            cookiejar.set_cookie(copy(cookie))
+        return cookiejar
+
+
 def _safe_request_error() -> RequestError:
     return RequestError("request rejected by controlled transport scope")
+
+
+def _allows_controlled_post(policy: UpstreamHostPolicy, url: str) -> bool:
+    if policy.platform != "youtube":
+        return False
+    try:
+        parts = urlsplit(url)
+        host = normalize_host(parts.hostname or "")
+    except (TypeError, ValueError):
+        return False
+    if policy.stage == "extractor_aux":
+        return True
+    return (
+        policy.stage == "page"
+        and host == "www.youtube.com"
+        and parts.path.startswith("/youtubei/v1/")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,12 +329,14 @@ class VtNoteRequestHandlerRH(RequestHandler):
         scope: BoundTransportScope,
         max_wire_bytes: int,
         max_decoded_bytes: int,
+        allow_browser_cookies: bool = False,
+        cookiejar: Any = None,
         **_: Any,
     ) -> None:
         super().__init__(
             logger=logger,
             headers={},
-            cookiejar=None,
+            cookiejar=cookiejar,
             proxies={},
             verify=True,
         )
@@ -217,6 +344,7 @@ class VtNoteRequestHandlerRH(RequestHandler):
         self._scope = scope
         self._max_wire_bytes = max_wire_bytes
         self._max_decoded_bytes = max_decoded_bytes
+        self._allow_browser_cookies = allow_browser_cookies
         self._anonymous_session_cookies: dict[str, str] = {}
 
     def _validate(self, request: Request) -> None:
@@ -235,25 +363,55 @@ class VtNoteRequestHandlerRH(RequestHandler):
             )
 
     def _send(self, request: Request) -> Response:
-        if request.data is not None or request.method not in {"GET", "HEAD"}:
+        if request.method not in {"GET", "HEAD", "POST"}:
             raise _safe_request_error()
         if request.extensions or request.proxies:
             raise _safe_request_error()
         headers = controlled_public_headers()
         headers.update(request.headers)
+        policy = self._scope.policy_for(request.url)
+        browser_authorization: str | None = None
+        for name in tuple(headers):
+            if name.casefold() != "authorization":
+                continue
+            browser_authorization = headers.pop(name)
         if any(
             name.casefold() in _SENSITIVE_HEADERS
             or name.casefold().startswith("proxy-")
             for name in headers
         ):
             raise _safe_request_error()
-        policy = self._scope.policy_for(request.url)
+        body: bytes | None = None
+        if request.method == "POST":
+            if not _allows_controlled_post(policy, request.url) or not isinstance(
+                request.data,
+                bytes,
+            ) or not request.data:
+                raise _safe_request_error()
+            body = request.data
+        elif request.data is not None:
+            raise _safe_request_error()
+        if browser_authorization is not None and (
+            not self._allow_browser_cookies
+            or policy.platform != "youtube"
+            or request.method != "POST"
+            or not _allows_controlled_post(policy, request.url)
+            or not is_youtube_browser_authorization(browser_authorization)
+        ):
+            raise _safe_request_error()
         source_request = SourceHttpRequest(
             url=request.url,
             method=request.method,
+            body=body,
             headers=headers,
             max_wire_bytes=self._max_wire_bytes,
             max_decoded_bytes=self._max_decoded_bytes,
+            browser_cookie_header=(
+                self.cookiejar.get_cookie_header(request.url)
+                if self._allow_browser_cookies
+                else None
+            ),
+            browser_authorization_header=browser_authorization,
             anonymous_session_cookies=(
                 self._anonymous_session_cookies
                 if policy.platform == "bilibili"
@@ -278,7 +436,7 @@ class VtNoteRequestHandlerRH(RequestHandler):
         adapter = _BoundedResponseAdapter(bounded)
         return Response(
             adapter,
-            url=request.url,
+            url=bounded.url,
             headers=bounded.headers,
             status=bounded.status,
             extensions={},
@@ -296,9 +454,13 @@ class VtNoteYoutubeDL(yt_dlp.YoutubeDL):
         transport: PinnedHttpsTransport,
         scope: BoundTransportScope,
         params: dict[str, Any],
+        browser_cookiejar: YoutubeDLCookieJar | None = None,
     ) -> None:
         self._vtnote_transport = transport
         self._vtnote_scope = scope
+        self._browser_cookies_enabled = browser_cookiejar is not None
+        if browser_cookiejar is not None:
+            self.__dict__["cookiejar"] = browser_cookiejar
         controlled_outtmpl = dict(params["outtmpl"])
         super().__init__(params=params, auto_init="no_verbose_header")
         self.params["outtmpl"] = controlled_outtmpl
@@ -316,6 +478,10 @@ class VtNoteYoutubeDL(yt_dlp.YoutubeDL):
                 scope=self._vtnote_scope,
                 max_wire_bytes=self._vtnote_scope.max_wire_bytes,
                 max_decoded_bytes=self._vtnote_scope.max_decoded_bytes,
+                allow_browser_cookies=(
+                    self._browser_cookies_enabled
+                ),
+                cookiejar=self.cookiejar,
             )
         )
         return director
@@ -371,12 +537,9 @@ def _validate_managed_runtime(runtime: YoutubeRuntime) -> None:
         or runtime.remote_components
         or runtime.system_runtime_fallback
         or not runtime.runtime_root.is_absolute()
-        or runtime.runtime_root.drive.casefold() != "d:"
         or not runtime.deno_executable.is_absolute()
-        or runtime.deno_executable.drive.casefold() != "d:"
         or not runtime.deno_executable.is_file()
         or not runtime.deno_dir.is_absolute()
-        or runtime.deno_dir.drive.casefold() != "d:"
         or not runtime.deno_dir.is_dir()
         or not contained
         or _has_reparse_component(runtime.runtime_root)
@@ -407,12 +570,14 @@ def build_controlled_ytdlp(
     output_root: Path,
     *,
     scope: BoundTransportScope,
+    browser_cookiejar: YoutubeDLCookieJar | None = None,
 ) -> VtNoteYoutubeDL:
     return build_controlled_platform_ytdlp(
         transport,
         output_root,
         scope=scope,
         runtime=runtime,
+        browser_cookiejar=browser_cookiejar,
     )
 
 
@@ -422,9 +587,13 @@ def build_controlled_platform_ytdlp(
     *,
     scope: BoundTransportScope,
     runtime: YoutubeRuntime | None = None,
+    browser_cookiejar: YoutubeDLCookieJar | None = None,
 ) -> VtNoteYoutubeDL:
     """Build the same controlled bridge with optional YouTube JS support."""
 
+    platform = scope.policies[0].platform
+    if browser_cookiejar is not None and platform not in {"douyin", "youtube"}:
+        raise ValueError("browser cookies are not enabled for this platform")
     if runtime is not None:
         _validate_managed_runtime(runtime)
     selected_output = _validate_output_root(output_root)
@@ -454,10 +623,14 @@ def build_controlled_platform_ytdlp(
         params["js_runtimes"] = {
             "deno": {"path": str(runtime.deno_executable)}
         }
+        params["extractor_args"] = {
+            "youtube": {"skip": ["hls", "dash"]}
+        }
     else:
         params["js_runtimes"] = {}
     return VtNoteYoutubeDL(
         transport=transport,
         scope=scope,
         params=params,
+        browser_cookiejar=browser_cookiejar,
     )

@@ -17,9 +17,14 @@ from vtnote.model_assets import (
     ModelAssetError,
     ModelAssetService,
     ModelDownloadWorker,
+    ModelManifest,
+    load_local_whisper_manifest,
 )
 from vtnote.paths import StoragePaths
-from vtnote.platform_transport import PinnedHttpsTransport
+from vtnote.platform_transport import (
+    LoopbackHttpProxyConnector,
+    PinnedHttpsTransport,
+)
 from vtnote.url_security import Resolver
 from vtnote.worker_store import (
     StageClaim,
@@ -68,6 +73,32 @@ class ModelInstaller(Protocol):
     def run_one(self) -> str | None: ...
 
 
+class RoundRobinModelInstaller:
+    """Poll multiple model installers without concurrent SQLite claims."""
+
+    def __init__(self, installers: tuple[ModelInstaller, ...]) -> None:
+        if not installers:
+            raise ValueError("at least one model installer is required")
+        self.installers = installers
+        self._cursor = 0
+
+    def run_one(self) -> str | None:
+        last_error: ModelAssetError | None = None
+        for _ in self.installers:
+            installer = self.installers[self._cursor]
+            self._cursor = (self._cursor + 1) % len(self.installers)
+            try:
+                result = installer.run_one()
+            except ModelAssetError as error:
+                last_error = error
+                continue
+            if result is not None:
+                return result
+        if last_error is not None:
+            raise last_error
+        return None
+
+
 class ModelInstallerLoop:
     """Supervise durable model work independently from media stage claims."""
 
@@ -102,8 +133,10 @@ def build_model_installer_loop(
     engine: Engine,
     paths: StoragePaths,
     manifest_path: Path,
+    manifest_loader: Callable[..., ModelManifest] = load_local_whisper_manifest,
     worker_id: str,
     resolver: Resolver,
+    proxy_url: str | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime] | None = None,
@@ -114,9 +147,17 @@ def build_model_installer_loop(
             engine=engine,
             paths=paths,
             manifest_path=manifest_path,
+            manifest_loader=manifest_loader,
         ),
         transport=HuggingFaceModelTransport(
-            PinnedHttpsTransport(resolver=resolver)
+            PinnedHttpsTransport(
+                resolver=resolver,
+                connector=(
+                    LoopbackHttpProxyConnector(proxy_url)
+                    if proxy_url is not None
+                    else None
+                ),
+            )
         ),
         worker_id=worker_id,
         clock=selected_clock,

@@ -154,12 +154,36 @@ def test_current_partial_install_is_youtube_only_and_bilibili_remains_ready(
         "deno_dir_missing",
         "deno_dir_env_mismatch",
     )
-    assert all(path.drive.casefold() == "d:" for path in (
+    assert all(path.is_absolute() for path in (
         status.runtime_root,
         status.deno_executable,
         status.deno_dir,
     ))
     assert all(call[0] not in {"which", "node", "npm", "npx"} for call in inventory.calls)
+
+
+def test_managed_assets_root_places_youtube_runtime_outside_primary_cache(
+    tmp_path: Path,
+) -> None:
+    selected = Settings(
+        data_root=tmp_path / "primary-data",
+        runtime_cache_root=tmp_path / "primary-cache",
+        managed_assets_root=tmp_path / "managed-assets",
+    )
+    status = inspect_youtube_runtime(
+        selected,
+        manifest=DEFAULT_YOUTUBE_RUNTIME_MANIFEST,
+        inventory=FakeInventory(
+            package_versions={"yt-dlp": "2026.7.4", "yt-dlp-ejs": "0.8.0"},
+            package_hashes={"yt-dlp-ejs": "1" * 64},
+            environment={},
+        ),
+    )
+
+    assert status.runtime_root == (
+        selected.managed_assets_root / "Cache" / "youtube-runtime"
+    )
+    assert not status.runtime_root.is_relative_to(selected.runtime_cache_root)
 
 
 def test_release_manifest_is_immutable_and_contains_reviewed_hashes() -> None:
@@ -265,7 +289,7 @@ def test_each_runtime_integrity_failure_has_a_granular_safe_code(
     assert status.bilibili_ready
 
 
-def test_non_d_drive_runtime_root_is_rejected_without_local_path_disclosure(
+def test_runtime_root_is_not_bound_to_one_windows_drive(
     tmp_path: Path,
 ) -> None:
     selected = Settings(
@@ -281,5 +305,5 @@ def test_non_d_drive_runtime_root_is_rejected_without_local_path_disclosure(
         inventory=inventory,
     )
 
-    assert "runtime_root_not_approved" in status.codes
+    assert "runtime_root_not_approved" not in status.codes
     assert "C:\\" not in repr(status.codes)

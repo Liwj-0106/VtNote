@@ -1,0 +1,372 @@
+
+.confirm-dialog .button-danger {
+  border-color: var(--destructive);
+  background: var(--destructive);
+  color: white;
+}
+
+.confirm-dialog .button-danger:hover:not(:disabled) {
+  border-color: var(--destructive-strong);
+  background: var(--destructive-strong);
+  color: white;
+}
+
+@media (max-width: 1100px) {
+  .detail-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .stage-inspector {
+    position: static;
+    grid-row: 1;
+    padding: 0 0 20px;
+    border-bottom: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .stage-timeline {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .stage-timeline::before {
+    display: none;
+  }
+
+  .stage-item {
+    grid-template-columns: 12px minmax(0, 1fr);
+    padding-bottom: 6px;
+  }
+}
+
+@media (max-width: 700px) {
+  .launcher-page {
+    padding-top: 0;
+  }
+
+  .launcher-heading {
+    margin-bottom: 24px;
+    text-align: left;
+  }
+
+  .launcher-tabs {
+    width: 100%;
+  }
+
+  .launcher-tabs button {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .launcher-input {
+    --launcher-input-height: 174px;
+
+    min-height: var(--launcher-input-height);
+    padding: 16px;
+  }
+
+  .launcher-input[data-source-mode="url"] {
+    height: var(--launcher-input-height);
+  }
+
+  .launcher-actions {
+    gap: 8px;
+  }
+
+  .collection-picker-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .collection-start {
+    width: 100%;
+  }
+
+  .collection-item {
+    grid-template-columns: auto 28px minmax(0, 1fr);
+    gap: 9px;
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .collection-item-duration {
+    display: none;
+  }
+
+  .output-selector {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .output-options small {
+    display: none;
+  }
+
+  .library-row {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    gap: 12px;
+  }
+
+  .library-select-checkbox {
+    grid-row: 1;
+    grid-column: 1;
+  }
+
+  .library-record {
+    grid-row: 1;
+    grid-column: 2;
+  }
+
+  .library-status {
+    grid-row: 2;
+    grid-column: 2 / -1;
+  }
+
+  .library-status-text {
+    text-align: left;
+  }
+
+  .library-actions {
+    grid-row: 1;
+    grid-column: 3;
+  }
+
+  .library-actions .button {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .export-choice-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .export-choice {
+    grid-template-columns: auto minmax(0, 1fr);
+    min-height: 86px;
+    align-items: center;
+    align-content: initial;
+  }
+
+  .export-dialog {
+    max-height: calc(100vh - 24px);
+    padding: 20px;
+  }
+
+  .segmented-control {
+    grid-template-columns: 1fr;
+  }
+
+  .segmented-control label {
+    min-height: 56px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .segmented-control label:last-child {
+    border-bottom: 0;
+  }
+
+  .source-input-area {
+    padding: 20px;
+  }
+
+  .input-action-row,
+  .history-tools,
+  .option-row,
+  .provider-form,
+  .asr-add-form {
+    grid-template-columns: 1fr;
+  }
+
+  .asr-add-button {
+    grid-column: 1;
+    width: 100%;
+  }
+
+  .ai-add-button {
+    width: 100%;
+  }
+
+  .input-action-row .button,
+  .compact-control {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .probe-result,
+  .detail-header,
+  .connection-row,
+  .profile-summary,
+  .trash-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .probe-result,
+  .detail-header {
+    display: flex;
+  }
+
+  .option-state {
+    justify-self: start;
+  }
+
+  .nested-options {
+    grid-template-columns: 1fr;
+    margin-left: 0;
+  }
+
+  .upload-progress,
+  .model-progress {
+    grid-template-columns: 1fr;
+  }
+
+  .task-row-link {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .task-state {
+    justify-items: start;
+  }
+
+  .detail-actions {
+    flex-wrap: wrap;
+  }
+
+  .stage-timeline {
+    grid-template-columns: 1fr;
+  }
+
+  .transcript-list {
+    padding-left: 0;
+  }
+
+  .transcript-list::before {
+    left: 58px;
+  }
+
+  .transcript-cue {
+    grid-template-columns: 50px minmax(0, 1fr);
+    gap: 18px;
+  }
+
+  .transcript-cue::before {
+    left: 51px;
+  }
+
+  .reader-pagination {
+    padding-left: 68px;
+  }
+
+  .connection-row,
+  .profile-summary,
+  .trash-row {
+    display: flex;
+  }
+
+  .connection-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-row {
+    align-items: start;
+  }
+
+  .settings-row > span {
+    max-width: 120px;
+  }
+
+  .settings-page-header {
+    margin-bottom: 32px;
+  }
+
+  .theme-choice-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .theme-choice {
+    grid-template-columns: 120px minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .theme-preview {
+    height: 68px;
+  }
+
+  .language-choice-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .preference-section + .preference-section {
+    margin-top: 36px;
+  }
+
+  .preference-row {
+    gap: 16px;
+  }
+
+  .preference-menu {
+    width: min(170px, 48vw);
+  }
+
+  .preference-menu-wide {
+    width: min(220px, 60vw);
+  }
+}
+
+@media (max-width: 430px) {
+  .theme-choice {
+    grid-template-columns: 1fr;
+  }
+
+  .color-setting-row {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+    padding-block: 12px;
+  }
+
+  .color-value-control {
+    width: 100%;
+  }
+}
+
+@media (forced-colors: active) {
+  .status-badge,
+  .source-composer,
+  .retry-panel {
+    border: 1px solid CanvasText;
+  }
+
+  .status-shape,
+  .stage-node,
+  .readiness-state > span,
+  .settings-switch > span {
+    forced-color-adjust: none;
+  }
+
+  .select-menu-trigger,
+  .select-menu-popover,
+  .select-menu-option,
+  .settings-switch > span {
+    border-color: CanvasText;
+  }
+
+  .select-menu-option.is-selected {
+    background: Highlight;
+    color: HighlightText;
+    forced-color-adjust: none;
+  }
+
+  .settings-switch input:checked + span {
+    border-color: Highlight;
+    background: Highlight;
+  }
+
+  .settings-switch input:checked + span::after {
+    background: HighlightText;
+  }
+}

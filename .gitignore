@@ -13,7 +13,13 @@ build/
 *.egg-info/
 .superpowers/
 .env
+debug.log
+cookies.txt
+*_cookies.txt
 *.db
 *.db-shm
 *.db-wal
 VtNote-data/
+.vtnote/
+# User-selected default export destination.
+exports/

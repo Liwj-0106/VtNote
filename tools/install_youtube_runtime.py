@@ -1,4 +1,4 @@
-"""Install one user-supplied, pinned Deno archive into VtNote's D-drive cache."""
+"""Install one user-supplied, pinned Deno archive into project-local runtime."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ DENO_ARCHIVE_SHA256 = (
 DENO_EXECUTABLE_SHA256 = (
     "a8afddac131261dc9e085c6a1a79544f0567bd09e481034b5d1533588cba9b30"
 )
-DEFAULT_RUNTIME_ROOT = Path(
-    r"D:\Workspace\Codex\cache\VtNote-runtime\youtube-runtime"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MANAGED_CACHE_ROOT = PROJECT_ROOT / ".vtnote" / "ManagedAssets" / "Cache"
+DEFAULT_RUNTIME_ROOT = MANAGED_CACHE_ROOT / "youtube-runtime"
 
 
 def sha256(path: Path) -> str:
@@ -34,12 +34,18 @@ def sha256(path: Path) -> str:
 def install(archive: Path, runtime_root: Path) -> Path:
     selected = archive.resolve(strict=True)
     root = runtime_root.resolve(strict=False)
+    controlled_root = MANAGED_CACHE_ROOT.resolve(strict=False)
     if (
         not selected.is_file()
         or selected.suffix.casefold() != ".zip"
-        or root.drive.casefold() != "d:"
     ):
         raise ValueError("invalid Deno archive or runtime root")
+    try:
+        root.relative_to(controlled_root)
+    except ValueError:
+        raise ValueError(
+            "runtime root must remain inside the project managed cache"
+        ) from None
     if sha256(selected) != DENO_ARCHIVE_SHA256:
         raise ValueError("Deno archive hash mismatch")
     destination = root / "deno" / DENO_VERSION / "deno.exe"

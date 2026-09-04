@@ -1,13 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CloseIcon,
+  CollectionIcon,
+  FolderIcon,
   MenuIcon,
   PanelIcon,
-  PlusIcon,
   SettingsIcon,
-  TasksIcon,
+  SparkIcon,
 } from "./icons";
+import { BrandMark } from "./BrandMark";
+import { useInterfacePreferences } from "./interfacePreferences";
 import { AppLink, useRouter } from "./router";
+import { MotionPresence } from "../components/MotionPresence";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -15,6 +19,25 @@ interface SidebarProps {
   onToggleCollapse: () => void;
   onOpenMobile: () => void;
   onCloseMobile: () => void;
+}
+
+const MOBILE_NAVIGATION_QUERY = "(max-width: 767px)";
+
+function useMobileNavigationViewport(): boolean {
+  const [isMobile, setIsMobile] = useState(
+    () => window.matchMedia?.(MOBILE_NAVIGATION_QUERY).matches ?? false,
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia?.(MOBILE_NAVIGATION_QUERY);
+    if (!media) return;
+    const update = () => setIsMobile(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, []);
+
+  return isMobile;
 }
 
 function navCurrent(path: string, target: string): boolean {
@@ -31,13 +54,32 @@ export function Sidebar({
   onCloseMobile,
 }: SidebarProps) {
   const { path } = useRouter();
+  const { text } = useInterfacePreferences();
   const closeButton = useRef<HTMLButtonElement>(null);
+  const openButton = useRef<HTMLButtonElement>(null);
+  const wasMobileOpen = useRef(false);
+  const isMobileNavigation = useMobileNavigationViewport();
+  const requestMobileClose = useCallback(() => {
+    if (mobileOpen) openButton.current?.focus();
+    onCloseMobile();
+  }, [mobileOpen, onCloseMobile]);
 
   useEffect(() => {
-    if (!mobileOpen) return;
+    if (!mobileOpen) {
+      const drawer = closeButton.current?.closest("aside");
+      if (
+        wasMobileOpen.current ||
+        (isMobileNavigation && drawer?.contains(document.activeElement))
+      ) {
+        openButton.current?.focus();
+      }
+      wasMobileOpen.current = false;
+      return;
+    }
+    wasMobileOpen.current = true;
     closeButton.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCloseMobile();
+      if (event.key === "Escape") requestMobileClose();
       if (event.key !== "Tab") return;
       const drawer = closeButton.current?.closest("aside");
       const focusable = drawer?.querySelectorAll<HTMLElement>(
@@ -60,70 +102,94 @@ export function Sidebar({
       document.removeEventListener("keydown", onKeyDown);
       document.body.classList.remove("drawer-open");
     };
-  }, [mobileOpen, onCloseMobile]);
+  }, [isMobileNavigation, mobileOpen, requestMobileClose]);
 
   const links = [
-    { to: "/", label: "新建处理", icon: PlusIcon },
-    { to: "/tasks", label: "内容库", icon: TasksIcon },
+    { to: "/", label: text("sidebar.newSummary"), icon: SparkIcon },
+    { to: "/tasks", label: text("sidebar.library"), icon: FolderIcon },
+    { to: "/collections", label: text("sidebar.collections"), icon: CollectionIcon },
   ];
   return (
     <>
       <button
+        ref={openButton}
         className="mobile-menu-button icon-button"
         type="button"
-        aria-label="打开导航"
+        aria-label={text("a11y.openNavigation")}
         onClick={onOpenMobile}
       >
         <MenuIcon />
       </button>
-      {mobileOpen && (
+      <MotionPresence present={mobileOpen} variant="fade">
         <button
           type="button"
           className="drawer-scrim"
-          aria-label="关闭导航"
-          onClick={onCloseMobile}
+          aria-label={text("a11y.closeNavigation")}
+          onClick={requestMobileClose}
         />
-      )}
+      </MotionPresence>
       <aside
+        id="primary-sidebar"
         className="sidebar"
-        aria-label="主导航"
+        aria-label={text("sidebar.navigation")}
+        aria-hidden={isMobileNavigation && !mobileOpen ? true : undefined}
         data-mobile-open={mobileOpen ? "true" : "false"}
+        inert={isMobileNavigation && !mobileOpen ? true : undefined}
       >
+        <button
+          className="sidebar-edge-toggle"
+          type="button"
+          aria-controls="primary-sidebar"
+          aria-expanded={!collapsed}
+          aria-label={
+            collapsed
+              ? text("sidebar.edgeExpand")
+              : text("sidebar.edgeCollapse")
+          }
+          title={collapsed ? text("sidebar.expand") : text("sidebar.collapse")}
+          onClick={onToggleCollapse}
+        />
         <div className="sidebar-brand">
-          <AppLink to="/" className="wordmark" onClick={onCloseMobile}>
-            <span className="wordmark-mark" aria-hidden="true">
-              V
+          <AppLink
+            to="/"
+            className="wordmark"
+            aria-label={text("sidebar.home")}
+            onClick={requestMobileClose}
+          >
+            <BrandMark className="brand-mark" />
+            <span className="wordmark-name sidebar-label" aria-hidden="true">
+              <strong>Vt</strong>Note
             </span>
-            <span className="sidebar-label">VtNote</span>
           </AppLink>
           <button
             ref={closeButton}
             className="mobile-close icon-button"
             type="button"
-            aria-label="关闭导航"
-            onClick={onCloseMobile}
+            aria-label={text("a11y.closeNavigation")}
+            onClick={requestMobileClose}
           >
             <CloseIcon />
           </button>
           <button
             className="desktop-collapse icon-button"
             type="button"
-            aria-label={collapsed ? "展开侧边栏" : "收起侧边栏"}
-            title={collapsed ? "展开侧边栏" : "收起侧边栏"}
+            aria-label={collapsed ? text("sidebar.expand") : text("sidebar.collapse")}
+            title={collapsed ? text("sidebar.expand") : text("sidebar.collapse")}
             onClick={onToggleCollapse}
           >
-            <PanelIcon />
+            <PanelIcon direction={collapsed ? "right" : "left"} />
           </button>
         </div>
-        <nav className="sidebar-nav" aria-label="主要页面">
+        <nav className="sidebar-nav" aria-label={text("sidebar.primaryPages")}>
           {links.map(({ to, label, icon: Icon }) => (
             <AppLink
               key={to}
               to={to}
               className={`nav-link ${navCurrent(path, to) ? "is-current" : ""}`}
+              aria-label={label}
               aria-current={navCurrent(path, to) ? "page" : undefined}
               title={collapsed ? label : undefined}
-              onClick={onCloseMobile}
+              onClick={requestMobileClose}
             >
               <Icon />
               <span className="sidebar-label">{label}</span>
@@ -132,16 +198,17 @@ export function Sidebar({
         </nav>
         <div className="sidebar-bottom">
           <AppLink
-            to="/settings"
+            to="/settings/general"
             className={`nav-link ${navCurrent(path, "/settings") ? "is-current" : ""}`}
+            aria-label={text("sidebar.settings")}
             aria-current={
               navCurrent(path, "/settings") ? "page" : undefined
             }
-            title={collapsed ? "设置" : undefined}
-            onClick={onCloseMobile}
+            title={collapsed ? text("sidebar.settings") : undefined}
+            onClick={requestMobileClose}
           >
             <SettingsIcon />
-            <span className="sidebar-label">设置</span>
+            <span className="sidebar-label">{text("sidebar.settings")}</span>
           </AppLink>
         </div>
       </aside>

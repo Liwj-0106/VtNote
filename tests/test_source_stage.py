@@ -42,6 +42,7 @@ VALID_SRT = (
     b"2\n00:00:02,000 --> 00:00:03,500\nworld\n"
 )
 VALID_VTT = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n"
+VALID_TXT = "第一段\n\n第二段\n".encode()
 
 
 def media_info(path: Path) -> MediaInfo:
@@ -264,6 +265,22 @@ def test_bilibili_json_seconds_normalize_to_canonical_milliseconds() -> None:
         (segment.id, segment.start_ms, segment.end_ms, segment.text)
         for segment in transcript.segments
     ] == [("seg_000001", 250, 1750, "caption")]
+
+
+def test_plain_text_subtitle_becomes_one_exportable_canonical_cue() -> None:
+    transcript = transcript_from_source_subtitle(
+        "txt",
+        VALID_TXT,
+        language="und",
+        method=ProvenanceMethod.UPLOADED_SUBTITLE,
+        provider="vtnote",
+    )
+
+    assert transcript.duration_ms == 1_000
+    assert [
+        (segment.start_ms, segment.end_ms, segment.text)
+        for segment in transcript.segments
+    ] == [(0, 1_000, "第一段\n第二段")]
 
 
 def test_uploaded_subtitle_is_trashed_only_after_durable_publication(

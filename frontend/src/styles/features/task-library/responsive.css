@@ -1,0 +1,120 @@
+
+.new-summary-skeleton > :first-child {
+  width: 46%;
+}
+
+.new-summary-skeleton > :nth-child(2) {
+  width: 72%;
+}
+
+.new-summary-skeleton > :last-child {
+  height: 78px;
+}
+
+@media (max-width: 1320px) {
+  .summary-library-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .library-toolbar-search {
+    order: -1;
+    flex-basis: calc(100% - 285px);
+  }
+
+  .library-pagination {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 880px) {
+  .summary-library-header {
+    align-items: flex-start;
+  }
+
+  .summary-library-toolbar {
+    align-items: stretch;
+  }
+
+  .library-toolbar-search {
+    min-width: 100%;
+    order: -2;
+  }
+
+  .library-source-select {
+    flex: 1 1 180px;
+  }
+
+  .library-pagination {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .library-table-head {
+    display: none;
+  }
+
+  .summary-library-page .library-row,
+  .library-workspace.is-list-view .library-row {
+    grid-template-columns: 18px minmax(100px, 132px) minmax(0, 1fr) 36px !important;
+  }
+
+  .summary-library-page .library-published-at {
+    display: none;
+  }
+
+  .library-workspace.is-waterfall-view .library-list {
+    columns: 2 220px;
+  }
+}
+
+@media (max-width: 620px) {
+  .summary-library-header h1 {
+    font-size: 2.25rem;
+  }
+
+  .summary-status-tabs {
+    width: 100%;
+  }
+
+  .summary-status-tabs button {
+    flex: 1;
+  }
+
+  .summary-library-toolbar > .library-menu-root,
+  .summary-library-toolbar > .library-toolbar-button,
+  .summary-library-toolbar > .select-menu {
+    flex: 1 1 calc(50% - 8px);
+  }
+
+  .summary-library-toolbar .library-toolbar-button,
+  .summary-library-toolbar .select-menu-trigger {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .summary-library-page .library-row,
+  .library-workspace.is-list-view .library-row {
+    grid-template-columns: 18px minmax(0, 1fr) 36px !important;
+  }
+
+  .summary-library-page .library-cover {
+    display: none;
+  }
+
+  .library-workspace.is-gallery-view .library-list {
+    grid-template-columns: 1fr;
+  }
+
+  .library-workspace.is-gallery-view .library-cover,
+  .library-workspace.is-waterfall-view .library-cover {
+    display: grid;
+  }
+
+  .library-workspace.is-waterfall-view .library-list {
+    columns: 1;
+  }
+
+  .new-summary-dialog {
+    padding: 20px;
+  }
+}

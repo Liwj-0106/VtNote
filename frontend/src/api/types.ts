@@ -1,12 +1,16 @@
 export type ReadinessStatus = "ready" | "partial" | "blocked";
 
+export type LocalAsrEngine = "faster_whisper" | "sensevoice_sherpa_onnx";
+
 export interface Readiness {
   status: ReadinessStatus;
   core: Record<string, boolean>;
   capabilities: Record<string, boolean>;
   local_model_state: string;
+  local_asr_engines?: Partial<Record<LocalAsrEngine, { state: string }>>;
   limits: {
     max_task_sources: number;
+    max_batch_sources: number;
     max_media_bytes: number;
     max_subtitle_bytes: number;
   };
@@ -23,11 +27,32 @@ export interface SubtitleTrack {
 }
 
 export interface SourceProbe {
-  source_kind: "bilibili" | "youtube";
+  result_type: "single" | "collection";
+  source_kind: "bilibili" | "douyin" | "youtube";
   canonical_url: string;
   title: string | null;
   duration_ms: number | null;
+  author?: string;
+  published_at?: string;
+  thumbnail_url?: string;
+  description?: string;
   subtitle_tracks: SubtitleTrack[];
+  collection?: SourceCollection;
+}
+
+export interface SourceCollectionItem {
+  id: string;
+  canonical_url: string;
+  title: string;
+  duration_ms: number | null;
+}
+
+export interface SourceCollection {
+  id: string;
+  title: string;
+  total_items: number;
+  truncated: boolean;
+  items: SourceCollectionItem[];
 }
 
 export interface StageRun {
@@ -61,6 +86,8 @@ export interface TaskItem {
   source_display_name: string | null;
   status: string;
   title: string | null;
+  thumbnail_url?: string | null;
+  published_at?: string | null;
   stage_runs: StageRun[];
   created_at: string;
   updated_at: string;
@@ -96,6 +123,14 @@ export interface Transcript {
   segments: TranscriptSegment[];
 }
 
+export interface SpeakerMap {
+  schema_version: 1;
+  source_transcript_sha256: string;
+  method: "local_acoustic_clustering" | "moss_transcribe_diarize";
+  speaker_count: number;
+  assignments: Array<{ segment_id: string; speaker: string }>;
+}
+
 export interface Translation {
   schema_version: 1;
   language: string;
@@ -116,7 +151,14 @@ export interface NoteResult {
 export interface ConnectionView {
   id: string;
   name: string;
-  protocol: "tencent_recording_asr" | "aliyun_bailian" | "tencent_tokenhub";
+  protocol:
+    | "tencent_recording_asr"
+    | "aliyun_bailian"
+    | "tencent_tokenhub"
+    | "openai_chat_completions"
+    | "anthropic_messages"
+    | "google_gemini"
+    | "azure_openai";
   base_url: string;
   parameters: Record<string, unknown>;
   has_secret: boolean;
@@ -133,7 +175,14 @@ export interface ProfileView {
   name: string;
   purpose: "cloud_asr" | "translation" | "notes";
   connection_id: string;
-  protocol: "tencent_recording_asr" | "aliyun_bailian" | "tencent_tokenhub";
+  protocol:
+    | "tencent_recording_asr"
+    | "aliyun_bailian"
+    | "tencent_tokenhub"
+    | "openai_chat_completions"
+    | "anthropic_messages"
+    | "google_gemini"
+    | "azure_openai";
   base_url: string;
   model: string;
   context_length: number;
@@ -156,6 +205,7 @@ export interface SpeechTestSample {
 
 export interface DefaultsView {
   asr_mode: "auto" | "cloud" | "local";
+  local_asr_engine: LocalAsrEngine;
   cloud_asr_profile_id: string | null;
   translation_enabled: boolean;
   translation_profile_id: string | null;
@@ -166,6 +216,11 @@ export interface DefaultsView {
   notes_output_language: string;
   has_custom_prompt: boolean;
   local_whisper_options: Record<string, unknown>;
+}
+
+export interface NotesPromptView {
+  prompt: string;
+  is_custom: boolean;
 }
 
 export interface StorageSummary {
@@ -196,4 +251,82 @@ export interface ModelStatus {
   current_file_bytes: number;
   cancel_requested: boolean;
   error_code: string | null;
+}
+
+export interface ExportSettings {
+  directory: string;
+  default_directory: string;
+  is_default: boolean;
+}
+
+export interface SavedExport {
+  directory: string;
+  files: Array<{ kind: "audio" | "transcript" | "notes" | "archive"; filename: string }>;
+}
+
+export interface BatchProbeResult {
+  input_url: string;
+  canonical_url?: string;
+  title?: string | null;
+  source_kind?: "bilibili" | "douyin" | "youtube";
+  status: "ready" | "failed" | "duplicate" | "collection_requires_separate_import";
+  duplicate_of?: number;
+  error_code?: string;
+}
+
+export interface BatchSourceProbe {
+  results: BatchProbeResult[];
+  valid_sources: Array<{
+    kind: "bilibili" | "douyin" | "youtube";
+    url: string;
+  }>;
+}
+
+export interface LibraryEntity {
+  id: string;
+  name: string;
+  created_at?: string;
+  updated_at?: string;
+  task_count?: number;
+}
+
+export interface LibraryMetadata {
+  collections: LibraryEntity[];
+  tags: LibraryEntity[];
+  total_count?: number;
+  unclassified_count?: number;
+}
+
+export interface LibraryOrganization {
+  collections: LibraryEntity[];
+  tags: LibraryEntity[];
+}
+
+export interface LibraryMatch {
+  kind: "title" | "source" | "transcript" | "note" | "excerpt";
+  item_id: string;
+  segment_id: string | null;
+  start_ms: number | null;
+  end_ms: number | null;
+  snippet: string;
+}
+
+export interface LibrarySearchResult {
+  task: Task;
+  match: LibraryMatch | null;
+  collections: LibraryEntity[];
+  tags: LibraryEntity[];
+}
+
+export interface LibraryExcerpt {
+  id: string;
+  item_id: string;
+  segment_id: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  note: string | null;
+  stale: boolean;
+  created_at: string;
+  updated_at: string;
 }

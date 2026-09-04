@@ -20,8 +20,10 @@
 | yt-dlp-ejs | 0.8.0 | Unlicense；包内另含 MIT/ISC 组件 |
 | faster-whisper | 1.2.1 | MIT |
 | CTranslate2 | 4.8.1 | MIT |
+| sherpa-onnx | 1.13.6 | Apache-2.0；最终制品仍需包含 `sherpa-onnx-core` 等传递依赖 |
 | Tencent COS Python SDK | 1.9.44 | 上游元数据为 MIT |
 | React / React DOM | 19.1.1 | MIT |
+| GSAP | 3.15.0 | [GSAP Standard License](https://gsap.com/standard-license/)；不是 SPDX 开源许可，发布与收费方式须按条款复核 |
 | Vite | 7.3.6 | MIT |
 | TypeScript | 5.9.2 | Apache-2.0 |
 
@@ -43,6 +45,8 @@ Deno、CUDA/cuBLAS/cuDNN、模型权重和 FFmpeg 是否构成发行内容，必
 ## 模型与硬件运行时
 
 - `large-v3-turbo` 的模型卡、权重来源、固定 revision 与许可必须在发布前冻结。
+- SenseVoice INT8 资产固定为 `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17@2365baeacb507f821a0c8120fcee3d484dba7a07`，文件大小和 SHA-256 由 `assets/models/sensevoice-small-int8.manifest.json` 维护。上游模型使用 [FunASR Model License](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE)，转换仓库没有独立许可元数据；对外分发权重前必须按最终文件来源复核。
+- Silero VAD 资产固定为 `csukuangfj/vad@af4fcfc9b8305246b1fe2ebcaf248975673166f1`，文件大小和 SHA-256 由 `assets/models/silero-vad.manifest.json` 维护。[Silero VAD 上游代码](https://github.com/snakers4/silero-vad)采用 MIT，但转换仓库没有独立许可元数据；不能据此自动推定当前 ONNX 文件的再分发边界。
 - NVIDIA 运行时受各自 EULA 约束，不能因 Conda 可安装就推定可随应用重分发。
 - 可选运行时组件若在用户机器上独立安装，也应在安装说明中明确来源和版本边界。
 

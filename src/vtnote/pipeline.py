@@ -44,7 +44,11 @@ _KNOWN_STAGE_STATUSES = frozenset(
 _CORE_STAGES = ("source", "transcribe")
 _PROGRESS_KEYS = frozenset({"current", "total", "unit", "message_code"})
 _PROGRESS_UNITS = frozenset({"bytes", "segments", "cues", "chunks", "items"})
-_MODEL_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MODEL_CODE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._:-]{0,63})?$"
+)
 _TRACK_ID = re.compile(r"^trk_[0-9a-f]{64}$")
 _MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
 _PROGRESS_MESSAGE_CODES = frozenset(
@@ -82,7 +86,10 @@ _PROVIDER_IDS = frozenset(
     {
         "aliyun_bailian",
         "bilibili",
+        "douyin",
         "faster_whisper",
+        "sensevoice_sherpa_onnx",
+        "moss_transcribe_diarize",
         "tencent_recording_asr",
         "tencent_tokenhub",
         "youtube",
@@ -96,6 +103,9 @@ _EVIDENCE_KEYS = (
     "provider",
     "model",
     "fallback_reason",
+    "detected_language",
+    "runtime_device",
+    "chunk_recovery",
 )
 _SOURCE_METHODS = frozenset(
     {
@@ -125,6 +135,9 @@ class ExecutionEvidence(TypedDict, total=False):
     provider: str
     model: str
     fallback_reason: str
+    detected_language: str
+    runtime_device: str
+    chunk_recovery: str
 
 
 def _bounded_nonnegative_integer(value: object, *, field: str) -> int | None:
@@ -186,7 +199,11 @@ def validate_execution_evidence(
     safe_models = frozenset(
         model
         for model in allowed_models
-        if isinstance(model, str) and _MODEL_CODE.fullmatch(model) is not None
+        if (
+            isinstance(model, str)
+            and len(model) <= 128
+            and _MODEL_CODE.fullmatch(model) is not None
+        )
     )
     normalized: ExecutionEvidence = {}
     for field in _EVIDENCE_KEYS:
@@ -207,6 +224,12 @@ def validate_execution_evidence(
             raise ValueError("invalid execution evidence model")
         if field == "fallback_reason" and value not in _FALLBACK_REASON_CODES:
             raise ValueError("invalid execution evidence fallback reason")
+        if field == "detected_language" and _SAFE_CODE.fullmatch(value) is None:
+            raise ValueError("invalid execution evidence language")
+        if field == "runtime_device" and value not in {"cuda", "cpu"}:
+            raise ValueError("invalid execution evidence runtime device")
+        if field == "chunk_recovery" and value not in {"used", "unused"}:
+            raise ValueError("invalid execution evidence chunk recovery")
         normalized[field] = value
     return normalized
 

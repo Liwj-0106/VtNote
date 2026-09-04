@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -50,6 +53,11 @@ def test_release_evidence_records_hashes_and_refuses_lgpl_label_for_gpl_ffmpeg(
         text=True,
         encoding="utf-8",
         timeout=30,
+        env={
+            **os.environ,
+            "VTNOTE_PYTHON": sys.executable,
+            "VTNOTE_DENO": shutil.which("node") or "node",
+        },
     )
 
     assert completed.returncode == 0, completed.stderr

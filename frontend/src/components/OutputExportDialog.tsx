@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ApiError, api } from "../api/client";
-import type { NoteResult } from "../api/types";
-import { loadPreferences, type AppPreferences, type ExportItem } from "../app/preferences";
+import type { SavedExport } from "../api/types";
+import { loadPreferences, type ExportItem } from "../app/preferences";
 import { DownloadIcon } from "../app/icons";
 import { InlineNotice } from "./InlineNotice";
+import { ModalDialog } from "./ModalDialog";
+import { Skeleton } from "./Skeleton";
 
 interface Outcomes {
   audio: boolean;
@@ -11,52 +13,34 @@ interface Outcomes {
   notes: boolean;
 }
 
-function safeFilename(title: string): string {
-  const cleaned = title.normalize("NFKC").replace(/[\\/:*?"<>|\r\n]+/gu, "-").trim();
-  return cleaned.slice(0, 80) || "vtnote-result";
-}
-
-function downloadBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
-function plainNote(markdown: string): string {
-  return markdown
-    .replace(/^---\n[\s\S]*?\n---\n?/u, "")
-    .replace(/^#{1,6}\s+/gmu, "")
-    .replace(/[*_`>]/gu, "")
-    .trim();
-}
-
 export function OutputExportDialog({
   itemId,
   title,
   open,
   onClose,
+  onExited,
 }: {
   itemId: string;
   title: string;
   open: boolean;
   onClose: () => void;
+  onExited?: () => void;
 }) {
   const [outcomes, setOutcomes] = useState<Outcomes | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<ExportItem[]>([]);
   const [exporting, setExporting] = useState(false);
+  const [savedDirectory, setSavedDirectory] = useState<string | null>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
+  const titleId = useId();
 
   useEffect(() => {
     if (!open) return;
-    const previousFocus = document.activeElement as HTMLElement | null;
     const controller = new AbortController();
     setOutcomes(null);
     setSelected([]);
     setError(null);
+    setSavedDirectory(null);
     api
       .request<Outcomes>(`/api/items/${itemId}/outcomes`, {
         signal: controller.signal,
@@ -72,53 +56,26 @@ export function OutputExportDialog({
           setError(caught instanceof ApiError ? caught.message : "无法读取可导出内容。");
         }
       });
-    closeButton.current?.focus();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKeyDown);
     return () => {
       controller.abort();
-      document.removeEventListener("keydown", onKeyDown);
-      previousFocus?.focus();
     };
-  }, [itemId, onClose, open]);
-
-  if (!open) return null;
-
-  const exportOne = async (kind: ExportItem, preferences: AppPreferences) => {
-    if (kind === "audio") {
-      const blob = await api.download(
-        `/api/items/${itemId}/audio?format=${preferences.audioFormat}`,
-      );
-      downloadBlob(blob, `${safeFilename(title)}.${preferences.audioFormat}`);
-    } else if (kind === "transcript") {
-      const format = preferences.subtitleFormat;
-      const blob = await api.download(
-        `/api/items/${itemId}/export?variant=original&format=${format}`,
-      );
-      downloadBlob(blob, `${safeFilename(title)}.${format}`);
-    } else {
-      const notes = await api.request<NoteResult[]>(`/api/items/${itemId}/notes`);
-      const markdown = notes[notes.length - 1]?.markdown ?? "";
-      const isText = preferences.noteFormat === "txt";
-      downloadBlob(
-        new Blob([isText ? plainNote(markdown) : markdown], {
-          type: isText ? "text/plain;charset=utf-8" : "text/markdown;charset=utf-8",
-        }),
-        `${safeFilename(title)}.${isText ? "txt" : "md"}`,
-      );
-    }
-  };
+  }, [itemId, open]);
 
   const runSelectedExports = async () => {
     setExporting(true);
     setError(null);
     try {
       const preferences = loadPreferences();
-      for (const kind of selected) {
-        await exportOne(kind, preferences);
-      }
+      const saved = await api.request<SavedExport>(`/api/items/${itemId}/export-files`, {
+        method: "POST",
+        body: {
+          items: selected,
+          audio_format: preferences.audioFormat,
+          transcript_format: preferences.subtitleFormat,
+          note_format: preferences.noteFormat,
+        },
+      });
+      setSavedDirectory(saved.directory);
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : "导出失败，请稍后重试。");
     } finally {
@@ -133,17 +90,19 @@ export function OutputExportDialog({
   ];
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
-      <dialog
-        className="export-dialog"
-        open
-        aria-labelledby="export-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
+    <ModalDialog
+      open={open}
+      busy={exporting}
+      className="export-dialog"
+      labelledBy={titleId}
+      initialFocusRef={closeButton}
+      onClose={onClose}
+      onExited={onExited}
+    >
         <div className="dialog-heading">
           <div>
             <p className="page-kicker">Export</p>
-            <h2 id="export-title">导出当前结果</h2>
+            <h2 id={titleId}>导出当前结果</h2>
             <p>{title}</p>
           </div>
           <button
@@ -151,13 +110,23 @@ export function OutputExportDialog({
             type="button"
             className="icon-button dialog-close"
             aria-label="关闭导出弹窗"
+            disabled={exporting}
             onClick={onClose}
           >
             ×
           </button>
         </div>
         {error && <InlineNotice tone="danger">{error}</InlineNotice>}
-        <div className="export-choice-grid">
+        {savedDirectory && (
+          <p className="export-saved-directory" role="status" title={savedDirectory}>
+            {savedDirectory}
+          </p>
+        )}
+        <div
+          className="export-choice-grid"
+          aria-busy={outcomes === null}
+          aria-label={outcomes === null ? "正在检查可导出内容" : undefined}
+        >
           {tiles.map((tile) => {
             const available = Boolean(outcomes?.[tile.kind]);
             const checked = selected.includes(tile.kind);
@@ -180,11 +149,13 @@ export function OutputExportDialog({
                 <span>
                   <strong>{tile.label}</strong>
                   <small>
-                    {outcomes === null
-                      ? "正在检查…"
-                      : available
-                        ? tile.hint
-                        : "当前没有此结果"}
+                    {outcomes === null ? (
+                      <Skeleton className="export-choice-hint-skeleton" />
+                    ) : available ? (
+                      tile.hint
+                    ) : (
+                      "当前没有此结果"
+                    )}
                   </small>
                 </span>
               </label>
@@ -194,12 +165,11 @@ export function OutputExportDialog({
         <button
           type="button"
           className="primary-button export-confirm-button"
-          disabled={outcomes === null || selected.length === 0 || exporting}
+          disabled={outcomes === null || selected.length === 0 || exporting || Boolean(savedDirectory)}
           onClick={() => void runSelectedExports()}
         >
-          导出所选（{selected.length}）
+          {savedDirectory ? "已导出" : `导出所选（${selected.length}）`}
         </button>
-      </dialog>
-    </div>
+    </ModalDialog>
   );
 }

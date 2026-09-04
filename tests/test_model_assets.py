@@ -21,7 +21,12 @@ from vtnote.model_assets import (
 )
 from vtnote.models import ModelInstallRecord
 from vtnote.paths import StoragePaths
-from vtnote.worker import ModelInstallerLoop, build_model_installer_loop
+from vtnote.platform_transport import LoopbackHttpProxyConnector
+from vtnote.worker import (
+    ModelInstallerLoop,
+    RoundRobinModelInstaller,
+    build_model_installer_loop,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -142,7 +147,7 @@ def test_install_requires_explicit_ack_and_free_space(tmp_path: Path) -> None:
         engine.dispose()
 
 
-def test_download_is_direct_only_and_d_drive_only(tmp_path: Path) -> None:
+def test_download_is_direct_only_and_stays_in_managed_roots(tmp_path: Path) -> None:
     service, engine, paths = make_service(tmp_path)
     try:
         status = service.request_install(
@@ -555,11 +560,18 @@ def test_worker_publishes_only_after_every_manifest_file_is_verified(
         worker_id="model-worker",
         clock=lambda: NOW,
     )
+    with Session(engine) as session:
+        row = session.get(ModelInstallRecord, "large-v3-turbo")
+        assert row is not None
+        row.error_code = "model_download_failed"
+        session.commit()
     try:
         results = [worker.run_one() for _ in TINY_FILES]
 
         assert results[-1] == "installed"
-        assert service.status().state == "installed"
+        status = service.status()
+        assert status.state == "installed"
+        assert status.error_code is None
         installed = service.require_installed_path()
         assert {
             path.name: path.read_bytes()
@@ -693,6 +705,27 @@ def test_model_installer_loop_survives_one_safe_install_failure() -> None:
     assert sleeps == [0.25]
 
 
+def test_round_robin_model_installer_serializes_and_rotates_installers() -> None:
+    calls: list[str] = []
+
+    class Installer:
+        def __init__(self, name: str, results: list[str | None]) -> None:
+            self.name = name
+            self.results = results
+
+        def run_one(self) -> str | None:
+            calls.append(self.name)
+            return self.results.pop(0)
+
+    first = Installer("first", [None, "first-installed"])
+    second = Installer("second", ["second-installed", None])
+    installer = RoundRobinModelInstaller((first, second))
+
+    assert installer.run_one() == "second-installed"
+    assert installer.run_one() == "first-installed"
+    assert calls == ["first", "second", "first"]
+
+
 def test_active_cancel_is_cooperative_then_moves_partial_to_recoverable_trash(
     tmp_path: Path,
 ) -> None:
@@ -789,5 +822,33 @@ def test_production_model_installer_composition_is_direct_and_durable(
             HuggingFaceModelTransport,
         )
         assert loop.installer.service.paths == service.paths
+    finally:
+        engine.dispose()
+
+
+def test_model_installer_uses_only_an_explicit_loopback_proxy(
+    tmp_path: Path,
+) -> None:
+    _, engine, paths = make_service(tmp_path)
+
+    class Resolver:
+        def resolve(self, host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+    try:
+        loop = build_model_installer_loop(
+            engine=engine,
+            paths=paths,
+            manifest_path=MANIFEST_PATH,
+            worker_id="model-installer",
+            resolver=Resolver(),
+            proxy_url="http://127.0.0.1:7897",
+            stop_requested=lambda: True,
+        )
+
+        connector = loop.installer.transport.transport.connector
+        assert isinstance(connector, LoopbackHttpProxyConnector)
+        assert connector.proxy_host == "127.0.0.1"
+        assert connector.proxy_port == 7897
     finally:
         engine.dispose()

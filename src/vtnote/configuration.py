@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import uuid
-import hashlib
 import json
-import re
-from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from vtnote.application.configuration_contracts import (
+    ConnectionView,
+    CredentialCleanupStatusView,
+    DefaultsView,
+    InvalidConfiguration,
+    ProfileView,
+    PublicModel,
+)
 from vtnote.config import Settings
 from vtnote.models import (
     CredentialCleanupRecord,
@@ -26,28 +29,17 @@ from vtnote.models import (
     ProviderConnectionRecord,
     TaskRecord,
 )
-from vtnote.chat import (
-    bailian_base_url,
-    bailian_chat_endpoint,
-    validate_chat_model,
-)
-from vtnote.diagnostics import sanitize_diagnostic
 from vtnote.secrets import SecretStore
 from vtnote.paths import StoragePaths
 from vtnote.provider_credentials import (
     CredentialBundle,
     CredentialReentryRequired,
+    STRUCTURED_CREDENTIAL_PROTOCOLS,
     configured_credential_fields,
     parse_credential_bundle,
     serialize_credential_bundle,
 )
-from vtnote.tencent_contract import (
-    TENCENT_ASR_ENDPOINT,
-    TENCENT_ASR_MODEL,
-    TENCENT_ASR_REGION,
-    TENCENT_LANGUAGE_SCOPE,
-)
-from vtnote.tokenhub_chat import TOKENHUB_BASE_URL, TOKENHUB_CHAT_ENDPOINT
+from vtnote.provider_chat import CHAT_PROTOCOLS
 from vtnote.sensitive_text import (
     DEFAULT_PROMPT_PURPOSE,
     SensitiveTextProtector,
@@ -55,403 +47,24 @@ from vtnote.sensitive_text import (
     require_sensitive_text_migration,
     validate_protected_text_envelope,
 )
-
-
-class InvalidConfiguration(ValueError):
-    pass
-
-
-class PublicModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class ConnectionView(PublicModel):
-    id: str
-    name: str
-    protocol: str
-    base_url: str
-    parameters: dict[str, Any]
-    revision: int
-    has_secret: bool
-    configured_fields: dict[str, bool]
-    tested: bool
-    test_ok: bool | None
-    test_message: str | None
-    cleanup_pending: bool
-
-
-class CredentialCleanupStatusView(PublicModel):
-    cleanup_pending: bool
-    pending_count: int
-
-
-class ProfileView(PublicModel):
-    id: str
-    name: str
-    purpose: str
-    connection_id: str
-    protocol: str
-    base_url: str
-    model: str
-    context_length: int
-    options: dict[str, Any]
-    revision: int
-    tested: bool
-    test_ok: bool | None
-    test_message: str | None
-    upload_authorized: bool
-    capability_fingerprint: dict[str, Any] | None
-    chat_data_authorized: bool
-
-
-class DefaultsView(PublicModel):
-    asr_mode: Literal["auto", "cloud", "local"]
-    cloud_asr_profile_id: str | None
-    translation_enabled: bool
-    translation_profile_id: str | None
-    translation_target_language: str
-    notes_enabled: bool
-    notes_profile_id: str | None
-    notes_template: Literal["summary", "key_points", "custom"]
-    notes_output_language: str
-    has_custom_prompt: bool
-    local_whisper_options: dict[str, Any]
-
-
-_PROTOCOL_PARAMETERS = {
-    "volc_bigasr_flash": frozenset(),
-    "tencent_recording_asr": frozenset(
-        {
-            "asr_region",
-            "cos_bucket",
-            "cos_region",
-            "cos_prefix",
-            "cos_private",
-            "cos_configured",
-        }
-    ),
-    "aliyun_bailian": frozenset({"workspace_id"}),
-    "tencent_tokenhub": frozenset(),
-}
-_ACTIVE_PROTOCOLS = frozenset(
-    {"tencent_recording_asr", "aliyun_bailian", "tencent_tokenhub"}
+from vtnote.configuration_policy import (
+    _ACTIVE_PROTOCOLS,
+    _ARCHIVED_NAME_PREFIX,
+    _CHAT_PURPOSES,
+    _RETRYABLE_STAGE_STATUSES,
+    _TERMINAL_TASK_STATUSES,
+    _chat_capability_fingerprint,
+    _clean_base_url,
+    _clean_message,
+    _normalize_connection_parameters,
+    _normalize_profile_contract,
+    _purpose_protocol_is_compatible,
+    _reject_reserved_name,
+    _validate_local_whisper_options,
+    _validate_profile_capacity,
+    chat_capability_fingerprint_digest,
 )
-_PURPOSE_PROTOCOL = {
-    "cloud_asr": frozenset({"tencent_recording_asr"}),
-    "translation": frozenset({"aliyun_bailian", "tencent_tokenhub"}),
-    "notes": frozenset({"aliyun_bailian", "tencent_tokenhub"}),
-}
-_PURPOSE_OPTIONS = {
-    "cloud_asr": frozenset(
-        {"language_scope", "res_text_format", "sentence_max_length"}
-    ),
-    "translation": frozenset({"temperature", "max_tokens", "enable_thinking"}),
-    "notes": frozenset({"temperature", "max_tokens", "enable_thinking"}),
-}
-_TERMINAL_TASK_STATUSES = frozenset(
-    {"canceled", "completed", "completed_with_warnings", "failed"}
-)
-_RETRYABLE_STAGE_STATUSES = frozenset({"failed", "canceled"})
-_ARCHIVED_NAME_PREFIX = "__vtnote_archived__:"
-_CHAT_PURPOSES = frozenset({"translation", "notes"})
-_MIN_CHAT_CONTEXT_LENGTH = 32_768
-_MIN_CHAT_MAX_TOKENS = 1_024
-
-
-def _reject_reserved_name(value: str) -> None:
-    if value.casefold().startswith(_ARCHIVED_NAME_PREFIX):
-        raise InvalidConfiguration("configuration name uses a reserved internal prefix")
-
-
-_COS_BUCKET_RE = re.compile(
-    r"^[a-z0-9][a-z0-9-]{1,58}[a-z0-9]-[1-9][0-9]{4,11}$"
-)
-
-
-def _normalize_connection_parameters(
-    protocol: str,
-    parameters: dict[str, Any],
-) -> dict[str, Any]:
-    if set(parameters) - _PROTOCOL_PARAMETERS[protocol]:
-        raise InvalidConfiguration("unsupported or secret connection parameter")
-    if protocol == "tencent_recording_asr":
-        configured = parameters.get("cos_configured")
-        cos_keys = {"cos_bucket", "cos_region", "cos_prefix", "cos_private"}
-        supplied_cos_keys = cos_keys.intersection(parameters)
-        if supplied_cos_keys:
-            if supplied_cos_keys != cos_keys:
-                raise InvalidConfiguration("COS configuration must be complete")
-            if configured is False:
-                raise InvalidConfiguration("COS configuration state conflicts with fields")
-            bucket = parameters["cos_bucket"]
-            region = parameters["cos_region"]
-            prefix = parameters["cos_prefix"]
-            private = parameters["cos_private"]
-            if not isinstance(bucket, str) or _COS_BUCKET_RE.fullmatch(bucket) is None:
-                raise InvalidConfiguration("invalid private COS bucket")
-            if region != TENCENT_ASR_REGION:
-                raise InvalidConfiguration("COS region must be ap-guangzhou")
-            if prefix != "vtnote-runtime":
-                raise InvalidConfiguration("COS prefix must be vtnote-runtime")
-            if private is not True:
-                raise InvalidConfiguration("COS bucket must be private")
-            if parameters.get("asr_region", TENCENT_ASR_REGION) != TENCENT_ASR_REGION:
-                raise InvalidConfiguration("Tencent ASR region must be ap-guangzhou")
-            return {
-                "asr_region": TENCENT_ASR_REGION,
-                "cos_bucket": bucket,
-                "cos_region": region,
-                "cos_prefix": prefix,
-                "cos_private": True,
-                "cos_configured": True,
-            }
-        if set(parameters) - {"asr_region", "cos_configured"}:
-            raise InvalidConfiguration("COS configuration must be complete")
-        if parameters.get("asr_region", TENCENT_ASR_REGION) != TENCENT_ASR_REGION:
-            raise InvalidConfiguration("Tencent ASR region must be ap-guangzhou")
-        if configured is not None and configured is not False:
-            raise InvalidConfiguration("COS configuration fields are missing")
-        return {
-            "asr_region": TENCENT_ASR_REGION,
-            "cos_configured": False,
-        }
-    if protocol == "aliyun_bailian":
-        workspace_id = parameters.get("workspace_id")
-        try:
-            bailian_base_url(workspace_id)
-        except ValueError:
-            raise InvalidConfiguration("invalid Bailian workspace_id") from None
-        return {"workspace_id": workspace_id}
-    if protocol == "tencent_tokenhub":
-        return {}
-    if any(not isinstance(value, str) or not value.strip() for value in parameters.values()):
-        raise InvalidConfiguration("connection parameter values must be non-empty strings")
-    return dict(parameters)
-
-
-def _validate_profile_options(purpose: str, options: dict[str, Any]) -> None:
-    if set(options) - _PURPOSE_OPTIONS[purpose]:
-        raise InvalidConfiguration("unsupported profile option")
-    language = options.get("language")
-    if language is not None and (not isinstance(language, str) or not language.strip()):
-        raise InvalidConfiguration("invalid profile option value")
-    temperature = options.get("temperature")
-    if temperature is not None and (
-        isinstance(temperature, bool)
-        or not isinstance(temperature, (int, float))
-        or not 0 <= temperature <= 2
-    ):
-        raise InvalidConfiguration("invalid profile option value")
-    max_tokens = options.get("max_tokens")
-    if max_tokens is not None and (
-        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
-    ):
-        raise InvalidConfiguration("invalid profile option value")
-    enable_thinking = options.get("enable_thinking")
-    if enable_thinking is not None and not isinstance(enable_thinking, bool):
-        raise InvalidConfiguration("invalid profile option value")
-
-
-def _normalize_profile_contract(
-    purpose: str,
-    protocol: str,
-    model: str,
-    options: dict[str, Any],
-) -> tuple[str, dict[str, Any]]:
-    cleaned_model = model.strip()
-    if purpose == "cloud_asr":
-        if protocol == "volc_bigasr_flash":
-            if set(options) - {"language"}:
-                raise InvalidConfiguration("unsupported profile option")
-            language = options.get("language")
-            if language is not None and (
-                not isinstance(language, str) or not language.strip()
-            ):
-                raise InvalidConfiguration("invalid profile option value")
-            return cleaned_model, dict(options)
-        if protocol != "tencent_recording_asr":
-            raise InvalidConfiguration(
-                "profile purpose is incompatible with connection protocol"
-            )
-        if cleaned_model != TENCENT_ASR_MODEL:
-            raise InvalidConfiguration(
-                f"Tencent ASR model must be {TENCENT_ASR_MODEL}"
-            )
-        if set(options) - _PURPOSE_OPTIONS[purpose]:
-            raise InvalidConfiguration("unsupported profile option")
-        if options.get("language_scope", TENCENT_LANGUAGE_SCOPE) != TENCENT_LANGUAGE_SCOPE:
-            raise InvalidConfiguration("Tencent ASR language scope is fixed")
-        if options.get("res_text_format", 3) != 3:
-            raise InvalidConfiguration("Tencent ASR result format is fixed")
-        if options.get("sentence_max_length", 20) != 20:
-            raise InvalidConfiguration("Tencent ASR sentence length is fixed")
-        return cleaned_model, {
-            "language_scope": TENCENT_LANGUAGE_SCOPE,
-            "res_text_format": 3,
-            "sentence_max_length": 20,
-        }
-    if protocol not in {"aliyun_bailian", "tencent_tokenhub"}:
-        raise InvalidConfiguration(
-            "profile purpose is incompatible with connection protocol"
-        )
-    _validate_profile_options(purpose, options)
-    try:
-        cleaned_model = validate_chat_model(cleaned_model)
-    except ValueError:
-        raise InvalidConfiguration("invalid chat model") from None
-    normalized = {
-        "temperature": options.get("temperature", 0.2),
-        "max_tokens": options.get("max_tokens", 4096),
-        "enable_thinking": options.get("enable_thinking", False),
-    }
-    if normalized["max_tokens"] < _MIN_CHAT_MAX_TOKENS:
-        raise InvalidConfiguration(
-            f"max_tokens must be at least {_MIN_CHAT_MAX_TOKENS}"
-        )
-    return cleaned_model, normalized
-
-
-def _purpose_protocol_is_compatible(purpose: str, protocol: str) -> bool:
-    return protocol in _PURPOSE_PROTOCOL.get(purpose, frozenset())
-
-
-def _validate_profile_capacity(
-    purpose: str,
-    context_length: int,
-    options: dict[str, Any],
-) -> None:
-    if purpose not in _CHAT_PURPOSES:
-        return
-    if context_length < _MIN_CHAT_CONTEXT_LENGTH:
-        raise InvalidConfiguration(
-            f"chat context_length must be at least {_MIN_CHAT_CONTEXT_LENGTH}"
-        )
-    max_tokens = options.get("max_tokens")
-    if (
-        isinstance(max_tokens, bool)
-        or not isinstance(max_tokens, int)
-        or max_tokens < _MIN_CHAT_MAX_TOKENS
-        or max_tokens >= context_length
-    ):
-        raise InvalidConfiguration(
-            f"max_tokens must be at least {_MIN_CHAT_MAX_TOKENS} "
-            "and smaller than context_length"
-        )
-
-
-def _validate_local_whisper_options(options: dict[str, Any]) -> None:
-    if set(options) - {
-        "model", "device", "compute_type", "vad_filter", "model_root", "cache_root"
-    }:
-        raise InvalidConfiguration("unsupported local Whisper option")
-    string_keys = {"model", "device", "compute_type", "model_root", "cache_root"}
-    if any(
-        key in string_keys and (not isinstance(value, str) or not value.strip())
-        for key, value in options.items()
-    ) or ("vad_filter" in options and not isinstance(options["vad_filter"], bool)):
-        raise InvalidConfiguration("local Whisper options must be non-empty strings")
-    if any(
-        options.get(name) != expected
-        for name, expected in {
-            "model": "large-v3-turbo",
-            "device": "cuda",
-            "compute_type": "int8_float16",
-            "vad_filter": True,
-        }.items()
-    ):
-        raise InvalidConfiguration(
-            "local Whisper is GPU-only with fixed model and runtime settings"
-        )
-
-
-def _clean_base_url(
-    value: str | None,
-    protocol: str,
-    parameters: dict[str, Any] | None = None,
-) -> str:
-    if protocol == "aliyun_bailian":
-        try:
-            expected = bailian_base_url((parameters or {}).get("workspace_id"))
-        except ValueError:
-            raise InvalidConfiguration("invalid Bailian workspace_id") from None
-        if value is not None and value != expected:
-            raise InvalidConfiguration("Bailian endpoint is fixed to Beijing workspace")
-        return expected
-    if protocol == "tencent_tokenhub":
-        if value is not None and value != TOKENHUB_BASE_URL:
-            raise InvalidConfiguration("TokenHub endpoint is fixed to Guangzhou")
-        return TOKENHUB_BASE_URL
-    if not isinstance(value, str):
-        raise InvalidConfiguration("provider base URL is required")
-    try:
-        parts = urlsplit(value)
-        host = parts.hostname
-        _ = parts.port
-    except ValueError as error:
-        raise InvalidConfiguration("invalid provider base URL") from error
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise InvalidConfiguration("invalid provider base URL")
-    if not host:
-        raise InvalidConfiguration("invalid provider base URL")
-    if parts.scheme == "http":
-        raise InvalidConfiguration("cloud provider base URL must use HTTPS")
-    if parts.scheme not in {"http", "https"}:
-        raise InvalidConfiguration("invalid provider base URL")
-    if parts.scheme != "https":
-        raise InvalidConfiguration("invalid provider base URL")
-    cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
-    if protocol == "tencent_recording_asr" and cleaned != TENCENT_ASR_ENDPOINT:
-        raise InvalidConfiguration("Tencent ASR endpoint is fixed")
-    return cleaned
-
-
-def _clean_message(
-    message: str | None, sensitive_values: tuple[str | None, ...] = ()
-) -> str | None:
-    return sanitize_diagnostic(message, sensitive_values)
-
-
-def _chat_capability_fingerprint(
-    row: ProcessorProfileRecord,
-) -> dict[str, Any] | None:
-    connection = row.connection
-    if (
-        row.purpose not in _CHAT_PURPOSES
-        or connection.protocol not in {"aliyun_bailian", "tencent_tokenhub"}
-    ):
-        return None
-    options = dict(row.options)
-    endpoint = (
-        bailian_chat_endpoint(connection.parameters["workspace_id"])
-        if connection.protocol == "aliyun_bailian"
-        else TOKENHUB_CHAT_ENDPOINT
-    )
-    return {
-        "schema_version": 1,
-        "protocol": connection.protocol,
-        "endpoint": endpoint,
-        "connection_revision": connection.revision,
-        "profile_revision": row.revision,
-        "model": row.model,
-        "response_format": "json_object",
-        "enable_thinking": options["enable_thinking"],
-        "options": {
-            "temperature": options["temperature"],
-            "max_tokens": options["max_tokens"],
-        },
-    }
-
-
-def chat_capability_fingerprint_digest(value: Mapping[str, Any]) -> str:
-    """Return the stable non-secret digest bound to one tested chat capability."""
-
-    body = json.dumps(
-        dict(value),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(body).hexdigest()
+from vtnote.local_asr_contract import LOCAL_ASR_ENGINES
 
 
 class ConfigurationService:
@@ -461,6 +74,7 @@ class ConfigurationService:
         secrets: SecretStore,
         *,
         paths: StoragePaths | None = None,
+        model_paths: StoragePaths | None = None,
         sensitive_text_protector: SensitiveTextProtector | None = None,
     ) -> None:
         self.session = session
@@ -471,21 +85,36 @@ class ConfigurationService:
         )
         if paths is None:
             selected_settings = Settings()
-            data_root = selected_settings.data_root
-            cache_root = selected_settings.runtime_cache_root
+            selected_model_paths = StoragePaths.managed_assets_from_settings(
+                selected_settings
+            )
         else:
-            data_root = paths.data_root
-            cache_root = paths.runtime_cache_root
+            selected_model_paths = model_paths or paths
+        model_data_root = selected_model_paths.data_root
+        model_cache_root = selected_model_paths.runtime_cache_root
         self.local_whisper_defaults = {
+            "schema_version": 2,
             "model": "large-v3-turbo",
             "device": "cuda",
             "compute_type": "int8_float16",
             "vad_filter": True,
-            "model_root": str(data_root / "models" / "faster-whisper"),
-            "cache_root": str(cache_root / "models" / "faster-whisper"),
+            "vad_parameters": {
+                "threshold": 0.5,
+                "min_speech_duration_ms": 250,
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            "cpu_fallback_enabled": False,
+            "word_timestamps": True,
+            "punctuation_normalization": True,
+            "speaker_diarization_enabled": False,
+            "chunk_duration_ms": 900_000,
+            "chunk_overlap_ms": 5_000,
+            "model_root": str(model_data_root / "models" / "faster-whisper"),
+            "cache_root": str(model_cache_root / "models" / "faster-whisper"),
         }
-        self._data_root = data_root.resolve(strict=False)
-        self._cache_root = cache_root.resolve(strict=False)
+        self._data_root = model_data_root.resolve(strict=False)
+        self._cache_root = model_cache_root.resolve(strict=False)
 
     def _validate_local_roots(self, options: dict[str, Any]) -> None:
         for key, root in (
@@ -576,16 +205,21 @@ class ConfigurationService:
                     override = run.retry_override_json
                     if not isinstance(override, dict):
                         continue
-                    asr = override.get("asr")
-                    profile = asr.get("profile") if isinstance(asr, dict) else None
-                    if not isinstance(profile, dict):
-                        continue
-                    profile_id = profile.get("id")
-                    connection_id = profile.get("connection_id")
-                    if isinstance(profile_id, str):
-                        profile_ids.add(profile_id)
-                    if isinstance(connection_id, str):
-                        connection_ids.add(connection_id)
+                    for section_name in ("asr", "notes"):
+                        section = override.get(section_name)
+                        profile = (
+                            section.get("profile")
+                            if isinstance(section, dict)
+                            else None
+                        )
+                        if not isinstance(profile, dict):
+                            continue
+                        profile_id = profile.get("id")
+                        connection_id = profile.get("connection_id")
+                        if isinstance(profile_id, str):
+                            profile_ids.add(profile_id)
+                        if isinstance(connection_id, str):
+                            connection_ids.add(connection_id)
         return profile_ids, connection_ids
 
     def _queue_credential_cleanup(
@@ -635,11 +269,7 @@ class ConfigurationService:
     def _connection_view(self, row: ProviderConnectionRecord) -> ConnectionView:
         current = row.tested_revision == row.revision
         stored_secret = self.secrets.get(row.credential_ref)
-        if row.protocol in {
-            "tencent_recording_asr",
-            "aliyun_bailian",
-            "tencent_tokenhub",
-        }:
+        if row.protocol in STRUCTURED_CREDENTIAL_PROTOCOLS:
             configured_fields = configured_credential_fields(
                 row.protocol,
                 stored_secret,
@@ -727,11 +357,7 @@ class ConfigurationService:
         selected_parameters = _normalize_connection_parameters(protocol, parameters)
         if secret is not None and credentials is not None:
             raise InvalidConfiguration("cannot provide two credential formats")
-        if protocol in {
-            "tencent_recording_asr",
-            "aliyun_bailian",
-            "tencent_tokenhub",
-        }:
+        if protocol in STRUCTURED_CREDENTIAL_PROTOCOLS:
             if secret is not None:
                 raise InvalidConfiguration(
                     "provider credentials must use the structured atomic form"
@@ -794,11 +420,7 @@ class ConfigurationService:
         if (secret is not None or credentials is not None) and clear_secret:
             raise InvalidConfiguration("cannot replace and clear a secret together")
         row = self._connection(connection_id)
-        if row.protocol in {
-            "tencent_recording_asr",
-            "aliyun_bailian",
-            "tencent_tokenhub",
-        }:
+        if row.protocol in STRUCTURED_CREDENTIAL_PROTOCOLS:
             if secret is not None:
                 raise InvalidConfiguration(
                     "provider credentials must use the structured atomic form"
@@ -1217,8 +839,7 @@ class ConfigurationService:
                 row.chat_data_authorized_fingerprint = None
         if (
             row.purpose == "notes"
-            and row.connection.protocol
-            not in {"aliyun_bailian", "tencent_tokenhub"}
+            and row.connection.protocol not in CHAT_PROTOCOLS
             and ok
         ):
             defaults = self.session.get(DefaultSettingsRecord, 1)
@@ -1255,8 +876,7 @@ class ConfigurationService:
         view = self._profile_view(row)
         if (
             row.purpose not in _CHAT_PURPOSES
-            or row.connection.protocol
-            not in {"aliyun_bailian", "tencent_tokenhub"}
+            or row.connection.protocol not in CHAT_PROTOCOLS
             or not view.tested
             or view.test_ok is not True
             or view.capability_fingerprint is None
@@ -1291,10 +911,9 @@ class ConfigurationService:
         row = self._profile(profile_id)
         if (
             row.purpose not in _CHAT_PURPOSES
-            or row.connection.protocol
-            not in {"aliyun_bailian", "tencent_tokenhub"}
+            or row.connection.protocol not in CHAT_PROTOCOLS
         ):
-            raise InvalidConfiguration("profile does not use domestic chat")
+            raise InvalidConfiguration("profile does not use chat")
         row.chat_data_authorized_fingerprint = None
         defaults = self.session.get(DefaultSettingsRecord, 1)
         if defaults is not None:
@@ -1312,6 +931,18 @@ class ConfigurationService:
                 id=1, local_whisper_options=dict(self.local_whisper_defaults)
             )
             self.session.add(row)
+            self.session.commit()
+            return row
+
+        local_options = dict(row.local_whisper_options)
+        roots_changed = False
+        for key in ("model_root", "cache_root"):
+            expected = self.local_whisper_defaults[key]
+            if local_options.get(key) != expected:
+                local_options[key] = expected
+                roots_changed = True
+        if roots_changed:
+            row.local_whisper_options = local_options
             self.session.commit()
         return row
 
@@ -1337,6 +968,7 @@ class ConfigurationService:
         translation_enabled = row.translation_enabled and self._valid_profile(row.translation_profile_id, "translation")
         return DefaultsView(
             asr_mode=row.asr_mode,
+            local_asr_engine=row.local_asr_engine,
             cloud_asr_profile_id=row.cloud_asr_profile_id,
             translation_enabled=translation_enabled,
             translation_profile_id=row.translation_profile_id,
@@ -1367,7 +999,7 @@ class ConfigurationService:
     def update_defaults(self, **changes: Any) -> DefaultsView:
         row = self._defaults_row()
         allowed = {
-            "asr_mode", "cloud_asr_profile_id", "translation_enabled",
+            "asr_mode", "local_asr_engine", "cloud_asr_profile_id", "translation_enabled",
             "translation_profile_id", "notes_enabled", "notes_profile_id",
             "translation_target_language", "notes_template", "notes_output_language",
             "notes_custom_prompt", "local_whisper_options",
@@ -1376,6 +1008,8 @@ class ConfigurationService:
             raise InvalidConfiguration("unsupported default setting")
         if changes.get("asr_mode", row.asr_mode) not in {"auto", "cloud", "local"}:
             raise InvalidConfiguration("invalid ASR mode")
+        if changes.get("local_asr_engine", row.local_asr_engine) not in LOCAL_ASR_ENGINES:
+            raise InvalidConfiguration("invalid local ASR engine")
         asr_mode = changes.get("asr_mode", row.asr_mode)
         cloud_id = changes.get("cloud_asr_profile_id", row.cloud_asr_profile_id)
         if cloud_id is not None:
@@ -1490,11 +1124,7 @@ class ConfigurationService:
         stored = self.secrets.get(row.credential_ref)
         if stored is None:
             return None
-        if row.protocol not in {
-            "tencent_recording_asr",
-            "aliyun_bailian",
-            "tencent_tokenhub",
-        }:
+        if row.protocol not in STRUCTURED_CREDENTIAL_PROTOCOLS:
             return stored
         try:
             return parse_credential_bundle(row.protocol, stored)
@@ -1565,11 +1195,7 @@ class ConfigurationService:
             raise InvalidConfiguration("legacy_chat_endpoint_blocked")
         stored_secret = self.secrets.get(connection.credential_ref)
         has_secret = stored_secret is not None
-        if connection.protocol in {
-            "tencent_recording_asr",
-            "aliyun_bailian",
-            "tencent_tokenhub",
-        }:
+        if connection.protocol in STRUCTURED_CREDENTIAL_PROTOCOLS:
             has_secret = all(
                 configured_credential_fields(
                     connection.protocol,
@@ -1591,7 +1217,7 @@ class ConfigurationService:
             "profile_revision": row.revision,
             "has_secret": has_secret,
         }
-        if connection.protocol in {"aliyun_bailian", "tencent_tokenhub"}:
+        if connection.protocol in CHAT_PROTOCOLS:
             capability_fingerprint = _chat_capability_fingerprint(row)
             snapshot["capability_fingerprint"] = (
                 dict(capability_fingerprint)
@@ -1649,6 +1275,41 @@ class ConfigurationService:
         if not view.upload_authorized:
             raise InvalidConfiguration(
                 "cloud ASR retry requires current upload authorization"
+            )
+        return self.snapshot_profile(profile_id)
+
+    def snapshot_current_notes_retry_profile(
+        self,
+        profile_id: str,
+        *,
+        profile_revision: int,
+    ) -> dict[str, Any]:
+        """Snapshot one explicitly selected, currently usable notes profile."""
+
+        if type(profile_revision) is not int or profile_revision <= 0:
+            raise InvalidConfiguration(
+                "notes retry profile revision must be positive"
+            )
+        try:
+            row = self._profile(profile_id)
+        except KeyError:
+            raise InvalidConfiguration(
+                "notes retry profile is unavailable"
+            ) from None
+        if row.purpose != "notes":
+            raise InvalidConfiguration("notes retry profile has the wrong purpose")
+        if row.revision != profile_revision:
+            raise InvalidConfiguration(
+                "notes retry profile revision is stale; refresh and retry"
+            )
+        view = self._profile_view(row)
+        if not view.tested or view.test_ok is not True:
+            raise InvalidConfiguration(
+                "notes retry requires a current successful test"
+            )
+        if not view.chat_data_authorized:
+            raise InvalidConfiguration(
+                "notes retry requires current chat data authorization"
             )
         return self.snapshot_profile(profile_id)
 

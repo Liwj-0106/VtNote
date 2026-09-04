@@ -7,26 +7,53 @@ writes. Direct mutation of diagnostic ORM fields is internal and unsupported.
 from __future__ import annotations
 
 import copy
-import json
 import re
-import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypedDict, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
+from vtnote.application.task_contracts import (
+    MAX_BATCH_SOURCES,
+    InvalidTaskOperation,
+    ItemView,
+    LocalSourceValidator,
+    RetryOverrideSnapshot,
+    StageView,
+    TaskDeletionError,
+    TaskView,
+)
 from vtnote.configuration import ConfigurationService, InvalidConfiguration
-from vtnote.diagnostics import sanitize_diagnostic
+from vtnote.local_asr_contract import (
+    LOCAL_ASR_ENGINES,
+    build_local_asr_snapshot,
+)
+from vtnote.diagnostics import contains_sensitive_value, sanitize_diagnostic
 from vtnote.exports import ExportFormat, render_export_from_json
-from vtnote.models import ItemRecord, RuntimeAssetRecord, StageRunRecord, TaskRecord
+from vtnote.models import (
+    ItemRecord,
+    RuntimeAssetRecord,
+    StageRunRecord,
+    TaskRecord,
+)
 from vtnote.paths import StoragePaths
-from vtnote.schemas import Transcript, Translation
+from vtnote.result_artifacts import parse_note_metadata, read_result_artifact
+from vtnote.retry_policy import bounded_retry_override, is_sqlite_retry_conflict
+from vtnote.stage_models import allowed_stage_models
+from vtnote.task_deletion import TaskDeletionService
+from vtnote.schemas import (
+    SpeakerMap,
+    Transcript,
+    TranscriptAlignment,
+    Translation,
+    transcript_sha256,
+)
 from vtnote.pipeline import (
     ACTIVE_STAGE_STATUSES as _ACTIVE,
     RETRY_ACTIVE_CONFLICTS as _RETRY_ACTIVE_CONFLICTS,
@@ -47,77 +74,14 @@ from vtnote.sensitive_text import (
 )
 
 
-class InvalidTaskOperation(ValueError):
-    pass
-
-
 _PROFILE_TEST_SAMPLE_REASON = "profile_test_sample"
-
-
-class RetryOverrideSnapshot(TypedDict, total=False):
-    schema_version: Literal[1]
-    strategy: Literal["same", "local", "cloud_confirmed"]
-    asr: dict[str, Any]
-    charge_acknowledged: bool
-
-
-class LocalSourceValidator(Protocol):
-    def validate_media(self, path: Path) -> Any: ...
-
-    def validate_subtitle(self, path: Path) -> None: ...
-
-
-class StageView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    id: str
-    stage: str
-    attempt: int
-    status: str
-    error_code: str | None
-    error_message: str | None
-    warning: str | None
-    progress: dict[str, Any] | None
-    execution_evidence: dict[str, Any] | None
-    provider_status_code: str | None
-    external_submission_state: str | None
-    started_at: datetime | None
-    finished_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
-
-
-class ItemView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    id: str
-    position: int
-    source_kind: str
-    source_locator: str
-    source_display_name: str | None
-    status: str
-    title: str | None
-    stage_runs: tuple[StageView, ...]
-    created_at: datetime
-    updated_at: datetime
-
-
-class TaskView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    id: str
-    status: str
-    options: dict[str, Any]
-    pipeline_snapshot: dict[str, Any]
-    items: tuple[ItemView, ...]
-    terminal_reason_code: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _TASK_OPTION_KEYS = frozenset(
     {
         "output_type",
         "audio_export_enabled",
         "asr_mode",
+        "local_asr_engine",
         "cloud_asr_profile_id",
         "translation_enabled",
         "translation_profile_id",
@@ -129,17 +93,7 @@ _TASK_OPTION_KEYS = frozenset(
         "notes_custom_prompt",
     }
 )
-_MAX_RETRY_OVERRIDE_BYTES = 16 * 1024
-_MAX_RESULT_ARTIFACT_BYTES = 32 * 1024 * 1024
-_NOTE_METADATA_KEYS = frozenset(
-    {
-        "generated_by_ai",
-        "template",
-        "output_language",
-        "requested_model",
-        "response_model",
-    }
-)
+_LANGUAGE_TAG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,63})$")
 
 
 class TaskService:
@@ -157,39 +111,8 @@ class TaskService:
         self.source_urls = source_urls
         self.local_source_validator = local_source_validator
 
-    @staticmethod
-    def _bounded_retry_override(
-        override: dict[str, Any],
-    ) -> RetryOverrideSnapshot:
-        try:
-            encoded = json.dumps(
-                override,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError):
-            raise InvalidTaskOperation("invalid retry override") from None
-        if len(encoded) > _MAX_RETRY_OVERRIDE_BYTES:
-            raise InvalidTaskOperation("retry override exceeds the storage limit")
-        return cast(RetryOverrideSnapshot, copy.deepcopy(override))
-
-    @staticmethod
-    def _is_sqlite_retry_conflict(error: OperationalError) -> bool:
-        original = error.orig
-        if not isinstance(original, sqlite3.OperationalError):
-            return False
-        code = getattr(original, "sqlite_errorcode", None)
-        if isinstance(code, int) and (code & 0xFF) in {
-            sqlite3.SQLITE_BUSY,
-            sqlite3.SQLITE_LOCKED,
-        }:
-            return True
-        return str(original).casefold() in {
-            "database is busy",
-            "database is locked",
-            "database table is locked",
-        }
+    _bounded_retry_override = staticmethod(bounded_retry_override)
+    _is_sqlite_retry_conflict = staticmethod(is_sqlite_retry_conflict)
 
     def _reserve_retry_transaction(self) -> None:
         if self.session.new or self.session.dirty or self.session.deleted:
@@ -219,6 +142,9 @@ class TaskService:
         cloud_profile_id: str | None = None,
         connection_revision: int | None = None,
         profile_revision: int | None = None,
+        notes_profile_id: str | None = None,
+        notes_profile_revision: int | None = None,
+        notes_output_language: str | None = None,
         acknowledge_possible_charge: bool = False,
     ) -> RetryOverrideSnapshot:
         """Build one exact internal retry snapshot without consulting defaults."""
@@ -227,6 +153,22 @@ class TaskService:
             raise InvalidTaskOperation("invalid possible-charge acknowledgement")
         if strategy not in {"same", "local", "cloud_confirmed"}:
             raise InvalidTaskOperation("invalid retry strategy")
+        has_notes_override = any(
+            value is not None
+            for value in (
+                notes_profile_id,
+                notes_profile_revision,
+                notes_output_language,
+            )
+        )
+        if has_notes_override and strategy != "same":
+            raise InvalidTaskOperation(
+                "notes retry fields require the same strategy"
+            )
+        if (notes_profile_id is None) != (notes_profile_revision is None):
+            raise InvalidTaskOperation(
+                "notes retry profile id and revision must be provided together"
+            )
         if strategy != "cloud_confirmed":
             if (
                 cloud_profile_id is not None
@@ -241,6 +183,27 @@ class TaskService:
                     "schema_version": 1,
                     "strategy": "same",
                 }
+                notes_override: dict[str, Any] = {}
+                if notes_profile_id is not None:
+                    assert notes_profile_revision is not None
+                    try:
+                        notes_override["profile"] = (
+                            self.configuration.snapshot_current_notes_retry_profile(
+                                notes_profile_id,
+                                profile_revision=notes_profile_revision,
+                            )
+                        )
+                    except InvalidConfiguration as error:
+                        raise InvalidTaskOperation(str(error)) from error
+                if notes_output_language is not None:
+                    normalized_language = notes_output_language.strip()
+                    if _LANGUAGE_TAG.fullmatch(normalized_language) is None:
+                        raise InvalidTaskOperation(
+                            "invalid notes output language"
+                        )
+                    notes_override["output_language"] = normalized_language
+                if notes_override:
+                    payload["notes"] = notes_override
                 if acknowledge_possible_charge:
                     payload["charge_acknowledged"] = True
                 return self._bounded_retry_override(
@@ -298,9 +261,8 @@ class TaskService:
         if type(schema_version) is not int or schema_version != 1:
             raise InvalidTaskOperation("invalid retry override schema")
         if strategy == "same":
-            if set(override) not in (
-                {"schema_version", "strategy"},
-                {"schema_version", "strategy", "charge_acknowledged"},
+            if not set(override).issubset(
+                {"schema_version", "strategy", "charge_acknowledged", "notes"}
             ) or (
                 "charge_acknowledged" in override
                 and override.get("charge_acknowledged") is not True
@@ -312,6 +274,58 @@ class TaskService:
             }
             if override.get("charge_acknowledged") is True:
                 normalized["charge_acknowledged"] = True
+            if "notes" in override:
+                notes = override.get("notes")
+                if (
+                    not isinstance(notes, Mapping)
+                    or not notes
+                    or not set(notes).issubset({"profile", "output_language"})
+                ):
+                    raise InvalidTaskOperation("invalid notes retry override")
+                normalized_notes: dict[str, Any] = {}
+                if "profile" in notes:
+                    supplied_profile = notes.get("profile")
+                    if not isinstance(supplied_profile, Mapping):
+                        raise InvalidTaskOperation(
+                            "invalid notes retry profile snapshot"
+                        )
+                    supplied_profile_dict = dict(supplied_profile)
+                    profile_id = supplied_profile_dict.get("id")
+                    profile_revision = supplied_profile_dict.get(
+                        "profile_revision"
+                    )
+                    if (
+                        not isinstance(profile_id, str)
+                        or type(profile_revision) is not int
+                    ):
+                        raise InvalidTaskOperation(
+                            "invalid notes retry profile snapshot"
+                        )
+                    try:
+                        current_profile = (
+                            self.configuration.snapshot_current_notes_retry_profile(
+                                profile_id,
+                                profile_revision=profile_revision,
+                            )
+                        )
+                    except InvalidConfiguration as error:
+                        raise InvalidTaskOperation(str(error)) from error
+                    if supplied_profile_dict != current_profile:
+                        raise InvalidTaskOperation(
+                            "notes retry profile changed; refresh and retry"
+                        )
+                    normalized_notes["profile"] = current_profile
+                if "output_language" in notes:
+                    output_language = notes.get("output_language")
+                    if (
+                        not isinstance(output_language, str)
+                        or _LANGUAGE_TAG.fullmatch(output_language) is None
+                    ):
+                        raise InvalidTaskOperation(
+                            "invalid notes retry output language"
+                        )
+                    normalized_notes["output_language"] = output_language
+                normalized["notes"] = normalized_notes
         elif strategy == "local":
             if set(override) != {"schema_version", "strategy", "asr"}:
                 raise InvalidTaskOperation("invalid local retry override")
@@ -372,60 +386,9 @@ class TaskService:
             raise InvalidTaskOperation("invalid retry strategy")
         return self._bounded_retry_override(normalized)
 
-    @staticmethod
-    def _allowed_stage_models(row: StageRunRecord) -> tuple[str, ...]:
-        snapshot = row.item.task.pipeline_snapshot_json
-        if not isinstance(snapshot, dict):
-            return ()
-        models: list[str] = []
-        if row.stage == "transcribe":
-            override = row.retry_override_json
-            if isinstance(override, dict):
-                strategy = override.get("strategy")
-                override_asr = override.get("asr")
-                if strategy == "cloud_confirmed":
-                    override_profile = (
-                        override_asr.get("profile")
-                        if isinstance(override_asr, dict)
-                        else None
-                    )
-                    if (
-                        isinstance(override_profile, dict)
-                        and isinstance(override_profile.get("model"), str)
-                    ):
-                        return (override_profile["model"],)
-                    return ()
-                if strategy == "local":
-                    local = snapshot.get("local_whisper")
-                    if (
-                        isinstance(local, dict)
-                        and isinstance(local.get("model"), str)
-                    ):
-                        return (local["model"],)
-                    return ()
-            local = snapshot.get("local_whisper")
-            if isinstance(local, dict) and isinstance(local.get("model"), str):
-                models.append(local["model"])
-            asr = snapshot.get("asr")
-            profile = asr.get("profile") if isinstance(asr, dict) else None
-        elif row.stage in {"translate", "notes"}:
-            section = snapshot.get("translation" if row.stage == "translate" else "notes")
-            profile = section.get("profile") if isinstance(section, dict) else None
-        else:
-            profile = None
-        if isinstance(profile, dict) and isinstance(profile.get("model"), str):
-            models.append(profile["model"])
-        return tuple(models)
+    _allowed_stage_models = staticmethod(allowed_stage_models)
 
-    @staticmethod
-    def _contains_sensitive_value(
-        values: tuple[str, ...], sensitive_values: tuple[str, ...]
-    ) -> bool:
-        return any(
-            sensitive and sensitive in value
-            for value in values
-            for sensitive in sensitive_values
-        )
+    _contains_sensitive_value = staticmethod(contains_sensitive_value)
 
     def _stage_view(
         self, row: StageRunRecord, sensitive_values: tuple[str, ...]
@@ -581,6 +544,11 @@ class TaskService:
         asr_mode = options.get("asr_mode", defaults.asr_mode)
         if asr_mode not in {"auto", "cloud", "local"}:
             raise InvalidTaskOperation("invalid ASR mode")
+        local_asr_engine = options.get(
+            "local_asr_engine", defaults.local_asr_engine
+        )
+        if local_asr_engine not in LOCAL_ASR_ENGINES:
+            raise InvalidTaskOperation("invalid local ASR engine")
         cloud_profile_id = options.get(
             "cloud_asr_profile_id", defaults.cloud_asr_profile_id
         )
@@ -666,6 +634,7 @@ class TaskService:
         snapshot = {
             "schema_version": 1,
             "asr": {"mode": asr_mode, "profile": cloud},
+            "local_asr": build_local_asr_snapshot(local_asr_engine),
             "translation": {
                 "enabled": translation_enabled,
                 "profile": translation,
@@ -678,8 +647,8 @@ class TaskService:
                 "output_language": output_language,
                 "custom_prompt_envelope": custom_prompt_envelope,
             },
-            "local_whisper": dict(defaults.local_whisper_options),
         }
+        snapshot["local_whisper"] = dict(defaults.local_whisper_options)
         if output_type is not None:
             snapshot["output_type"] = output_type
         snapshot["audio_export_enabled"] = audio_export_enabled
@@ -712,12 +681,12 @@ class TaskService:
                 raise InvalidTaskOperation(f"invalid local {label}") from None
         return kind, str(path)
 
-    def _create_validated_task(
+    def _build_validated_task(
         self,
         *,
         validated: list[tuple[str, str, str | None]],
         selected_options: dict[str, Any],
-    ) -> TaskView:
+    ) -> TaskRecord:
         task_id = str(uuid4())
         snapshot = self._pipeline_snapshot(selected_options, task_id)
         stored_options = dict(selected_options)
@@ -755,6 +724,18 @@ class TaskService:
         self.session.flush()
         for item in task.items:
             item.artifact_relpath = f"items/{item.id}"
+        return task
+
+    def _create_validated_task(
+        self,
+        *,
+        validated: list[tuple[str, str, str | None]],
+        selected_options: dict[str, Any],
+    ) -> TaskView:
+        task = self._build_validated_task(
+            validated=validated,
+            selected_options=selected_options,
+        )
         self.session.commit()
         return self._view(self._load_task(task.id))
 
@@ -770,6 +751,39 @@ class TaskService:
         return self._create_validated_task(
             validated=validated, selected_options=selected_options
         )
+
+    def create_batch_tasks(
+        self,
+        *,
+        sources: list[dict[str, str]],
+        options: dict[str, Any] | None = None,
+    ) -> tuple[TaskView, ...]:
+        if not sources:
+            raise InvalidTaskOperation("at least one source is required")
+        if len(sources) > MAX_BATCH_SOURCES:
+            raise InvalidTaskOperation(
+                f"batch cannot exceed {MAX_BATCH_SOURCES} sources"
+            )
+        selected_options = dict(options or {})
+        if set(selected_options) - _TASK_OPTION_KEYS:
+            raise InvalidTaskOperation("unsupported task option")
+        validated = [(*self._validate_source(source), None) for source in sources]
+        locators = [item[1] for item in validated]
+        if len(locators) != len(set(locators)):
+            raise InvalidTaskOperation("batch sources must be unique")
+        try:
+            task_ids = [
+                self._build_validated_task(
+                    validated=[source],
+                    selected_options=selected_options,
+                ).id
+                for source in validated
+            ]
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return tuple(self._view(self._load_task(task_id)) for task_id in task_ids)
 
     def create_upload_task(
         self, *, upload_kind: str, upload_id: str, options: dict[str, Any] | None = None
@@ -897,6 +911,9 @@ class TaskService:
     def get_task(self, task_id: str) -> TaskView:
         return self._view(self._load_task(task_id))
 
+    def delete_tasks(self, task_ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        return TaskDeletionService(self.session, self.paths).delete_tasks(task_ids)
+
     def finalize_profile_test_sample(self, task_id: str) -> ItemView:
         """Hide a validated short sample from the work queue and task history."""
 
@@ -933,16 +950,7 @@ class TaskService:
             raise KeyError(item_id)
         return item
 
-    @staticmethod
-    def _read_result(path: Path) -> bytes:
-        if not path.is_file():
-            raise InvalidTaskOperation("result artifact is not available")
-        try:
-            if path.stat().st_size > _MAX_RESULT_ARTIFACT_BYTES:
-                raise InvalidTaskOperation("result artifact exceeds the read limit")
-            return path.read_bytes()
-        except OSError as error:
-            raise InvalidTaskOperation("result artifact could not be read") from error
+    _read_result = staticmethod(read_result_artifact)
 
     def get_item_transcript(self, item_id: str) -> Transcript:
         self._require_item(item_id)
@@ -952,6 +960,30 @@ class TaskService:
             )
         except ValidationError as error:
             raise InvalidTaskOperation("transcript artifact is invalid") from error
+
+    def get_item_alignment(self, item_id: str) -> TranscriptAlignment:
+        transcript = self.get_item_transcript(item_id)
+        try:
+            alignment = TranscriptAlignment.model_validate_json(
+                self._read_result(self.paths.transcript_alignment(item_id))
+            )
+        except ValidationError as error:
+            raise InvalidTaskOperation("alignment artifact is invalid") from error
+        if alignment.source_transcript_sha256 != transcript_sha256(transcript):
+            raise InvalidTaskOperation("alignment artifact does not match transcript")
+        return alignment
+
+    def get_item_speakers(self, item_id: str) -> SpeakerMap:
+        transcript = self.get_item_transcript(item_id)
+        try:
+            speakers = SpeakerMap.model_validate_json(
+                self._read_result(self.paths.speaker_map(item_id))
+            )
+        except ValidationError as error:
+            raise InvalidTaskOperation("speaker artifact is invalid") from error
+        if speakers.source_transcript_sha256 != transcript_sha256(transcript):
+            raise InvalidTaskOperation("speaker artifact does not match transcript")
+        return speakers
 
     def get_item_translation(self, item_id: str, language: str) -> Translation:
         transcript = self.get_item_transcript(item_id)
@@ -965,25 +997,7 @@ class TaskService:
         except ValueError as error:
             raise InvalidTaskOperation("translation artifact does not match transcript") from error
 
-    @staticmethod
-    def _note_metadata(markdown: str) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        lines = markdown.splitlines()
-        if not lines or lines[0] != "---":
-            return metadata
-        for line in lines[1:]:
-            if line == "---":
-                break
-            key, separator, value = line.partition(":")
-            normalized_key = key.strip()
-            if separator and normalized_key in _NOTE_METADATA_KEYS:
-                normalized_value = value.strip()
-                metadata[normalized_key] = (
-                    normalized_value.casefold() == "true"
-                    if normalized_key == "generated_by_ai"
-                    else normalized_value
-                )
-        return metadata
+    _note_metadata = staticmethod(parse_note_metadata)
 
     def list_item_notes(self, item_id: str) -> list[dict[str, Any]]:
         self._require_item(item_id)
@@ -1268,6 +1282,10 @@ class TaskService:
                 raise InvalidTaskOperation("cannot retry while cancellation is active")
             if stage not in _STAGE_DEPENDENCIES:
                 raise InvalidTaskOperation("unknown pipeline stage")
+            if "notes" in normalized_override and stage != "notes":
+                raise InvalidTaskOperation(
+                    "notes retry override is valid only for notes"
+                )
             if any(
                 run.status in _ACTIVE
                 and run.stage in _RETRY_ACTIVE_CONFLICTS[stage]
@@ -1288,7 +1306,13 @@ class TaskService:
                 raise InvalidTaskOperation(
                     "stage retry conflicted; refresh and retry"
                 )
-            if latest_attempt.status not in _RETRYABLE:
+            regenerating_completed_notes = (
+                stage == "notes" and latest_attempt.status == "completed"
+            )
+            if (
+                latest_attempt.status not in _RETRYABLE
+                and not regenerating_completed_notes
+            ):
                 raise InvalidTaskOperation(
                     "only a failed or canceled stage can be retried"
                 )

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib
 import io
+from http.cookiejar import Cookie
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import yt_dlp.plugins
+from yt_dlp.cookies import YoutubeDLCookieJar
 from yt_dlp.networking.common import Request
 from yt_dlp.networking.exceptions import NoSupportingHandlers, RequestError
 
@@ -20,6 +22,8 @@ from vtnote.url_security import (
 )
 from vtnote.youtube_runtime import YoutubeRuntime, YoutubeRuntimeManifest
 from vtnote.ytdlp_bridge import (
+    BrowserCookieStore,
+    NetscapeCookieFileStore,
     BoundTransportScope,
     VtNoteRequestHandlerRH,
     build_controlled_platform_ytdlp,
@@ -46,11 +50,13 @@ class TrackingBoundedResponse(io.RawIOBase):
         self,
         body: bytes,
         *,
+        url: str = "https://www.youtube.com/watch?v=abc",
         status: int = 200,
         headers: dict[str, str] | None = None,
         anonymous_session_cookies: dict[str, str] | None = None,
     ) -> None:
         self.status = status
+        self.url = url
         self.headers = headers or {"Content-Type": "text/plain"}
         self._body = io.BytesIO(body)
         self._anonymous_session_cookies = dict(
@@ -137,6 +143,31 @@ def runtime(tmp_path: Path) -> YoutubeRuntime:
         remote_components=frozenset(),
         system_runtime_fallback=False,
     )
+
+
+def youtube_cookiejar() -> YoutubeDLCookieJar:
+    cookiejar = YoutubeDLCookieJar()
+    cookiejar.set_cookie(
+        Cookie(
+            version=0,
+            name="SAPISID",
+            value="browser-super-secret",
+            port=None,
+            port_specified=False,
+            domain=".youtube.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+    return cookiejar
 
 
 def probe_scope() -> BoundTransportScope:
@@ -277,6 +308,198 @@ def test_handler_adds_only_fixed_public_default_headers() -> None:
     assert headers["User-Agent"].startswith("Mozilla/5.0 ")
     assert "Cookie" not in headers
     assert "Authorization" not in headers
+
+
+def test_handler_scopes_browser_cookie_in_memory_without_public_headers() -> None:
+    cookiejar = youtube_cookiejar()
+    transport = FakeTransport([TrackingBoundedResponse(b"ok")])
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+        allow_browser_cookies=True,
+        cookiejar=cookiejar,
+    )
+
+    handler.send(Request("https://www.youtube.com/watch?v=abc")).close()
+
+    sent = transport.calls[0].request
+    assert sent.browser_cookie_header == "SAPISID=browser-super-secret"
+    assert "Cookie" not in sent.headers
+    assert "browser-super-secret" not in repr(sent)
+
+
+def test_handler_accepts_only_derived_youtube_sid_authorization() -> None:
+    transport = FakeTransport([TrackingBoundedResponse(b"{}")])
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+        allow_browser_cookies=True,
+        cookiejar=youtube_cookiejar(),
+    )
+    authorization = f"SAPISIDHASH 1720000000_{'a' * 40}"
+
+    handler.send(
+        Request(
+            "https://youtubei.googleapis.com/youtubei/v1/player",
+            data=b'{}',
+            headers={"Authorization": authorization},
+        )
+    ).close()
+
+    sent = transport.calls[0].request
+    assert sent.browser_authorization_header == authorization
+    assert sent.browser_cookie_header is None
+    assert "Authorization" not in sent.headers
+    assert "browser-super-secret" not in repr(sent)
+
+
+def test_browser_cookie_store_filters_domains_and_returns_fresh_jars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = youtube_cookiejar()
+    source.set_cookie(
+        Cookie(
+            version=0,
+            name="unrelated",
+            value="must-not-survive",
+            port=None,
+            port_specified=False,
+            domain=".example.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+    monkeypatch.setattr(
+        "vtnote.ytdlp_bridge.extract_cookies_from_browser",
+        lambda *_args, **_kwargs: source,
+    )
+
+    store = BrowserCookieStore("chrome")
+    first = store.new_cookiejar()
+    second = store.new_cookiejar()
+
+    assert len(source) == 0
+    assert first is not second
+    assert first.get_cookie_header("https://www.youtube.com/") == (
+        "SAPISID=browser-super-secret"
+    )
+    assert first.get_cookie_header("https://example.com/") is None
+
+
+def test_netscape_cookie_file_store_is_platform_scoped_and_in_memory(
+    tmp_path: Path,
+) -> None:
+    source = youtube_cookiejar()
+    source.set_cookie(
+        Cookie(
+            version=0,
+            name="unrelated",
+            value="must-not-survive",
+            port=None,
+            port_specified=False,
+            domain=".example.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+    cookie_file = tmp_path / "private-cookies.txt"
+    source.save(cookie_file, ignore_discard=True, ignore_expires=True)
+
+    store = NetscapeCookieFileStore(cookie_file, "youtube")
+    first = store.new_cookiejar()
+    second = store.new_cookiejar()
+
+    assert first is not second
+    assert first.get_cookie_header("https://www.youtube.com/") == (
+        "SAPISID=browser-super-secret"
+    )
+    assert first.get_cookie_header("https://example.com/") is None
+    assert "private-cookies" not in repr(store)
+
+
+def test_netscape_cookie_file_store_rejects_wrong_platform(
+    tmp_path: Path,
+) -> None:
+    source = youtube_cookiejar()
+    cookie_file = tmp_path / "private-cookies.txt"
+    source.save(cookie_file, ignore_discard=True, ignore_expires=True)
+
+    with pytest.raises(RuntimeError, match="platform cookie file import failed"):
+        NetscapeCookieFileStore(cookie_file, "douyin")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/youtubei/v1/player",
+        "https://youtubei.googleapis.com/youtubei/v1/player",
+    ],
+)
+def test_handler_allows_only_bounded_youtube_api_posts(url: str) -> None:
+    transport = FakeTransport([TrackingBoundedResponse(b"{}")])
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+    )
+
+    handler.send(
+        Request(
+            url,
+            data=b'{"videoId":"abc"}',
+            headers={"Content-Type": "application/json"},
+        )
+    ).close()
+
+    sent = transport.calls[0].request
+    assert sent.method == "POST"
+    assert sent.body == b'{"videoId":"abc"}'
+    assert sent.headers["Content-Type"] == "application/json"
+
+
+def test_handler_rejects_post_to_non_api_page() -> None:
+    transport = FakeTransport([])
+    handler = VtNoteRequestHandlerRH(
+        logger=NullLogger(),
+        transport=transport,
+        scope=probe_scope(),
+        max_wire_bytes=100,
+        max_decoded_bytes=100,
+    )
+
+    with pytest.raises(RequestError):
+        handler.send(
+            Request(
+                "https://www.youtube.com/watch?v=abc",
+                data=b"not-an-api-request",
+            )
+        )
+
+    assert transport.calls == []
 
 
 def test_bilibili_handler_keeps_anonymous_cookies_in_one_memory_session() -> None:
@@ -474,6 +697,9 @@ def test_controlled_builder_uses_static_output_and_runtime_options_only(
     assert bridge.params["js_runtimes"] == {
         "deno": {"path": str(selected_runtime.deno_executable)}
     }
+    assert bridge.params["extractor_args"] == {
+        "youtube": {"skip": ["hls", "dash"]}
+    }
     assert bridge.params["remote_components"] == set()
     assert bridge.params["proxy"] == ""
     assert bridge.params["cookiefile"] is None
@@ -514,6 +740,36 @@ def test_bilibili_builder_accepts_owned_absolute_output_root(
         "default": str(output_root / "source.%(ext)s")
     }
     assert bridge.params["js_runtimes"] == {}
+
+
+def test_builder_accepts_only_preloaded_in_memory_browser_cookies(
+    tmp_path: Path,
+) -> None:
+    cookiejar = YoutubeDLCookieJar()
+
+    bridge = build_controlled_platform_ytdlp(
+        FakeTransport([]),
+        tmp_path / "douyin",
+        scope=BoundTransportScope.for_probe(
+            page_host_policy("douyin"),
+            extractor_aux_host_policy("douyin"),
+        ),
+        browser_cookiejar=cookiejar,
+    )
+
+    assert bridge.params["cookiefile"] is None
+    assert bridge.params["cookiesfrombrowser"] is None
+    assert bridge.cookiejar is cookiejar
+
+
+def test_builder_rejects_browser_cookies_for_bilibili(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not enabled"):
+        build_controlled_platform_ytdlp(
+            FakeTransport([]),
+            tmp_path / "bilibili-cookie",
+            scope=bilibili_probe_scope(),
+            browser_cookiejar=YoutubeDLCookieJar(),
+        )
 
 
 def test_probe_forces_download_false(

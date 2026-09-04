@@ -1,6 +1,6 @@
 # VtNote 产品与技术调研
 
-校准日期：2026-08-19
+校准日期：2026-08-30
 原则：只记录会影响当前产品或技术决策的结论；价格、热度和营销数字不作为架构依据。
 
 ## 结论
@@ -21,10 +21,21 @@ VtNote 不需要变成完整下载器或通用知识库。其差异化应保持�
 | [BiliNote](https://github.com/JefferyHcool/BiliNote) | 视频链接到 Markdown 笔记、截图/原片跳转、AI 问答，提供本地部署和托管版 | 笔记应保持结构、来源定位和后续复用能力 | VtNote 当前不扩大到截图、RAG、托管 SaaS；先保证字幕和本机恢复 |
 | [BibiGPT Skill](https://github.com/JimmyLv/bibigpt-skill) | URL 摘要、章节、字幕、批处理、MCP/CLI/API | 字幕-only、章节和机器可读输出应是独立意图 | 远程服务、OAuth/MCP 和多平台批量不是当前本机 V1 范围 |
 | [NotebookLM](https://support.google.com/notebooklm/answer/16164461) | 多来源研究、基于来源的问答与引用、报告/导览等派生产物 | 长期方向是让字幕成为可引用来源，而不是只生成一次性摘要 | YouTube 导入依赖公开字幕；云端知识库的数据模型和隐私边界不同，不作为当前架构模板 |
+| [MacWhisper](https://www.macwhisper.com/) | 多文件批量转写、字幕检索、音频同步回听和速度控制 | 批量导入应保持一文件一任务；校对入口应与字幕和时间码共处 | 不引入独立媒体库、订阅或新的设置层级 |
+| [Buzz](https://github.com/chidiwilliams/buzz) | 本地转写、批处理、搜索、同步播放和速度控制 | 本地优先工具仍需要完整字幕检索与轻量回听 | 不照搬桌面窗口结构、监听目录和全部模型管理能力 |
+| [Descript](https://help.descript.com/hc/en-us/articles/10164807821581-Search-in-script-tool) | 在稿件中检索并跳转结果，文本与媒体位置保持关联 | 检索必须覆盖完整字幕，结果跳转不能受当前分页限制 | 不扩展为多轨音视频编辑器或协作 SaaS |
 | DownKyi 1.6.1 | B 站解析、字幕/音视频独立选择、下载进度、断点恢复、FFmpeg 合并 | 内容选择、阶段状态、字幕轨枚举、许可入口值得参考 | GPL 源码/二进制、aria2 RPC、旧私有 API 和 exe 目录存储不复用 |
 | vivo 录音机许可清单 | Android UI、网络、协程、容器/Office 解析等依赖披露 | 可借鉴结构化并发、取消、流式网络和依赖清单生成 | 清单不包含录音/ASR 架构证据，不能据此判断其识别方案更优 |
 
-产品结论：当前设置中的“默认生成与导出类型”是正确方向；字幕不应隐含 AI。下一阶段的产品价值优先级应是字幕质量/选轨、缓存治理、详情与可追溯性，而不是继续增加 Provider 数量。
+产品结论：当前设置中的“默认生成与导出类型”是正确方向；字幕不应隐含 AI。批量本地导入、完整字幕检索和时间码回听应直接融入现有启动台与详情页，而不是增加新模块。后续价值优先级仍是字幕质量/选轨、缓存治理与可追溯性，而不是继续增加 Provider 数量。
+
+### 界面与动效参考
+
+| 来源 | 采用内容 | 边界 |
+|---|---|---|
+| [Refero Styles](https://styles.refero.design/) | 用于校准暖纸色、墨色正文、细边框和单一低饱和强调色，保持首屏工作区层级一致 | 不复制具体产品页面，也不增加英文眉题、营销段落或装饰性卡片 |
+| [Vibe Interaction Glossary](https://vibe-hub.org/) | 用统一术语描述悬停、弹层、拖拽、入场和状态反馈，便于设计规范与实现保持同义 | 只为已有操作选择合适反馈，不因展示动效而增加步骤 |
+| [GSAP](https://gsap.com/) / [Showcase](https://gsap.com/showcase/) | 用 GSAP 实现来源预检和提交中的短促状态信号，集中封装时间线、清理和减少动态效果分支 | 不采用整页滚动叙事、弹跳、发光、视差或持续装饰动画 |
 
 ## 技术选型调研
 
@@ -35,16 +46,16 @@ VtNote 不需要变成完整下载器或通用知识库。其差异化应保持�
 | 固定 yt-dlp + adapter | 平台变化集中在上游；支持字幕/音频信息；便于固定版本与测试 | 仍受平台变化、EJS 运行时和网络环境影响 | **当前采用**；外层继续做 URL/DNS/redirect/resource 校验 |
 | 自写 B 站私有 API | 可精细控制字幕轨和 DASH | WBI/端点/Cookie 易漂移，长期维护和登录边界更大 | 可做无登录、只读实验 adapter；实测优于 yt-dlp 后才启用，并保留后备 |
 | aria2 | 多连接下载、GID/session 恢复成熟 | 新进程/RPC/证书配置与治理成本；和现有 Worker durability 重复 | 当前单音频路径无实测收益；大文件基准证明收益后可作为 loopback-only 可选下载器 |
-| 浏览器扩展/读取 Cookie | 可接近用户登录态 | 密钥/会话泄露和平台合规风险高 | V1 禁止 |
+| 显式读取浏览器 Cookie | 可通过抖音/YouTube 的验证与反机器人检查 | 会话泄露、浏览器数据库锁和平台合规风险高 | 用户授权后仅在启动时读取 Firefox/Chrome/Edge，域名过滤、仅驻留内存、首跳发送；Windows Chromium `v20` 不可解密时使用 Firefox，不用于会员或 DRM 绕过 |
 
 ### ASR
 
 | 方案 | 特征 | 决策 |
 |---|---|---|
 | 腾讯云录音文件识别 | 异步 task id，可内联或通过私有 COS；适合较长录音 | **当前云路径**；必须持久化 submit/query/unknown/cleanup，验证可能计费 |
-| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + CTranslate2 | 本地模型、GPU/量化选项、生态成熟 | **当前本地后备**；固定模型资产并由用户显式安装，不在任务中临时下载 |
+| [SenseVoice Small](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) + [sherpa-onnx](https://k2-fsa.github.io/sherpa/onnx/sense-voice/pretrained.html) + Silero VAD | 非自回归多语种模型、INT8 ONNX、CPU 推理和 VAD 分段 | **当前可选本地引擎**；固定模型与 VAD 资产，关闭说话人分离；速度和质量由本机同样本测试决定 |
+| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + CTranslate2 | 本地模型、GPU/量化选项、生态成熟 | **当前可选本地引擎**；固定模型资产并由用户显式安装，不在任务中临时下载 |
 | whisper.cpp | 单二进制、CPU/多平台潜力 | 需要另一套模型格式、质量/性能矩阵和分发验证 | 候选，不与当前引擎同时维护 |
-| FunASR/SenseVoice 类方案 | 中文场景潜力 | 新模型许可、服务进程、结果 schema 和实测成本 | 只有真实语料证明收益后再评估 |
 
 当前选择不是“全场景准确率冠军”的声明。云/本地质量必须在相同授权语料上比较；项目不引用不同厂商不可比的营销准确率。
 
@@ -67,8 +78,8 @@ VtNote 不需要变成完整下载器或通用知识库。其差异化应保持�
 
 审阅范围：
 
-- `D:\Workspace\Project\CY\downkyi--main`：源码快照，无 `.git` 元数据。
-- `D:\Workspace\Project\CY\DownKyi-1.6.1`：发行目录，包含用户状态。
+- 本地 DownKyi 源码快照：无 `.git` 元数据。
+- 本地 DownKyi 1.6.1 发行快照：包含用户状态。
 
 源码 `AssemblyInfo.cs` 与发行文件均标识 1.6.1，`CHANGELOG.md` 日期为 2023-12-10。两个目录只能证明本地快照内容，不能证明完整上游提交；上游 release 页面仍将 v1.6.1 标为最新 release：[DownKyi releases](https://github.com/leiurayer/downkyi/releases)。
 

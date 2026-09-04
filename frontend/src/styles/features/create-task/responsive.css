@@ -1,0 +1,44 @@
+
+.batch-probe-footer p {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 0.86rem;
+}
+
+.batch-probe-start {
+  min-width: 180px;
+}
+
+@media (max-width: 700px) {
+  .summary-settings-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 14px 0;
+  }
+
+  .summary-settings-row > .select-menu,
+  .summary-settings-row > .settings-switch {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .summary-settings-row > .settings-switch {
+    width: 44px;
+  }
+
+  .launcher-submit-status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .batch-probe-heading,
+  .batch-probe-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-probe-start {
+    width: 100%;
+  }
+}

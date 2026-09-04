@@ -18,6 +18,8 @@ from vtnote.chat import (
 )
 from vtnote.config import Settings
 from vtnote.notes import (
+    DEFAULT_NOTES_PROMPT,
+    KEY_POINTS_NOTES_PROMPT,
     NoteCanceled,
     NoteError,
     NoteGenerator,
@@ -156,14 +158,29 @@ def test_builtin_templates_propagate_output_language_and_provenance(template: st
     assert note.response_model == "qwen-max"
     assert all(request_data(call)["output_language"] == "zh-Hans" for call in client.calls)
     assert all(request_data(call)["template"] == template for call in client.calls)
+    assert all(
+        request_data(call)["task_instruction"]
+        == (
+            DEFAULT_NOTES_PROMPT
+            if template == "summary"
+            else KEY_POINTS_NOTES_PROMPT
+        )
+        for call in client.calls
+    )
     assert all(call.response_format == "json_object" for call in client.calls)
     assert all(
         json.loads(canonical_chat_request_bytes(call))["stream"] is False
         for call in client.calls
     )
+    system_prompt = client.calls[0].messages[0].content
+    assert "summary is a non-empty string of at most 600" in system_prompt
+    assert "key_points contains 4 to 8 core items" in system_prompt
+    assert "contain 1 or 2 citation objects" in system_prompt
+    assert "citation object contains exactly cue_id" in system_prompt
+    assert "Citations are internal evidence metadata" in system_prompt
 
 
-def test_custom_prompt_is_required_only_for_custom_and_is_data_not_system_text() -> None:
+def test_custom_prompt_is_required_only_for_custom_and_is_authorized_control_data() -> None:
     source = transcript(1)
     with pytest.raises(NoteError, match="note_custom_prompt_required"):
         NoteGenerator(task_id=str(uuid4())).generate(
@@ -199,7 +216,9 @@ def test_custom_prompt_is_required_only_for_custom_and_is_data_not_system_text()
     )
 
     assert prompt not in client.calls[0].messages[0].content
-    assert request_data(client.calls[0])["custom_instruction"] == prompt
+    assert request_data(client.calls[0])["task_instruction"] == prompt
+    assert "task_instruction are application-authorized" in client.calls[0].messages[0].content
+    assert "cues[*].text" in client.calls[0].messages[0].content
     assert prompt not in repr(client.calls[0])
     assert prompt not in repr(note)
     assert prompt not in note.to_markdown(source)
@@ -293,6 +312,33 @@ def test_reduce_order_is_deterministic_and_citation_lineage_is_preserved() -> No
         for node in first_reduce_nodes
     ]
     assert cited_ids == sorted(cited_ids)
+    note.validate_against(source)
+
+
+def test_cue_id_only_citations_are_resolved_to_exact_transcript_lineage() -> None:
+    source = transcript(1)
+
+    def cue_id_only(request: ChatRequest, _: int) -> ChatResponse:
+        payload = json.loads(valid_content(request))
+        citation = payload["summary_citations"][0]
+        cue_id = citation["cue_id"]
+        payload["summary_citations"] = [{"cue_id": cue_id}]
+        payload["key_points"][0]["citations"] = [{"cue_id": cue_id}]
+        return response(json.dumps(payload, ensure_ascii=False))
+
+    note = NoteGenerator(task_id=str(uuid4())).generate(
+        source,
+        profile(),
+        ScriptedClient(cue_id_only),
+        template="summary",
+        output_language="zh-Hans",
+        custom_prompt=None,
+        limits=AiLimits(),
+    )
+
+    assert note.summary_citations[0].cue_id == source.segments[0].id
+    assert note.summary_citations[0].start_ms == source.segments[0].start_ms
+    assert note.summary_citations[0].end_ms == source.segments[0].end_ms
     note.validate_against(source)
 
 
@@ -501,7 +547,7 @@ def test_cancellation_discards_remote_result_and_publishes_nothing(
     assert not paths.note(item_id, note_id).exists()
 
 
-def test_markdown_contains_stable_citations_provenance_and_review_warning(
+def test_markdown_hides_citations_and_preserves_internal_provenance(
     tmp_path: Path,
 ) -> None:
     source = transcript(2)
@@ -532,9 +578,13 @@ def test_markdown_contains_stable_citations_provenance_and_review_warning(
     assert transcript_sha256(source) in markdown
     assert "requested_model: qwen-plus" in markdown
     assert "response_model: qwen-plus-actual" in markdown
-    assert "seg_000001" in markdown
-    assert "00:00.000" in markdown
-    assert "请核对人名、数字、术语和引用" in markdown
+    assert "vtnote://cue/" not in markdown
+    assert "seg_000001 @" not in markdown
+    assert "[00:00]" not in markdown
+    assert "请核对人名、数字、术语和引用" not in markdown
+    assert "## 摘要" in markdown
+    assert "## 亮点" in markdown
+    assert note.summary_citations[0].cue_id == source.segments[0].id
     assert note.to_markdown(source) == markdown
 
 

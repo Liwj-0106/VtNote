@@ -7,14 +7,14 @@ export function EmptyState({
   actionTo = "/",
 }: {
   title: string;
-  description: string;
+  description?: string;
   actionLabel?: string;
   actionTo?: string;
 }) {
   return (
     <div className="empty-state">
       <h2>{title}</h2>
-      <p>{description}</p>
+      {description ? <p>{description}</p> : null}
       {actionLabel && (
         <AppLink className="button" to={actionTo}>
           {actionLabel}

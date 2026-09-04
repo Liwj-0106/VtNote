@@ -10,6 +10,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session
 
 from vtnote.database import initialize_database
+from vtnote.local_asr_contract import SENSEVOICE_ENGINE
 from vtnote.models import (
     Base,
     DefaultSettingsRecord,
@@ -118,8 +119,8 @@ def test_existing_default_device_auto_migrates_to_cuda(tmp_path: Path) -> None:
                 "device": "auto",
                 "compute_type": "int8_float16",
                 "vad_filter": True,
-                "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",
-                "cache_root": r"D:\Workspace\Codex\cache\VtNote-runtime\models\faster-whisper",
+                "model_root": ".vtnote/ManagedAssets/Data/models/faster-whisper",
+                "cache_root": ".vtnote/ManagedAssets/Cache/models/faster-whisper",
             },
         )
         task = TaskRecord(
@@ -149,6 +150,72 @@ def test_existing_default_device_auto_migrates_to_cuda(tmp_path: Path) -> None:
             )
     finally:
         migrated.dispose()
+
+
+def test_removed_local_asr_default_migrates_without_rewriting_tasks(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "local-asr-engine-migration.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        defaults = DefaultSettingsRecord(
+            id=1,
+            local_asr_engine="moss_transcribe_diarize",
+        )
+        task = TaskRecord(
+            pipeline_snapshot_json={
+                "local_asr": {
+                    "schema_version": 1,
+                    "engine": "moss_transcribe_diarize",
+                    "model": "legacy-model",
+                    "options": {},
+                }
+            }
+        )
+        session.add_all([defaults, task])
+        session.commit()
+        task_id = task.id
+    engine.dispose()
+
+    migrated = initialize_database(database_path)
+    try:
+        with Session(migrated) as session:
+            defaults = session.get(DefaultSettingsRecord, 1)
+            task = session.get(TaskRecord, task_id)
+            assert defaults is not None
+            assert defaults.local_asr_engine == "faster_whisper"
+            assert task is not None
+            assert (
+                task.pipeline_snapshot_json["local_asr"]["engine"]
+                == "moss_transcribe_diarize"
+            )
+    finally:
+        migrated.dispose()
+
+
+def test_supported_sensevoice_default_survives_database_reinitialization(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "sensevoice-default.db"
+    engine = initialize_database(database_path)
+    with Session(engine) as session:
+        session.add(
+            DefaultSettingsRecord(
+                id=1,
+                local_asr_engine=SENSEVOICE_ENGINE,
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    reopened = initialize_database(database_path)
+    try:
+        with Session(reopened) as session:
+            defaults = session.get(DefaultSettingsRecord, 1)
+            assert defaults is not None
+            assert defaults.local_asr_engine == SENSEVOICE_ENGINE
+    finally:
+        reopened.dispose()
 
 
 def test_startup_moves_active_tencent_profiles_to_free_tier_model(
@@ -467,6 +534,10 @@ def test_additive_upgrade_adds_stage_evidence_columns(tmp_path: Path) -> None:
             "execution_evidence_json",
             "provider_status_code",
         } <= {column["name"] for column in inspector.get_columns("stage_runs")}
+        assert "local_asr_engine" in {
+            column["name"]
+            for column in inspector.get_columns("default_settings")
+        }
         with Session(engine) as session:
             task = session.get(TaskRecord, "11111111-1111-4111-8111-111111111111")
             assert task is not None

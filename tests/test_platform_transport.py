@@ -8,6 +8,7 @@ from io import BytesIO
 import pytest
 
 from vtnote.platform_transport import (
+    LoopbackHttpProxyConnector,
     PinnedHttpsTransport,
     SourceHttpRequest,
     TransportLimits,
@@ -15,6 +16,7 @@ from vtnote.platform_transport import (
 )
 from vtnote.url_security import (
     UpstreamHostPolicy,
+    extractor_aux_host_policy,
     extracted_resource_hosts,
     page_host_policy,
     resource_host_policy,
@@ -67,6 +69,7 @@ class ConnectorCall:
     addresses: tuple[str, ...]
     method: str
     target: str
+    body: bytes | None
     headers: dict[str, str]
     connect_timeout: float
     read_timeout: float
@@ -84,6 +87,7 @@ class FakeConnector:
         addresses: tuple[str, ...],
         method: str,
         target: str,
+        body: bytes | None,
         headers: dict[str, str],
         connect_timeout: float,
         read_timeout: float,
@@ -94,6 +98,7 @@ class FakeConnector:
                 addresses=addresses,
                 method=method,
                 target=target,
+                body=body,
                 headers=headers,
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
@@ -103,6 +108,10 @@ class FakeConnector:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class FakeLoopbackProxyConnector(FakeConnector):
+    dns_pinned = False
 
 
 def request(url: str = "https://www.youtube.com/watch?v=abc", **changes: object) -> SourceHttpRequest:
@@ -166,6 +175,70 @@ def test_direct_request_uses_vetted_addresses_host_sni_inputs_and_no_environment
     assert "127.0.0.1" not in repr(call)
 
 
+def test_controlled_post_has_bounded_body_and_managed_content_length() -> None:
+    resolver = FakeResolver({"youtubei.googleapis.com": ["142.250.72.10"]})
+    connector = FakeConnector(
+        [FakeRawResponse(body=b"{}", peer_ip="142.250.72.10")]
+    )
+
+    response = transport(resolver, connector).request(
+        request(
+            "https://youtubei.googleapis.com/youtubei/v1/player",
+            method="POST",
+            body=b'{"videoId":"abc"}',
+            headers={
+                "Content-Type": "application/json",
+                "content-length": "999999",
+            },
+        ),
+        extractor_aux_host_policy("youtube"),
+    )
+
+    assert response.read() == b"{}"
+    call = connector.calls[0]
+    assert call.method == "POST"
+    assert call.body == b'{"videoId":"abc"}'
+    assert call.headers["Content-Type"] == "application/json"
+    assert call.headers["Content-Length"] == str(len(call.body))
+    assert "content-length" not in call.headers
+
+
+def test_controlled_post_rejects_oversized_body_before_connection() -> None:
+    resolver = FakeResolver({"youtubei.googleapis.com": ["142.250.72.10"]})
+    connector = FakeConnector([FakeRawResponse()])
+
+    with pytest.raises(TransportSecurityError, match="request_body_too_large"):
+        transport(
+            resolver,
+            connector,
+            limits=TransportLimits(max_request_body_bytes=3),
+        ).request(
+            request(
+                "https://youtubei.googleapis.com/youtubei/v1/player",
+                method="POST",
+                body=b"four",
+            ),
+            extractor_aux_host_policy("youtube"),
+        )
+
+    assert connector.calls == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"method": "POST"},
+        {"method": "POST", "body": b""},
+        {"method": "GET", "body": b"unexpected"},
+    ],
+)
+def test_source_request_rejects_invalid_method_body_combinations(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        request(**changes)
+
+
 def test_bilibili_anonymous_session_accepts_only_allowlisted_cookies() -> None:
     resolver = FakeResolver({"www.bilibili.com": ["203.107.1.33"]})
     connector = FakeConnector(
@@ -219,6 +292,113 @@ def test_anonymous_session_cookies_are_rejected_for_other_platforms() -> None:
     assert connector.calls == []
 
 
+def test_browser_cookie_is_secret_and_never_forwarded_across_redirects() -> None:
+    resolver = FakeResolver(
+        {
+            "www.youtube.com": ["142.250.72.14"],
+            "youtu.be": ["142.250.72.15"],
+        }
+    )
+    connector = FakeConnector(
+        [
+            FakeRawResponse(
+                status=302,
+                headers=(("Location", "https://youtu.be/abc"),),
+                peer_ip="142.250.72.14",
+            ),
+            FakeRawResponse(body=b"ok", peer_ip="142.250.72.15"),
+        ]
+    )
+    selected_request = request(
+        browser_cookie_header="session=browser-super-secret"
+    )
+
+    response = transport(resolver, connector).request(
+        selected_request,
+        page_host_policy("youtube"),
+    )
+
+    assert response.read() == b"ok"
+    assert connector.calls[0].headers["Cookie"] == "session=browser-super-secret"
+    assert "Cookie" not in connector.calls[1].headers
+    assert "browser-super-secret" not in repr(selected_request)
+
+
+def test_browser_authorization_is_only_sent_with_youtube_api_cookie() -> None:
+    resolver = FakeResolver({"youtubei.googleapis.com": ["142.250.72.10"]})
+    connector = FakeConnector(
+        [FakeRawResponse(body=b"{}", peer_ip="142.250.72.10")]
+    )
+    authorization = f"SAPISIDHASH 1720000000_{'a' * 40}"
+    selected_request = request(
+        "https://youtubei.googleapis.com/youtubei/v1/player",
+        method="POST",
+        body=b'{}',
+        browser_authorization_header=authorization,
+    )
+
+    response = transport(resolver, connector).request(
+        selected_request,
+        extractor_aux_host_policy("youtube"),
+    )
+
+    assert response.read() == b"{}"
+    assert connector.calls[0].headers["Authorization"] == authorization
+    assert "Cookie" not in connector.calls[0].headers
+    assert authorization not in repr(selected_request)
+
+
+def test_invalid_browser_authorization_is_rejected_before_transport() -> None:
+    resolver = FakeResolver({"youtubei.googleapis.com": ["142.250.72.10"]})
+    connector = FakeConnector([FakeRawResponse()])
+
+    with pytest.raises(ValueError, match="browser authorization"):
+        request(
+            "https://youtubei.googleapis.com/youtubei/v1/player",
+            method="POST",
+            body=b'{}',
+            browser_authorization_header="Bearer must-not-pass",
+        )
+
+    assert connector.calls == []
+
+
+@pytest.mark.parametrize(
+    ("url", "policy"),
+    [
+        (
+            "https://www.bilibili.com/video/BV1",
+            page_host_policy("bilibili"),
+        ),
+        (
+            "https://rr1---sn.example.googlevideo.com/videoplayback",
+            resource_host_policy(
+                "youtube",
+                extracted_resource_hosts(
+                    frozenset({"rr1---sn.example.googlevideo.com"})
+                ),
+                expires_at=NOW + timedelta(minutes=5),
+            ),
+        ),
+    ],
+)
+def test_browser_cookie_is_rejected_outside_page_or_aux_scope(
+    url: str,
+    policy: UpstreamHostPolicy,
+) -> None:
+    host = url.split("/", 3)[2]
+    resolver = FakeResolver({host: ["142.250.72.14"]})
+    connector = FakeConnector([FakeRawResponse()])
+
+    with pytest.raises(TransportSecurityError, match="browser_session_rejected"):
+        transport(resolver, connector).request(
+            request(url, browser_cookie_header="session=secret"),
+            policy,
+        )
+
+    assert connector.calls == []
+
+
 @pytest.mark.parametrize(
     "answers",
     [
@@ -257,6 +437,51 @@ def test_connected_peer_must_belong_to_current_dns_answer_set() -> None:
     assert raw.closed
 
 
+def test_explicit_loopback_proxy_requires_loopback_peer_but_not_target_dns_peer() -> None:
+    resolver = FakeResolver({"www.youtube.com": ["142.250.72.14"]})
+    connector = FakeLoopbackProxyConnector(
+        [FakeRawResponse(body=b"proxied", peer_ip="127.0.0.1")]
+    )
+
+    response = transport(resolver, connector).request(
+        request(),
+        page_host_policy("youtube"),
+    )
+
+    assert response.read() == b"proxied"
+    assert connector.calls[0].host == "www.youtube.com"
+    assert connector.calls[0].addresses == ()
+    assert resolver.calls == []
+
+
+def test_explicit_loopback_proxy_rejects_non_loopback_peer() -> None:
+    resolver = FakeResolver({"www.youtube.com": ["142.250.72.14"]})
+    raw = FakeRawResponse(peer_ip="192.168.1.2")
+    connector = FakeLoopbackProxyConnector([raw])
+
+    with pytest.raises(TransportSecurityError, match="peer_mismatch"):
+        transport(resolver, connector).request(
+            request(),
+            page_host_policy("youtube"),
+        )
+
+    assert raw.closed
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "https://127.0.0.1:7897",
+        "http://10.0.0.2:7897",
+        "http://user:secret@127.0.0.1:7897",
+        "http://127.0.0.1:7897/path",
+    ],
+)
+def test_loopback_proxy_connector_rejects_unsafe_configuration(proxy_url: str) -> None:
+    with pytest.raises(ValueError):
+        LoopbackHttpProxyConnector(proxy_url)
+
+
 def test_each_redirect_revalidates_scheme_host_dns_and_peer() -> None:
     resolver = FakeResolver(
         {
@@ -278,12 +503,51 @@ def test_each_redirect_revalidates_scheme_host_dns_and_peer() -> None:
     )
 
     assert response.read() == b"done"
+    assert response.url == "https://youtu.be/next"
     assert resolver.calls == ["www.youtube.com", "youtu.be"]
     assert [call.host for call in connector.calls] == [
         "www.youtube.com",
         "youtu.be",
     ]
     assert first.closed
+
+
+def test_douyin_short_link_allows_only_reviewed_official_transition_host() -> None:
+    resolver = FakeResolver(
+        {
+            "v.douyin.com": ["180.163.151.34"],
+            "www.iesdouyin.com": ["180.163.151.35"],
+            "www.douyin.com": ["180.163.151.36"],
+        }
+    )
+    connector = FakeConnector(
+        [
+            FakeRawResponse(
+                status=302,
+                headers=(("Location", "https://www.iesdouyin.com/share/video/1/"),),
+                peer_ip="180.163.151.34",
+            ),
+            FakeRawResponse(
+                status=302,
+                headers=(("Location", "https://www.douyin.com/video/1"),),
+                peer_ip="180.163.151.35",
+            ),
+            FakeRawResponse(body=b"page", peer_ip="180.163.151.36"),
+        ]
+    )
+
+    response = transport(resolver, connector).request(
+        request("https://v.douyin.com/AbC_123/"),
+        page_host_policy("douyin"),
+    )
+
+    assert response.read() == b"page"
+    assert response.url == "https://www.douyin.com/video/1"
+    assert [call.host for call in connector.calls] == [
+        "v.douyin.com",
+        "www.iesdouyin.com",
+        "www.douyin.com",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -363,6 +627,69 @@ def test_resource_policy_is_exact_host_only_and_expires() -> None:
         transport(resolver, FakeConnector([])).request(
             request("https://rr1---sn.example.googlevideo.com/videoplayback"),
             expired,
+        )
+
+
+def test_resource_policy_allows_only_known_cdn_hosts_after_redirect() -> None:
+    policy = resource_host_policy(
+        "douyin",
+        extracted_resource_hosts(frozenset({"api-play.amemv.com"})),
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    resolver = FakeResolver(
+        {
+            "api-play.amemv.com": ["142.250.72.14"],
+            "v5-traffic.douyinvod.com": ["142.250.72.14"],
+        }
+    )
+    connector = FakeConnector(
+        [
+            FakeRawResponse(
+                status=302,
+                headers=(("Location", "https://v5-traffic.douyinvod.com/media"),),
+            ),
+            FakeRawResponse(body=b"media"),
+        ]
+    )
+
+    response = transport(resolver, connector).request(
+        request("https://api-play.amemv.com/redirect"),
+        policy,
+    )
+
+    assert response.read() == b"media"
+    assert [call.host for call in connector.calls] == [
+        "api-play.amemv.com",
+        "v5-traffic.douyinvod.com",
+    ]
+
+    with pytest.raises(TransportSecurityError, match="host_not_allowed"):
+        transport(resolver, FakeConnector([])).request(
+            request("https://v5-traffic.douyinvod.com/media"),
+            policy,
+        )
+
+
+def test_resource_policy_rejects_unknown_redirect_host() -> None:
+    policy = resource_host_policy(
+        "douyin",
+        extracted_resource_hosts(frozenset({"api-play.amemv.com"})),
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    resolver = FakeResolver({"api-play.amemv.com": ["142.250.72.14"]})
+    connector = FakeConnector(
+        [
+            FakeRawResponse(
+                status=302,
+                headers=(("Location", "https://private.example/media"),),
+            )
+        ]
+    )
+
+    with pytest.raises(TransportSecurityError, match="host_not_allowed"):
+        transport(resolver, connector).request(
+            request("https://api-play.amemv.com/redirect"),
+            policy,
         )
 
 

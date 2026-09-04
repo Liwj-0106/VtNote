@@ -602,6 +602,7 @@ class FfmpegMediaProcessor:
             source_info.audio_codec == "pcm_s16le"
             and source_info.sample_rate == 16_000
             and source_info.channels == 1
+            and Path(source).suffix.casefold() == ".wav"
         ):
             return PreparedAudio(Path(source), None, False, source_info)
         paths, _ = self._runtime_dependencies()

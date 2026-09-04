@@ -63,6 +63,77 @@ class Transcript(CanonicalModel):
         return self
 
 
+class WordTiming(CanonicalModel):
+    """Optional word-level timing produced beside the canonical transcript."""
+
+    segment_id: str = Field(pattern=r"^seg_\d{6}$")
+    index: int = Field(ge=1)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    text: str = Field(min_length=1)
+    probability: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms must be greater than start_ms")
+        return self
+
+
+class TranscriptAlignment(CanonicalModel):
+    """Derived word alignment that may be absent without invalidating subtitles."""
+
+    schema_version: Literal[1] = 1
+    source_transcript_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    words: tuple[WordTiming, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_timeline(self) -> Self:
+        positions = [(word.start_ms, word.end_ms, word.index) for word in self.words]
+        if positions != sorted(positions):
+            raise ValueError("word timings must be chronological")
+        return self
+
+
+class SpeakerAssignment(CanonicalModel):
+    segment_id: str = Field(pattern=r"^seg_\d{6}$")
+    speaker: str = Field(pattern=r"^speaker_\d{2}$")
+
+
+class SpeakerMap(CanonicalModel):
+    """Optional speaker attribution derived from a local ASR result."""
+
+    schema_version: Literal[1] = 1
+    source_transcript_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    method: Literal[
+        "local_acoustic_clustering", "moss_transcribe_diarize"
+    ] = "local_acoustic_clustering"
+    speaker_count: int = Field(ge=1, le=99)
+    assignments: tuple[SpeakerAssignment, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_assignments(self) -> Self:
+        ids = [assignment.segment_id for assignment in self.assignments]
+        if len(ids) != len(set(ids)):
+            raise ValueError("speaker assignments must be unique")
+        return self
+
+    def validate_against(self, transcript: Transcript) -> Self:
+        if self.source_transcript_sha256 != transcript_sha256(transcript):
+            raise ValueError("speaker map source transcript hash does not match")
+        expected_ids = [segment.id for segment in transcript.segments]
+        actual_ids = [assignment.segment_id for assignment in self.assignments]
+        if actual_ids != expected_ids:
+            raise ValueError(
+                "speaker assignments must exactly match the source transcript"
+            )
+        if len({assignment.speaker for assignment in self.assignments}) != (
+            self.speaker_count
+        ):
+            raise ValueError("speaker count does not match speaker assignments")
+        return self
+
+
 class TranslationEntry(CanonicalModel):
     cue_id: str = Field(pattern=r"^seg_\d{6}$")
     text: str = Field(min_length=1)

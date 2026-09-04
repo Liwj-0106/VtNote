@@ -233,18 +233,13 @@ class SystemYoutubeRuntimeInventory:
     def paths_are_safe(self, root: Path, targets: tuple[Path, ...]) -> bool:
         try:
             resolved_root = root.resolve(strict=False)
-            if (
-                not root.is_absolute()
-                or root.drive.casefold() != "d:"
-                or resolved_root.drive.casefold() != "d:"
-            ):
+            if not root.is_absolute() or not resolved_root.is_absolute():
                 return False
             for target in targets:
                 resolved_target = target.resolve(strict=False)
                 if (
                     not target.is_absolute()
-                    or target.drive.casefold() != "d:"
-                    or resolved_target.drive.casefold() != "d:"
+                    or not resolved_target.is_absolute()
                     or not _contained(resolved_root, resolved_target)
                     or _existing_path_has_reparse_point(root, target)
                 ):
@@ -259,14 +254,19 @@ def _runtime_paths(
     manifest: YoutubeRuntimeManifest,
 ) -> tuple[Path, Path, Path]:
     version = ".".join(str(part) for part in manifest.deno_version)
-    root = settings.runtime_cache_root / "youtube-runtime"
+    cache_root = (
+        settings.managed_assets_root / "Cache"
+        if settings.managed_assets_root is not None
+        else settings.runtime_cache_root
+    )
+    root = cache_root / "youtube-runtime"
     executable = root / "deno" / version / "deno.exe"
     deno_dir = root / "deno-cache" / version
     return root, executable, deno_dir
 
 
 def configure_managed_runtime_environment(settings: Settings) -> Path:
-    """Select the pinned D-drive Deno cache for launcher-owned processes."""
+    """Select the pinned managed Deno cache for launcher-owned processes."""
 
     _, _, deno_dir = _runtime_paths(
         settings,
@@ -318,7 +318,7 @@ def inspect_youtube_runtime(
     if not manifest_configured:
         codes.append("manifest_unconfigured")
 
-    if root.drive.casefold() != "d:" or not root.is_absolute():
+    if not root.is_absolute() or not root.resolve(strict=False).is_absolute():
         codes.append("runtime_root_not_approved")
     elif not selected.paths_are_safe(root, (executable, deno_dir)):
         codes.append("runtime_path_unsafe")

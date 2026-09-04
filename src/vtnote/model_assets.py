@@ -25,7 +25,7 @@ from vtnote.url_security import UpstreamHostPolicy
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
-_ALLOWED_FILES = frozenset(
+_LOCAL_WHISPER_ALLOWED_FILES = frozenset(
     {
         "config.json",
         "model.bin",
@@ -34,8 +34,8 @@ _ALLOWED_FILES = frozenset(
         "vocabulary.json",
     }
 )
-_PINNED_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
-_PINNED_FILES = {
+_LOCAL_WHISPER_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+_LOCAL_WHISPER_FILES = {
     "config.json": (
         2263,
         "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
@@ -57,6 +57,51 @@ _PINNED_FILES = {
         "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
     ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedModelSpec:
+    model_name: str
+    repo_id: str
+    revision: str
+    files: Mapping[str, tuple[int, str]]
+
+
+LOCAL_WHISPER_SPEC = PinnedModelSpec(
+    model_name="large-v3-turbo",
+    repo_id="dropbox-dash/faster-whisper-large-v3-turbo",
+    revision=_LOCAL_WHISPER_REVISION,
+    files=_LOCAL_WHISPER_FILES,
+)
+SENSEVOICE_SPEC = PinnedModelSpec(
+    model_name="sensevoice-small-int8-2024-07-17",
+    repo_id=(
+        "csukuangfj/"
+        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    ),
+    revision="2365baeacb507f821a0c8120fcee3d484dba7a07",
+    files={
+        "model.int8.onnx": (
+            239_233_841,
+            "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+        ),
+        "tokens.txt": (
+            315_894,
+            "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+        ),
+    },
+)
+SILERO_VAD_SPEC = PinnedModelSpec(
+    model_name="silero-vad-v4",
+    repo_id="csukuangfj/vad",
+    revision="af4fcfc9b8305246b1fe2ebcaf248975673166f1",
+    files={
+        "silero_vad.onnx": (
+            1_807_522,
+            "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
+        ),
+    },
+)
 
 
 class ModelAssetError(ValueError):
@@ -187,9 +232,10 @@ class HuggingFaceModelTransport:
         return _PinnedModelResponse(response)
 
 
-def load_local_whisper_manifest(
+def load_pinned_model_manifest(
     path: Path,
     *,
+    spec: PinnedModelSpec,
     allow_test_file_variants: bool = False,
 ) -> ModelManifest:
     candidate = Path(path)
@@ -203,9 +249,8 @@ def load_local_whisper_manifest(
         or set(payload)
         != {"schema_version", "model_name", "repo_id", "revision", "files"}
         or payload.get("schema_version") != 1
-        or payload.get("model_name") != "large-v3-turbo"
-        or payload.get("repo_id")
-        != "dropbox-dash/faster-whisper-large-v3-turbo"
+        or payload.get("model_name") != spec.model_name
+        or payload.get("repo_id") != spec.repo_id
         or not isinstance(payload.get("revision"), str)
         or _REVISION.fullmatch(payload["revision"]) is None
         or not isinstance(payload.get("files"), list)
@@ -216,7 +261,7 @@ def load_local_whisper_manifest(
         if (
             not isinstance(value, dict)
             or set(value) != {"path", "size", "sha256"}
-            or value.get("path") not in _ALLOWED_FILES
+            or value.get("path") not in spec.files
             or isinstance(value.get("size"), bool)
             or not isinstance(value.get("size"), int)
             or value["size"] <= 0
@@ -226,17 +271,17 @@ def load_local_whisper_manifest(
             raise ModelAssetError("model_manifest_invalid")
         files.append(ModelFile(**value))
     if (
-        {item.path for item in files} != _ALLOWED_FILES
-        or len(files) != len(_ALLOWED_FILES)
+        {item.path for item in files} != set(spec.files)
+        or len(files) != len(spec.files)
     ):
         raise ModelAssetError("model_manifest_invalid")
     if not allow_test_file_variants and (
-        payload["revision"] != _PINNED_REVISION
+        payload["revision"] != spec.revision
         or {
             item.path: (item.size, item.sha256)
             for item in files
         }
-        != _PINNED_FILES
+        != dict(spec.files)
     ):
         raise ModelAssetError("model_manifest_invalid")
     return ModelManifest(
@@ -249,6 +294,42 @@ def load_local_whisper_manifest(
     )
 
 
+def load_local_whisper_manifest(
+    path: Path,
+    *,
+    allow_test_file_variants: bool = False,
+) -> ModelManifest:
+    return load_pinned_model_manifest(
+        path,
+        spec=LOCAL_WHISPER_SPEC,
+        allow_test_file_variants=allow_test_file_variants,
+    )
+
+
+def load_sensevoice_manifest(
+    path: Path,
+    *,
+    allow_test_file_variants: bool = False,
+) -> ModelManifest:
+    return load_pinned_model_manifest(
+        path,
+        spec=SENSEVOICE_SPEC,
+        allow_test_file_variants=allow_test_file_variants,
+    )
+
+
+def load_silero_vad_manifest(
+    path: Path,
+    *,
+    allow_test_file_variants: bool = False,
+) -> ModelManifest:
+    return load_pinned_model_manifest(
+        path,
+        spec=SILERO_VAD_SPEC,
+        allow_test_file_variants=allow_test_file_variants,
+    )
+
+
 class ModelAssetService:
     def __init__(
         self,
@@ -256,12 +337,13 @@ class ModelAssetService:
         engine: Engine,
         paths: StoragePaths,
         manifest_path: Path,
+        manifest_loader: Callable[..., ModelManifest] = load_local_whisper_manifest,
         free_bytes: Callable[[Path], int] | None = None,
         allow_test_manifest: bool = False,
     ) -> None:
         self.engine = engine
         self.paths = paths
-        self.manifest = load_local_whisper_manifest(
+        self.manifest = manifest_loader(
             manifest_path,
             allow_test_file_variants=allow_test_manifest,
         )
@@ -447,6 +529,8 @@ class ModelAssetService:
             row.current_file = None
             row.current_file_bytes = 0
             row.current_etag = None
+            row.cancel_requested = False
+            row.error_code = None
             row.staging_relpath = None
             row.installed_relpath = self.install_root.relative_to(
                 self.paths.data_root

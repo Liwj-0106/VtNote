@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -15,8 +16,11 @@ from sqlalchemy.orm import Session
 from vtnote.artifacts import (
     ArtifactExistsError,
     ensure_transcript_json,
+    ensure_transcript_alignment,
+    ensure_speaker_map,
     ensure_transcription_recovery,
     transcript_from_timed_text,
+    write_transcription_chunk_recovery,
 )
 from vtnote.cloud_submissions import (
     CloudSubmission,
@@ -28,6 +32,11 @@ from vtnote.local_asr import (
     FasterWhisperTranscriber,
     LocalAsrError,
     TranscriptionContext,
+)
+from vtnote.local_asr_contract import (
+    FASTER_WHISPER_ENGINE,
+    LocalAsrSnapshotError,
+    resolve_local_asr_snapshot,
 )
 from vtnote.media import FfmpegMediaProcessor, PreparedAudio
 from vtnote.models import (
@@ -45,6 +54,7 @@ from vtnote.provider_credentials import (
 )
 from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService
 from vtnote.schemas import ProvenanceMethod, Transcript
+from vtnote.speaker_diarization import SpeakerDiarizationError, diarize_transcript
 from vtnote.secrets import SecretStore
 from vtnote.tencent_asr import (
     CloudAsrOutcomeKind,
@@ -199,6 +209,7 @@ class TranscribeStageHandler:
         paths: StoragePaths,
         media: MediaPreparer | FfmpegMediaProcessor,
         local_transcriber: LocalTranscriber | FasterWhisperTranscriber,
+        local_transcribers: Mapping[str, LocalTranscriber] | None = None,
         cloud_client: RecordingCreateQueryClient | None,
         credential_resolver: CredentialResolver,
         cos_stager_resolver: CosStagerResolver | None = None,
@@ -208,6 +219,10 @@ class TranscribeStageHandler:
         self.paths = paths
         self.media = media
         self.local_transcriber = local_transcriber
+        self.local_transcribers = dict(
+            local_transcribers
+            or {FASTER_WHISPER_ENGINE: local_transcriber}
+        )
         self.cloud_client = cloud_client
         self.credential_resolver = credential_resolver
         self.cos_stager_resolver = cos_stager_resolver
@@ -423,6 +438,8 @@ class TranscribeStageHandler:
         context: StageContext,
         *,
         result: StageResult,
+        expected_provider: str,
+        expected_model: str,
     ) -> StageResult | None:
         transcript_path = self.paths.transcript(context.claim.item_id)
         recovery_path = self.paths.transcription_recovery(
@@ -441,8 +458,8 @@ class TranscribeStageHandler:
             raise StageExecutionError("transcript_publication_conflict") from None
         if (
             recovery.provenance.method != ProvenanceMethod.LOCAL_ASR
-            or recovery.provenance.provider != "faster-whisper"
-            or recovery.provenance.model != "large-v3-turbo"
+            or recovery.provenance.provider != expected_provider
+            or recovery.provenance.model != expected_model
         ):
             raise StageExecutionError("transcript_publication_conflict")
         if transcript_path.exists():
@@ -472,14 +489,19 @@ class TranscribeStageHandler:
         fallback_reason: str | None = None,
         warning: str | None = None,
     ) -> StageResult:
-        local = selected.snapshot.get("local_whisper")
-        if not isinstance(local, Mapping):
+        try:
+            local_selection = resolve_local_asr_snapshot(selected.snapshot)
+        except LocalAsrSnapshotError:
             raise StageExecutionError("local_asr_snapshot_invalid")
+        local = local_selection.options
+        local_transcriber = self.local_transcribers.get(local_selection.engine)
+        if local_transcriber is None:
+            raise StageExecutionError("local_asr_runtime_unavailable")
         evidence = {
             "source_method": "local_asr",
             "asr_route": route,
-            "provider": "faster_whisper",
-            "model": "large-v3-turbo",
+            "provider": local_selection.evidence_provider,
+            "model": local_selection.model,
         }
         if fallback_reason is not None:
             evidence["fallback_reason"] = fallback_reason
@@ -490,16 +512,19 @@ class TranscribeStageHandler:
         recovered = self._recover_local_publication(
             context,
             result=stage_result,
+            expected_provider=local_selection.provider,
+            expected_model=local_selection.model,
         )
         if recovered is not None:
             return recovered
-        if not context.store.acquire_resource(
-            context.claim,
-            "local-asr:gpu:0",
-            context.clock(),
-            self.gpu_lease_duration,
-        ):
-            raise StageRequeue()
+        if local_selection.engine == FASTER_WHISPER_ENGINE:
+            if not context.store.acquire_resource(
+                context.claim,
+                "local-asr:gpu:0",
+                context.clock(),
+                self.gpu_lease_duration,
+            ):
+                raise StageRequeue()
 
         def canceled() -> bool:
             try:
@@ -511,12 +536,13 @@ class TranscribeStageHandler:
         transcription_context = TranscriptionContext(
             local_whisper=local,
             cancel_requested=canceled,
+            local_engine=local_selection.engine,
         )
 
         # The real faster-whisper adapter can prove the model/CUDA runtime is
         # available before a long PCM conversion. Test doubles and alternate
         # adapters remain compatible because this preflight is optional.
-        ensure_available = getattr(self.local_transcriber, "ensure_available", None)
+        ensure_available = getattr(local_transcriber, "ensure_available", None)
         if callable(ensure_available):
             try:
                 ensure_available(transcription_context)
@@ -535,8 +561,58 @@ class TranscribeStageHandler:
         except Exception:
             raise StageExecutionError("local_audio_preparation_failed") from None
 
+        def load_chunk(chunk_index: int) -> Mapping[str, object] | None:
+            path = self.paths.transcription_chunk_recovery(
+                context.claim.item_id,
+                context.claim.stage_run_id,
+                chunk_index,
+            )
+            if not path.is_file():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        def save_chunk(chunk_index: int, payload: dict[str, object]) -> None:
+            context.checkpoint()
+            try:
+                write_transcription_chunk_recovery(
+                    self.paths,
+                    context.claim.item_id,
+                    context.claim.stage_run_id,
+                    chunk_index,
+                    payload,
+                )
+            except (OSError, ValueError, UnsafePathError):
+                raise LocalAsrError("local_asr_recovery_write_failed") from None
+
+        def report_progress(current: int, total: int) -> None:
+            context.checkpoint()
+            if not context.store.update_progress(
+                context.claim,
+                {
+                    "current": current,
+                    "total": total,
+                    "unit": "chunks",
+                    "message_code": "transcribing_segments",
+                },
+                now=context.clock(),
+            ):
+                raise LocalAsrError("local_asr_canceled")
+
+        transcription_context = TranscriptionContext(
+            local_whisper=local,
+            cancel_requested=canceled,
+            local_engine=local_selection.engine,
+            chunk_loader=load_chunk,
+            chunk_saver=save_chunk,
+            progress_reporter=report_progress,
+        )
+
         try:
-            result = self.local_transcriber.transcribe(
+            result = local_transcriber.transcribe(
                 audio,
                 transcription_context,
             )
@@ -547,6 +623,48 @@ class TranscribeStageHandler:
                 error.code,
                 warning=fallback_reason,
             ) from None
+        if result.transcript.provenance.provider != local_selection.provider or (
+            result.transcript.provenance.model != local_selection.model
+        ):
+            raise StageExecutionError("local_asr_result_invalid")
+        derived_warning: str | None = None
+        if result.alignment is not None:
+            try:
+                ensure_transcript_alignment(
+                    self.paths,
+                    context.claim.item_id,
+                    result.alignment,
+                )
+            except (ArtifactExistsError, OSError, ValueError, UnsafePathError):
+                derived_warning = "word_alignment_unavailable"
+
+        if result.speakers is not None:
+            try:
+                result.speakers.validate_against(result.transcript)
+                ensure_speaker_map(
+                    self.paths,
+                    context.claim.item_id,
+                    result.speakers,
+                )
+            except (
+                ArtifactExistsError,
+                OSError,
+                ValueError,
+                UnsafePathError,
+            ):
+                derived_warning = "speaker_diarization_unavailable"
+        elif local.get("speaker_diarization_enabled") is True:
+            try:
+                speakers = diarize_transcript(audio.path, result.transcript)
+                ensure_speaker_map(self.paths, context.claim.item_id, speakers)
+            except (
+                ArtifactExistsError,
+                OSError,
+                ValueError,
+                UnsafePathError,
+                SpeakerDiarizationError,
+            ):
+                derived_warning = "speaker_diarization_unavailable"
         try:
             ensure_transcription_recovery(
                 self.paths,
@@ -556,10 +674,24 @@ class TranscribeStageHandler:
             )
         except (ArtifactExistsError, OSError, ValueError, UnsafePathError):
             raise StageExecutionError("transcript_recovery_conflict") from None
+        if local.get("schema_version") == 2:
+            evidence.update(
+                {
+                    "detected_language": result.transcript.language,
+                    "runtime_device": result.runtime_device,
+                    "chunk_recovery": (
+                        "used" if result.recovered_chunks else "unused"
+                    ),
+                }
+            )
+        completed_result = StageResult(
+            warning=derived_warning or warning,
+            execution_evidence=evidence,
+        )
         return self._publish(
             context,
             result.transcript,
-            result=stage_result,
+            result=completed_result,
         )
 
     @staticmethod
@@ -772,7 +904,14 @@ class TranscribeStageHandler:
                 )
                 locator = cos_context.locator()
             except Exception:
-                raise StageExecutionError("cloud_cos_configuration_invalid") from None
+                if mode == "cloud":
+                    raise StageExecutionError("cloud_cos_configuration_invalid") from None
+                return self._run_local(
+                    context,
+                    selected,
+                    route="cloud_to_local",
+                    fallback_reason="cloud_profile_unavailable",
+                )
         try:
             credentials = self.credential_resolver(profile)
             if not isinstance(credentials, TencentCredentialBundle):
@@ -781,7 +920,14 @@ class TranscribeStageHandler:
                 assert self.cos_stager_resolver is not None
                 stager = self.cos_stager_resolver(profile, credentials)
         except Exception:
-            raise StageExecutionError("cloud_credentials_unavailable") from None
+            if mode == "cloud":
+                raise StageExecutionError("cloud_credentials_unavailable") from None
+            return self._run_local(
+                context,
+                selected,
+                route="cloud_to_local",
+                fallback_reason="cloud_profile_unavailable",
+            )
         with Session(context.store.engine) as session:
             submissions = CloudSubmissionStore(session)
             try:

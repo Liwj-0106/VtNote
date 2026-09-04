@@ -18,13 +18,15 @@ describe("OutputExportDialog", () => {
   });
 
   it("preselects available defaults and exports every selected result", async () => {
-    vi.spyOn(api, "request").mockImplementation(async (path) => {
+    const request = vi.spyOn(api, "request").mockImplementation(async (path) => {
       if (path.endsWith("/outcomes")) {
         return { audio: true, transcript: true, notes: false };
       }
+      if (path.endsWith("/export-files")) {
+        return { directory: "D:\\Exports", files: [] };
+      }
       throw new Error(`unexpected ${path}`);
     });
-    const download = vi.spyOn(api, "download").mockResolvedValue(new Blob(["ok"]));
 
     render(
       <OutputExportDialog
@@ -42,11 +44,16 @@ describe("OutputExportDialog", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "导出所选（2）" }));
 
-    await waitFor(() => expect(download).toHaveBeenCalledTimes(2));
-    expect(download.mock.calls.map(([path]) => path)).toEqual([
-      "/api/items/11111111-1111-4111-8111-111111111111/audio?format=m4a",
-      "/api/items/11111111-1111-4111-8111-111111111111/export?variant=original&format=srt",
-    ]);
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith(
+        "/api/items/11111111-1111-4111-8111-111111111111/export-files",
+        expect.objectContaining({
+          method: "POST",
+          body: expect.objectContaining({ items: ["audio", "transcript"] }),
+        }),
+      ),
+    );
+    expect(screen.getByText("D:\\Exports")).toBeInTheDocument();
   });
 
   it("disables export when none of the preferred results exist", async () => {

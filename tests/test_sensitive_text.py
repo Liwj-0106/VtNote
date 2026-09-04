@@ -23,7 +23,7 @@ from vtnote.tasks import TaskService
 from vtnote.url_security import SourceUrlPolicy
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 PROMPT = "SENSITIVE-PROMPT-9f2d: summarize private launch details"
 
 

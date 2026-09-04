@@ -60,6 +60,16 @@ def sanitize_diagnostic(
     return cleaned[:max_length]
 
 
+def contains_sensitive_value(
+    values: tuple[str, ...], sensitive_values: tuple[str, ...]
+) -> bool:
+    return any(
+        sensitive and sensitive in value
+        for value in values
+        for sensitive in sensitive_values
+    )
+
+
 def build_diagnostic_bundle(
     destination: Path,
     *,

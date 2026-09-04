@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from zipfile import ZipFile
 
 import httpx
 import pytest
@@ -19,8 +20,16 @@ from vtnote.artifacts import (
 )
 from vtnote.config import Settings
 from vtnote.database import initialize_database
-from vtnote.models import ItemRecord, ProcessorProfileRecord, StageRunRecord
+from vtnote.models import (
+    CloudSubmissionRecord,
+    ItemRecord,
+    ProcessorProfileRecord,
+    RuntimeAssetRecord,
+    StageRunRecord,
+    TaskRecord,
+)
 from vtnote.media import MediaInfo, PreparedAudio
+from vtnote.notes import DEFAULT_NOTES_PROMPT
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import PlatformSourceRegistry
 from vtnote.provider_credentials import (
@@ -38,11 +47,18 @@ from vtnote.schemas import (
     transcript_sha256,
 )
 from vtnote.secrets import MemorySecretStore
-from vtnote.sources import SourceProbeResult, make_subtitle_track
+from vtnote.sources import (
+    PlatformSourceError,
+    SourceCollectionItem,
+    SourceCollectionProbeResult,
+    SourceProbeResult,
+    ThumbnailOutcome,
+    make_subtitle_track,
+)
 from vtnote.runtime_assets import RuntimeAssetService
 
 
-BASE_URL = "http://127.0.0.1:8765"
+BASE_URL = "http://127.0.0.1:8766"
 MODEL_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
 
 
@@ -204,10 +220,57 @@ class FakeSourceProbe:
             ),
         )
 
+    def fetch_thumbnail(self, url: str) -> ThumbnailOutcome:
+        assert url == "https://youtu.be/abc"
+        return ThumbnailOutcome(
+            content=b"\xff\xd8\xff\xe0public jpeg",
+            media_type="image/jpeg",
+        )
+
+
+class FakeCollectionSourceProbe:
+    def __init__(self) -> None:
+        self.single_probe_called = False
+
+    def probe_collection(self, url: str):
+        assert url == (
+            "https://space.bilibili.com/2142762/lists/3662502?type=season"
+        )
+        return SourceCollectionProbeResult(
+            source_kind="bilibili",
+            id="bilibili:season:2142762:3662502",
+            canonical_url=url,
+            title="课程合集",
+            items=(
+                SourceCollectionItem(
+                    id="BV1111111111",
+                    canonical_url="https://www.bilibili.com/video/BV1111111111",
+                    title="第一课",
+                    duration_ms=61_000,
+                ),
+                SourceCollectionItem(
+                    id="BV2222222222",
+                    canonical_url="https://www.bilibili.com/video/BV2222222222",
+                    title="第二课",
+                    duration_ms=62_000,
+                ),
+            ),
+            total_items=2,
+        )
+
+    def probe(self, url: str):
+        self.single_probe_called = True
+        raise AssertionError("collection URL must not use the single-video probe")
+
 
 class ExplodingSourceProbe:
     def probe(self, url: str):
         raise RuntimeError("Authorization: super-secret")
+
+
+class AuthenticationRequiredSourceProbe:
+    def probe(self, url: str):
+        raise PlatformSourceError("auth_required")
 
 
 class UnsafeReportedRedirectProbe:
@@ -262,6 +325,34 @@ def csrf(client: TestClient) -> dict[str, str]:
     response = client.get("/api/security/csrf")
     assert response.status_code == 200
     return {"Origin": BASE_URL, "X-CSRF-Token": response.json()["csrf_token"]}
+
+
+def make_task_terminal_with_artifacts(
+    engine,
+    paths: StoragePaths,
+    task: dict[str, object],
+) -> tuple[Path, Path, str]:
+    item_id = str(task["items"][0]["id"])
+    durable = paths.transcript(item_id)
+    durable.parent.mkdir(parents=True, exist_ok=True)
+    durable.write_bytes(b'{"owned":"result"}')
+    runtime = paths.downloaded_audio(item_id, "webm")
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_bytes(b"owned-runtime-audio")
+    with Session(engine) as session:
+        item = session.get(ItemRecord, item_id)
+        assert item is not None
+        item.status = "completed"
+        item.task.status = "completed"
+        for run in item.stage_runs:
+            run.status = "completed"
+        session.commit()
+        asset = RuntimeAssetService(session, paths).register_staged(
+            item_id=item_id,
+            role="downloaded_audio",
+            relative_path=paths.runtime_relative(runtime),
+        )
+    return durable, runtime, asset.id
 
 
 def test_tencent_credentials_are_atomic_redacted_and_reject_sts_fields(
@@ -486,6 +577,54 @@ def test_tokenhub_verification_creates_and_authorizes_glm_notes_profile(
             verified.json()["profile"]["id"]
         )
         assert len(tester.calls) == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("name", "protocol", "base_url"),
+    [
+        ("OpenAI compatible", "openai_chat_completions", "https://api.deepseek.com"),
+        ("Anthropic", "anthropic_messages", "https://api.anthropic.com"),
+        (
+            "Gemini",
+            "google_gemini",
+            "https://generativelanguage.googleapis.com",
+        ),
+        (
+            "Azure OpenAI",
+            "azure_openai",
+            "https://summary.openai.azure.com/openai/v1",
+        ),
+    ],
+)
+def test_modern_chat_connections_are_accepted_at_api_boundary(
+    tmp_path: Path,
+    name: str,
+    protocol: str,
+    base_url: str,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        response = client.post(
+            "/api/connections",
+            headers=headers,
+            json={
+                "name": name,
+                "protocol": protocol,
+                "base_url": base_url,
+                "parameters": {},
+                "credentials": {"api_key": "test-only-key"},
+            },
+        )
+
+        assert response.status_code == 201
+        payload = response.json()
+        assert payload["protocol"] == protocol
+        assert payload["base_url"] == base_url
+        assert payload["configured_fields"] == {"api_key": True}
+        assert "test-only-key" not in response.text
     finally:
         engine.dispose()
 
@@ -770,14 +909,14 @@ def test_bailian_policy_capability_test_and_chat_data_consent_are_independent(
 def test_exact_host_origin_and_double_submit_csrf_are_enforced(tmp_path: Path) -> None:
     client, engine, _ = make_client(tmp_path)
     try:
-        assert client.get("/api/tasks", headers={"Host": "localhost:8765"}).status_code == 403
+        assert client.get("/api/tasks", headers={"Host": "localhost:8766"}).status_code == 403
         no_origin = client.post("/api/tasks", json={"sources": []})
         assert no_origin.status_code == 403
         token_headers = csrf(client)
         wrong_origin = client.post(
             "/api/tasks",
             json={"sources": []},
-            headers={**token_headers, "Origin": "http://localhost:8765"},
+            headers={**token_headers, "Origin": "http://localhost:8766"},
         )
         assert wrong_origin.status_code == 403
         wrong_csrf = client.post(
@@ -1076,6 +1215,56 @@ def test_defaults_patch_allows_null_only_for_nullable_fields(
         engine.dispose()
 
 
+def test_notes_prompt_reveal_uses_builtin_default_and_returns_saved_custom_prompt(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    headers = csrf(client)
+    custom_prompt = "只提炼可以立即执行的动作，并保留对应依据。"
+    try:
+        builtin = client.post(
+            "/api/defaults/notes-prompt/reveal",
+            headers=headers,
+        )
+        assert builtin.status_code == 200
+        assert builtin.json() == {
+            "prompt": DEFAULT_NOTES_PROMPT,
+            "is_custom": False,
+        }
+        assert builtin.headers["cache-control"] == "no-store"
+        assert builtin.headers["pragma"] == "no-cache"
+
+        patched = client.patch(
+            "/api/defaults",
+            headers=headers,
+            json={
+                "notes_template": "custom",
+                "notes_custom_prompt": custom_prompt,
+            },
+        )
+        assert patched.status_code == 200
+        assert patched.json()["has_custom_prompt"] is True
+        assert custom_prompt not in patched.text
+
+        revealed = client.post(
+            "/api/defaults/notes-prompt/reveal",
+            headers=headers,
+        )
+        assert revealed.status_code == 200
+        assert revealed.json() == {
+            "prompt": custom_prompt,
+            "is_custom": True,
+        }
+        assert revealed.headers["cache-control"] == "no-store"
+        assert revealed.headers["pragma"] == "no-cache"
+
+        generic_defaults = client.get("/api/defaults")
+        assert generic_defaults.status_code == 200
+        assert custom_prompt not in generic_defaults.text
+    finally:
+        engine.dispose()
+
+
 def test_default_registry_reports_youtube_runtime_and_probe_injection_revalidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1126,6 +1315,7 @@ def test_default_registry_reports_youtube_runtime_and_probe_injection_revalidate
             stable_ordinal=1,
         )
         assert response.json() == {
+            "result_type": "single",
             "source_kind": "youtube",
             "canonical_url": "https://www.youtube.com/watch?v=abc",
             "title": "Example",
@@ -1156,6 +1346,25 @@ def test_default_registry_reports_youtube_runtime_and_probe_injection_revalidate
         engine.dispose()
 
 
+def test_source_thumbnail_is_returned_as_a_private_nosniff_image(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path, source_probe=FakeSourceProbe())
+    try:
+        response = client.get(
+            "/api/sources/thumbnail",
+            params={"url": "https://youtu.be/abc"},
+        )
+
+        assert response.status_code == 200
+        assert response.content == b"\xff\xd8\xff\xe0public jpeg"
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.headers["cache-control"] == "private, max-age=86400"
+        assert response.headers["x-content-type-options"] == "nosniff"
+    finally:
+        engine.dispose()
+
+
 def test_probe_centrally_rejects_an_unsafe_reported_redirect_chain(tmp_path: Path) -> None:
     client, engine, _ = make_client(
         tmp_path, source_probe=UnsafeReportedRedirectProbe()
@@ -1167,6 +1376,371 @@ def test_probe_centrally_rejects_an_unsafe_reported_redirect_chain(tmp_path: Pat
         )
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "unsafe_source_url"
+    finally:
+        engine.dispose()
+
+
+def test_probe_returns_a_selectable_bilibili_collection(tmp_path: Path) -> None:
+    source_probe = FakeCollectionSourceProbe()
+    client, engine, _ = make_client(tmp_path, source_probe=source_probe)
+    try:
+        response = client.post(
+            "/api/sources/probe",
+            headers=csrf(client),
+            json={
+                "url": (
+                    "https://space.bilibili.com/2142762/lists/3662502"
+                    "?type=season"
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["result_type"] == "collection"
+        assert payload["canonical_url"] == (
+            "https://space.bilibili.com/2142762/lists/3662502?type=season"
+        )
+        assert payload["collection"] == {
+            "id": "bilibili:season:2142762:3662502",
+            "title": "课程合集",
+            "total_items": 2,
+            "truncated": False,
+            "items": [
+                {
+                    "id": "BV1111111111",
+                    "canonical_url": "https://www.bilibili.com/video/BV1111111111",
+                    "title": "第一课",
+                    "duration_ms": 61_000,
+                },
+                {
+                    "id": "BV2222222222",
+                    "canonical_url": "https://www.bilibili.com/video/BV2222222222",
+                    "title": "第二课",
+                    "duration_ms": 62_000,
+                },
+            ],
+        }
+        assert source_probe.single_probe_called is False
+    finally:
+        engine.dispose()
+
+
+def test_probe_extracts_supported_url_from_share_text(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path, source_probe=FakeSourceProbe())
+    try:
+        response = client.post(
+            "/api/sources/probe",
+            headers=csrf(client),
+            json={
+                "url": (
+                    "推荐这个视频：\n"
+                    "https://youtu.be/abc。\n"
+                    "复制链接后打开 VtNote"
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["canonical_url"] == (
+            "https://www.youtube.com/watch?v=abc"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_probe_reports_actionable_platform_authentication_requirement(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(
+        tmp_path,
+        source_probe=AuthenticationRequiredSourceProbe(),
+    )
+    try:
+        response = client.post(
+            "/api/sources/probe",
+            headers=csrf(client),
+            json={"url": "https://v.douyin.com/AbC_123/"},
+        )
+        assert response.status_code == 403
+        assert response.json() == {
+            "error": {
+                "code": "auth_required",
+                "message": (
+                    "platform requires authentication or fresh verification cookies"
+                ),
+                "details": None,
+            }
+        }
+    finally:
+        engine.dispose()
+
+
+def test_probe_uses_explicit_loopback_proxy_without_target_dns_precheck(
+    tmp_path: Path,
+) -> None:
+    class PoisonedYoutubeResolver:
+        def resolve(self, host: str) -> list[str]:
+            return ["2001::1"]
+
+    settings = Settings(
+        data_root=tmp_path / "data",
+        runtime_cache_root=tmp_path / "cache",
+        platform_proxy_url="http://127.0.0.1:7897",
+    )
+    paths = StoragePaths.from_settings(settings)
+    engine = initialize_database(paths.database)
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        secret_store=MemorySecretStore(),
+        resolver=PoisonedYoutubeResolver(),
+        source_probe=FakeSourceProbe(),
+    )
+    client = TestClient(app, base_url=BASE_URL)
+    try:
+        response = client.post(
+            "/api/sources/probe",
+            headers=csrf(client),
+            json={"url": "https://youtu.be/abc"},
+        )
+        assert response.status_code == 200
+        assert response.json()["canonical_url"] == (
+            "https://www.youtube.com/watch?v=abc"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_batch_task_endpoint_creates_one_library_task_per_selected_video(
+    tmp_path: Path,
+) -> None:
+    client, engine, _ = make_client(tmp_path)
+    try:
+        response = client.post(
+            "/api/tasks/batch",
+            headers=csrf(client),
+            json={
+                "sources": [
+                    {
+                        "kind": "url",
+                        "locator": "https://www.bilibili.com/video/BV1111111111",
+                    },
+                    {
+                        "kind": "url",
+                        "locator": "https://www.bilibili.com/video/BV2222222222",
+                    },
+                ],
+                "output_type": "transcript",
+                "audio_export_enabled": True,
+            },
+        )
+
+        assert response.status_code == 201
+        created = response.json()
+        assert len(created) == 2
+        assert [len(task["items"]) for task in created] == [1, 1]
+        assert [task["items"][0]["source_locator"] for task in created] == [
+            "https://www.bilibili.com/video/BV1111111111",
+            "https://www.bilibili.com/video/BV2222222222",
+        ]
+        listed = client.get("/api/tasks?limit=10")
+        assert listed.status_code == 200
+        assert {task["id"] for task in listed.json()} == {
+            task["id"] for task in created
+        }
+    finally:
+        engine.dispose()
+
+
+def test_batch_task_endpoint_rejects_duplicate_sources(tmp_path: Path) -> None:
+    client, engine, _ = make_client(tmp_path)
+    source = {
+        "kind": "url",
+        "locator": "https://www.bilibili.com/video/BV1111111111",
+    }
+    try:
+        response = client.post(
+            "/api/tasks/batch",
+            headers=csrf(client),
+            json={"sources": [source, source]},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_task"
+        assert client.get("/api/tasks?limit=10").json() == []
+    finally:
+        engine.dispose()
+
+
+def test_delete_terminal_task_removes_database_and_only_app_owned_artifacts(
+    tmp_path: Path,
+) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    external_original = tmp_path / "user-original.mp4"
+    external_original.write_bytes(b"must-survive")
+    try:
+        task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {
+                        "kind": "url",
+                        "locator": "https://youtu.be/delete-one",
+                    }
+                ]
+            },
+        ).json()
+        durable, runtime, asset_id = make_task_terminal_with_artifacts(
+            engine, paths, task
+        )
+
+        response = client.delete(f"/api/tasks/{task['id']}", headers=headers)
+
+        assert response.status_code == 204
+        assert client.get(f"/api/tasks/{task['id']}").status_code == 404
+        assert not durable.exists()
+        assert not runtime.exists()
+        assert external_original.read_bytes() == b"must-survive"
+        with Session(engine) as session:
+            assert session.get(TaskRecord, task["id"]) is None
+            assert session.get(ItemRecord, task["items"][0]["id"]) is None
+            assert session.get(RuntimeAssetRecord, asset_id) is None
+        assert not paths.runtime("task-deletions").exists()
+    finally:
+        engine.dispose()
+
+
+def test_bulk_delete_is_atomic_and_removes_multiple_terminal_tasks(
+    tmp_path: Path,
+) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        tasks = [
+            client.post(
+                "/api/tasks",
+                headers=headers,
+                json={
+                    "sources": [
+                        {
+                            "kind": "url",
+                            "locator": f"https://youtu.be/delete-bulk-{index}",
+                        }
+                    ]
+                },
+            ).json()
+            for index in range(2)
+        ]
+        artifacts = [
+            make_task_terminal_with_artifacts(engine, paths, task)
+            for task in tasks
+        ]
+
+        response = client.post(
+            "/api/tasks/bulk-delete",
+            headers=headers,
+            json={"task_ids": [task["id"] for task in tasks]},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "deleted_task_ids": [task["id"] for task in tasks]
+        }
+        assert client.get("/api/tasks").json() == []
+        assert all(not path.exists() for pair in artifacts for path in pair[:2])
+    finally:
+        engine.dispose()
+
+
+def test_bulk_delete_rejects_active_task_without_partially_deleting(
+    tmp_path: Path,
+) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        terminal = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/delete-terminal"}
+                ]
+            },
+        ).json()
+        active = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/delete-active"}
+                ]
+            },
+        ).json()
+        durable, runtime, _ = make_task_terminal_with_artifacts(
+            engine, paths, terminal
+        )
+
+        response = client.post(
+            "/api/tasks/bulk-delete",
+            headers=headers,
+            json={"task_ids": [terminal["id"], active["id"]]},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "task_not_terminal"
+        assert client.get(f"/api/tasks/{terminal['id']}").status_code == 200
+        assert client.get(f"/api/tasks/{active['id']}").status_code == 200
+        assert durable.is_file()
+        assert runtime.is_file()
+    finally:
+        engine.dispose()
+
+
+def test_delete_waits_for_cloud_submission_and_cos_cleanup(tmp_path: Path) -> None:
+    client, engine, paths = make_client(tmp_path)
+    headers = csrf(client)
+    try:
+        task = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "sources": [
+                    {"kind": "url", "locator": "https://youtu.be/delete-cloud"}
+                ]
+            },
+        ).json()
+        durable, runtime, _ = make_task_terminal_with_artifacts(engine, paths, task)
+        item_id = task["items"][0]["id"]
+        with Session(engine) as session:
+            stage = session.scalar(
+                select(StageRunRecord).where(
+                    StageRunRecord.item_id == item_id,
+                    StageRunRecord.stage == "transcribe",
+                )
+            )
+            assert stage is not None
+            session.add(
+                CloudSubmissionRecord(
+                    stage_run_id=stage.id,
+                    audio_sha256="a" * 64,
+                    cos_bucket="private-bucket",
+                    cos_region="ap-guangzhou",
+                    cos_object_key="private/object.ogg",
+                    state="failed",
+                )
+            )
+            session.commit()
+
+        response = client.delete(f"/api/tasks/{task['id']}", headers=headers)
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "task_remote_cleanup_pending"
+        assert durable.is_file()
+        assert runtime.is_file()
+        assert client.get(f"/api/tasks/{task['id']}").status_code == 200
     finally:
         engine.dispose()
 
@@ -1251,6 +1825,46 @@ def test_task_list_get_cancel_retry_and_export_routes(tmp_path: Path) -> None:
         assert exported.status_code == 200
         assert exported.text == "Hello\n"
 
+        export_directory = tmp_path / "exports"
+        export_directory.mkdir()
+        configured = client.patch(
+            "/api/export-settings",
+            headers=headers,
+            json={"directory": str(export_directory)},
+        )
+        assert configured.status_code == 200
+        saved = client.post(
+            f"/api/items/{item_id}/export-text-file",
+            headers=headers,
+            json={"variant": "original", "format": "markdown"},
+        )
+        assert saved.status_code == 200
+        saved_payload = saved.json()
+        assert saved_payload["directory"] == str(export_directory.resolve())
+        assert (export_directory / saved_payload["files"][0]["filename"]).is_file()
+
+        original_batch = client.post(
+            "/api/tasks/bulk-export",
+            headers=headers,
+            json={"task_ids": [task["id"]], "mode": "original_markdown"},
+        )
+        assert original_batch.status_code == 200
+        original_batch_file = (
+            export_directory / original_batch.json()["files"][0]["filename"]
+        )
+        assert original_batch_file.is_file()
+        assert original_batch_file.read_text(encoding="utf-8").endswith("Hello\n")
+
+        bulk_saved = client.post(
+            "/api/tasks/bulk-export",
+            headers=headers,
+            json={"task_ids": [task["id"]], "mode": "zip_all"},
+        )
+        assert bulk_saved.status_code == 200
+        bulk_file = export_directory / bulk_saved.json()["files"][0]["filename"]
+        with ZipFile(bulk_file) as archive:
+            assert archive.namelist() == ["vtnote-result-transcript.md"]
+
         canceled = client.post(f"/api/tasks/{task['id']}/cancel", headers=headers)
         assert canceled.status_code == 200
     finally:
@@ -1271,7 +1885,12 @@ def test_health_readiness_pagination_and_result_read_models(tmp_path: Path) -> N
         readiness = client.get("/api/readiness")
         assert readiness.status_code == 200
         assert "secret" not in readiness.text.casefold()
+        assert readiness.json()["local_asr_engines"] == {
+            "faster_whisper": {"state": "not_installed"},
+            "sensevoice_sherpa_onnx": {"state": "not_installed"},
+        }
         assert readiness.json()["limits"]["max_task_sources"] == 1
+        assert readiness.json()["limits"]["max_batch_sources"] == 100
 
         created_tasks = [
             client.post(
@@ -1483,8 +2102,14 @@ def test_item_outcomes_and_audio_download_reflect_available_artifacts(
         downloaded = client.get(f"/api/items/{item_id}/audio?format=m4a")
         assert downloaded.status_code == 200
         assert downloaded.content == b"converted-audio"
+        assert downloaded.headers["cache-control"] == "private, max-age=0"
         assert "vtnote-" in downloaded.headers["content-disposition"]
         assert downloaded.headers["content-disposition"].endswith('-audio.m4a"')
+
+        inline = client.get(f"/api/items/{item_id}/audio?format=m4a&inline=true")
+        assert inline.status_code == 200
+        assert inline.content == b"converted-audio"
+        assert "content-disposition" not in inline.headers
     finally:
         engine.dispose()
 
@@ -1631,6 +2256,19 @@ def test_task_create_accepts_audio_export_enabled(tmp_path: Path) -> None:
             "connection_revision": 1,
             "profile_revision": 1,
             "acknowledge_possible_charge": False,
+        },
+        {
+            "item_id": "item",
+            "stage": "transcribe",
+            "expected_attempt": 1,
+            "notes_profile_id": "profile",
+            "notes_profile_revision": 1,
+        },
+        {
+            "item_id": "item",
+            "stage": "notes",
+            "expected_attempt": 1,
+            "notes_profile_id": "profile",
         },
     ],
 )

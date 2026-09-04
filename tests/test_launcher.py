@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import subprocess
 import sys
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from vtnote.config import Settings
 from vtnote.launcher import (
     LauncherError,
+    _spawn,
     child_commands,
     ensure_port_available,
     stop_children,
@@ -22,6 +24,26 @@ def test_launcher_uses_explicit_python_argv_for_api_and_worker() -> None:
         "worker": (sys.executable, "-m", "vtnote", "worker"),
     }
     assert all(isinstance(command, tuple) for command in commands.values())
+
+
+def test_spawn_passes_the_configured_environment_to_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_popen(command: tuple[str, ...], **kwargs: object):
+        captured["command"] = command
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setenv("VTNOTE_NATIVE_RUNTIME_TEST", "inherited")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    _spawn((sys.executable, "-m", "vtnote", "worker"))
+
+    child_environment = captured["env"]
+    assert isinstance(child_environment, dict)
+    assert child_environment["VTNOTE_NATIVE_RUNTIME_TEST"] == "inherited"
 
 
 def test_port_conflict_is_reported_before_children_start() -> None:

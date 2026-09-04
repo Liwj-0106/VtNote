@@ -17,12 +17,14 @@ describe("SetupPage", () => {
       capabilities: {
         local_files: true,
         bilibili_url: true,
+        douyin_url: true,
         youtube_url: false,
         local_asr: false,
       },
       local_model_state: "not_installed",
       limits: {
         max_task_sources: 1,
+        max_batch_sources: 100,
         max_media_bytes: 1000,
         max_subtitle_bytes: 100,
       },

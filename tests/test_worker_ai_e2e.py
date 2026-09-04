@@ -159,10 +159,12 @@ class ScriptedClient:
 class ClientFactory:
     failures: dict[str, Exception] = field(default_factory=dict)
     clients: list[ScriptedClient] = field(default_factory=list)
+    selected_profiles: list[dict[str, object]] = field(default_factory=list)
 
     def __call__(self, profile: Mapping[str, object], _credentials: object) -> ScriptedClient:
         purpose = profile.get("purpose")
         assert purpose in {"translation", "notes"}
+        self.selected_profiles.append(dict(profile))
         client = ScriptedClient(str(purpose), self.failures.get(str(purpose)))
         self.clients.append(client)
         return client
@@ -563,7 +565,7 @@ def test_translation_and_notes_complete_as_independent_parallel_branches(
     translated.validate_against(_transcript())
     note_path = case.paths.note(case.item_id, _latest(case, "notes").id)
     assert note_path.is_file()
-    assert "AI 生成内容：请核对" in note_path.read_text("utf-8")
+    assert "AI 生成内容：请核对" not in note_path.read_text("utf-8")
     with Session(case.store.engine) as session:
         item = session.get(ItemRecord, case.item_id)
         assert item is not None
@@ -598,6 +600,78 @@ def test_failed_translation_does_not_block_notes_or_hide_original(
         assert item is not None
         assert item.status == "completed_with_warnings"
         assert item.task.status == "completed_with_warnings"
+
+
+def test_notes_retry_uses_the_explicit_profile_and_output_language(
+    tmp_path: Path,
+) -> None:
+    case = _make_case(tmp_path, translation=False)
+    with Session(case.store.engine) as session:
+        configuration = ConfigurationService(
+            session,
+            case.secrets,
+            paths=case.paths,
+        )
+        connection_id = case.profiles["notes"]["connection_id"]
+        selected = configuration.create_profile(
+            name="Retry notes",
+            purpose="notes",
+            connection_id=connection_id,
+            model=MODEL,
+            context_length=32_768,
+            options={
+                "temperature": 0.2,
+                "max_tokens": 4096,
+                "enable_thinking": False,
+            },
+        )
+        configuration.record_profile_test(selected.id, ok=True, message="ok")
+        configuration.authorize_chat_data(selected.id)
+        item = session.get(ItemRecord, case.item_id)
+        assert item is not None
+        notes_run = next(run for run in item.stage_runs if run.stage == "notes")
+        notes_run.status = "failed"
+        item.status = "completed_with_warnings"
+        item.task.status = "completed_with_warnings"
+        session.commit()
+        tasks = TaskService(
+            session,
+            configuration,
+            case.paths,
+            SourceUrlPolicy(PublicResolver()),
+        )
+        override = tasks.build_retry_override(
+            notes_profile_id=selected.id,
+            notes_profile_revision=selected.revision,
+            notes_output_language="en",
+        )
+        tasks.retry_stage(
+            case.item_id,
+            "notes",
+            expected_attempt=1,
+            override=override,
+        )
+
+    factory = ClientFactory()
+    _run_one(case, _handlers(case, factory), worker_id="worker-notes-retry")
+
+    latest = _latest(case, "notes")
+    assert latest.attempt == 2
+    assert (latest.status, latest.error_code, latest.error_message) == (
+        "completed",
+        None,
+        None,
+    )
+    assert factory.selected_profiles[-1]["id"] == selected.id
+    payloads = [
+        json.loads(request.messages[1].content)
+        for client in factory.clients
+        for request in client.calls
+    ]
+    assert payloads
+    assert all(payload["output_language"] == "en" for payload in payloads)
+    note = case.paths.note(case.item_id, latest.id).read_text("utf-8")
+    assert "output_language: en" in note
 
 
 def test_chat_submission_unknown_requires_charge_acknowledged_stage_only_retry(

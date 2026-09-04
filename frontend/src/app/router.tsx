@@ -54,7 +54,7 @@ export function RouterProvider({
         );
       }
       setPath(safePath);
-      window.scrollTo?.({ top: 0, behavior: "auto" });
+      window.scrollTo?.({ top: 0, left: 0, behavior: "auto" });
     },
     [initialPath],
   );

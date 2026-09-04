@@ -3,8 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
-    <meta name="theme-color" content="#f7f5f0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f7f7f6" />
+    <script>
+      (() => {
+        try {
+          const value = JSON.parse(localStorage.getItem("vtnote.interface.v1") || "null");
+          const preference = ["light", "dark", "system"].includes(value?.theme)
+            ? value.theme
+            : "system";
+          const theme = preference === "system"
+            ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+            : preference;
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.dataset.themePreference = preference;
+          document.documentElement.lang = value?.language === "en" ? "en" : "zh-CN";
+        } catch {
+          document.documentElement.dataset.theme = "light";
+          document.documentElement.dataset.themePreference = "system";
+        }
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>VtNote</title>
   </head>
   <body>

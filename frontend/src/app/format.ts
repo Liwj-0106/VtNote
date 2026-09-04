@@ -1,12 +1,12 @@
 const statusLabels: Record<string, string> = {
-  queued: "等待处理",
+  queued: "处理中",
   running: "处理中",
-  waiting_external: "等待云端结果",
-  cancel_requested: "正在停止",
-  canceled: "已停止",
-  completed: "已完成",
-  completed_with_warnings: "已完成，有提醒",
-  failed: "需要处理",
+  waiting_external: "处理中",
+  cancel_requested: "处理中",
+  canceled: "失败",
+  completed: "完成",
+  completed_with_warnings: "完成",
+  failed: "失败",
 };
 
 const stageLabels: Record<string, string> = {
@@ -71,10 +71,13 @@ export function formatBytes(bytes: number): string {
 export function sourceLabel(kind: string): string {
   const labels: Record<string, string> = {
     bilibili: "Bilibili",
+    douyin: "抖音",
     youtube: "YouTube",
     url: "公开视频",
     local_media: "本地媒体",
     local_subtitle: "字幕文件",
+    uploaded_media: "本地媒体",
+    uploaded_subtitle: "字幕文件",
   };
   return labels[kind] ?? kind;
 }

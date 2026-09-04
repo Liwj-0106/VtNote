@@ -1,0 +1,114 @@
+.dropdown-menu {
+  position: relative;
+}
+
+.dropdown-menu-trigger {
+  cursor: pointer;
+}
+
+.dropdown-popover,
+.select-menu-popover {
+  --dropdown-width: 260px;
+  position: absolute;
+  z-index: var(--z-menu);
+  top: calc(100% + 8px);
+  display: grid;
+  width: min(var(--dropdown-width), calc(100vw - 32px));
+  max-height: min(420px, 70vh);
+  gap: 2px;
+  padding: 6px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
+  box-shadow: var(--shadow-menu);
+}
+
+.dropdown-popover.is-start { left: 0; }
+.dropdown-popover.is-end { right: 0; }
+.dropdown-popover.is-compact { --dropdown-width: 220px; }
+.dropdown-popover.is-wide { --dropdown-width: 320px; }
+.dropdown-popover.opens-up {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
+.select-menu-popover {
+  right: 0;
+  left: 0;
+  width: 100%;
+}
+
+.dropdown-popover > :is(button, a),
+.select-menu-option {
+  display: grid;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 1px);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.84rem;
+  line-height: 1.35;
+  text-align: left;
+  text-decoration: none;
+  transition:
+    background var(--motion-fast),
+    color var(--motion-fast),
+    transform var(--motion-fast) var(--ease-enter);
+}
+
+.dropdown-popover > :is(button, a):is(:hover, :focus-visible),
+.select-menu-option.is-active:not(.is-selected),
+.select-menu-option:focus-visible {
+  outline: 0;
+  background: var(--sidebar);
+}
+
+.dropdown-popover > :is(button, a):active:not(:disabled),
+.select-menu-option:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.dropdown-popover > :is(button, a)[aria-checked="true"],
+.select-menu-option.is-selected {
+  background: var(--terracotta-soft);
+  color: var(--terracotta-strong);
+  font-weight: 650;
+}
+
+.dropdown-popover > button:disabled,
+.select-menu-option:disabled {
+  color: var(--ink-tertiary);
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.dropdown-popover > strong {
+  min-height: 40px;
+  padding: 9px 10px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--ink);
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.dropdown-menu-trigger[aria-expanded="true"] .dropdown-menu-chevron {
+  transform: rotate(180deg);
+}
+
+.dropdown-menu-chevron {
+  transition: transform var(--motion-fast);
+}
+
+@media (max-width: 640px) {
+  .dropdown-popover,
+  .select-menu-popover {
+    max-width: calc(100vw - 24px);
+  }
+}

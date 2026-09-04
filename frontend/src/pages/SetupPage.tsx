@@ -2,6 +2,8 @@ import type { Readiness } from "../api/types";
 import { AppLink } from "../app/router";
 import { useApiResource } from "../app/hooks";
 import { InlineNotice } from "../components/InlineNotice";
+import { MotionPresence } from "../components/MotionPresence";
+import { SettingsRowsSkeleton } from "../components/Skeleton";
 
 const checks = [
   {
@@ -41,10 +43,16 @@ const checks = [
     description: "需要固定版本 yt-dlp、EJS 和 Deno",
   },
   {
+    key: "douyin_url",
+    group: "capabilities",
+    label: "抖音公开链接",
+    description: "公开单视频；平台无字幕时进入语音识别",
+  },
+  {
     key: "local_asr",
     group: "capabilities",
     label: "本地语音转录",
-    description: "需要 NVIDIA GPU、CUDA 和本地模型",
+    description: "SenseVoice 或 Faster-Whisper",
   },
 ] as const;
 
@@ -55,11 +63,7 @@ export function SetupPage() {
     <div className="page setup-page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">Local readiness</p>
           <h1>运行环境</h1>
-          <p className="page-intro">
-            VtNote 会按可用能力工作。缺少可选组件不会挡住其他路径。
-          </p>
         </div>
         <button
           type="button"
@@ -67,20 +71,21 @@ export function SetupPage() {
           disabled={loading}
           onClick={() => void refresh()}
         >
-          {loading ? "正在检查…" : "重新检查"}
+          {loading && data ? "正在检查…" : "重新检查"}
         </button>
       </header>
-      {error && (
-        <InlineNotice tone="danger" title="检查失败">
+      <MotionPresence present={Boolean(error)}>
+        {error ? <InlineNotice tone="danger" title="检查失败">
           无法读取本地环境状态，请确认服务仍在运行。
-        </InlineNotice>
-      )}
-      {data?.status === "blocked" && (
-        <InlineNotice tone="danger" title="核心能力需要修复">
+        </InlineNotice> : null}
+      </MotionPresence>
+      <MotionPresence present={data?.status === "blocked"}>
+        {data?.status === "blocked" ? <InlineNotice tone="danger" title="核心能力需要修复">
           处理任务前，请先修复下列标为“不可用”的核心项目。
-        </InlineNotice>
-      )}
-      {data && (
+        </InlineNotice> : null}
+      </MotionPresence>
+      <MotionPresence present={Boolean(data)}>
+        {data ? (
         <div className="readiness-list">
           {checks.map((check) => {
             const available =
@@ -106,17 +111,21 @@ export function SetupPage() {
           })}
           <section className="settings-row">
             <div>
-              <h2>本地模型</h2>
-              <p>large-v3-turbo 按需下载到 D 盘，不影响平台自带字幕。</p>
+              <h2>SenseVoice Small INT8</h2>
+              <p>本地语音转录</p>
             </div>
             <span className="readiness-state">
-              {data.local_model_state === "installed"
+              {data.local_asr_engines?.sensevoice_sherpa_onnx?.state === "installed"
                 ? "已安装"
                 : "尚未安装"}
             </span>
           </section>
         </div>
-      )}
+        ) : null}
+      </MotionPresence>
+      {loading && !data ? (
+        <SettingsRowsSkeleton label="正在检查运行环境" count={9} />
+      ) : null}
       <div className="setup-actions">
         <AppLink
           className={`button button-primary ${

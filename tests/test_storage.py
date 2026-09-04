@@ -151,6 +151,11 @@ def test_settings_defaults_are_absolute_and_support_environment_overrides(
 ) -> None:
     monkeypatch.delenv("VTNOTE_DATA_ROOT", raising=False)
     monkeypatch.delenv("VTNOTE_RUNTIME_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("VTNOTE_MANAGED_ASSETS_ROOT", raising=False)
+    monkeypatch.delenv("VTNOTE_PLATFORM_PROXY_URL", raising=False)
+    monkeypatch.delenv("VTNOTE_PLATFORM_COOKIE_BROWSER", raising=False)
+    monkeypatch.delenv("VTNOTE_PLATFORM_DOUYIN_COOKIE_FILE", raising=False)
+    monkeypatch.delenv("VTNOTE_PLATFORM_YOUTUBE_COOKIE_FILE", raising=False)
     defaults = Settings()
 
     assert defaults.data_root.is_absolute()
@@ -166,12 +171,37 @@ def test_settings_defaults_are_absolute_and_support_environment_overrides(
 
     data_root = tmp_path / "explicit-data"
     cache_root = tmp_path / "explicit-cache"
+    managed_assets_root = tmp_path / "managed-assets"
     monkeypatch.setenv("VTNOTE_DATA_ROOT", str(data_root))
     monkeypatch.setenv("VTNOTE_RUNTIME_CACHE_ROOT", str(cache_root))
+    monkeypatch.setenv("VTNOTE_MANAGED_ASSETS_ROOT", str(managed_assets_root))
+    monkeypatch.setenv("VTNOTE_PLATFORM_PROXY_URL", "http://127.0.0.1:7897/")
+    monkeypatch.setenv("VTNOTE_PLATFORM_COOKIE_BROWSER", "chrome")
+    douyin_cookie_file = tmp_path / "douyin-cookies.txt"
+    youtube_cookie_file = tmp_path / "youtube-cookies.txt"
+    monkeypatch.setenv(
+        "VTNOTE_PLATFORM_DOUYIN_COOKIE_FILE",
+        str(douyin_cookie_file),
+    )
+    monkeypatch.setenv(
+        "VTNOTE_PLATFORM_YOUTUBE_COOKIE_FILE",
+        str(youtube_cookie_file),
+    )
     overridden = Settings()
 
     assert overridden.data_root == data_root
     assert overridden.runtime_cache_root == cache_root
+    assert overridden.managed_assets_root == managed_assets_root
+    assert overridden.platform_proxy_url == "http://127.0.0.1:7897"
+    assert overridden.platform_cookie_browser == "chrome"
+    assert overridden.platform_douyin_cookie_file == douyin_cookie_file
+    assert overridden.platform_youtube_cookie_file == youtube_cookie_file
+    assert "douyin-cookies" not in repr(overridden)
+    assert "youtube-cookies" not in repr(overridden)
+
+    managed_paths = StoragePaths.managed_assets_from_settings(overridden)
+    assert managed_paths.data_root == managed_assets_root / "Data"
+    assert managed_paths.runtime_cache_root == managed_assets_root / "Cache"
 
 
 def test_settings_cannot_bind_outside_loopback(tmp_path: Path) -> None:
@@ -180,6 +210,28 @@ def test_settings_cannot_bind_outside_loopback(tmp_path: Path) -> None:
             data_root=tmp_path / "data",
             runtime_cache_root=tmp_path / "cache",
             bind_host="0.0.0.0",
+        )
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "https://127.0.0.1:7897",
+        "http://192.168.1.2:7897",
+        "http://user:secret@127.0.0.1:7897",
+        "http://127.0.0.1:7897/path",
+        "http://127.0.0.1",
+    ],
+)
+def test_settings_rejects_uncontrolled_platform_proxy(
+    tmp_path: Path,
+    proxy_url: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            data_root=tmp_path / "data",
+            runtime_cache_root=tmp_path / "cache",
+            platform_proxy_url=proxy_url,
         )
 
 
@@ -250,7 +302,7 @@ def test_storage_paths_produce_typed_runtime_media_layout(tmp_path: Path) -> Non
         ("incoming_upload", ("not-a-uuid", "mp4")),
         ("incoming_upload", (UPLOAD_ID, "../mp4")),
         ("uploaded_source", (ITEM_ID, "exe")),
-        ("downloaded_audio", (ITEM_ID, "mp4")),
+        ("downloaded_audio", (ITEM_ID, "avi")),
         ("trash_asset", (ASSET_ID, "exe")),
     ],
 )
@@ -338,6 +390,13 @@ def test_source_original_accepts_real_subtitles_and_never_overwrites(tmp_path: P
         b'{"body":[{"from":0.0,"to":1.0,"content":"Hello"}]}'
     )
     json_destination = write_source_original(paths, NOTE_ID, "json", bili_json)
+    txt_destination = write_source_original(
+        paths,
+        "33333333-3333-4333-8333-333333333333",
+        "txt",
+        "第一段\n第二段\n".encode(),
+    )
+    assert txt_destination.read_text(encoding="utf-8") == "第一段\n第二段\n"
     assert json_destination.read_bytes() == bili_json
     assert write_source_original(paths, ITEM_ID, "srt", source) == destination
 

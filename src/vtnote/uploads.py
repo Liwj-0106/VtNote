@@ -24,7 +24,7 @@ from vtnote.runtime_assets import RuntimeAssetError, RuntimeAssetService, Runtim
 from vtnote.tasks import TaskService, TaskView
 
 
-SUBTITLE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "json"})
+SUBTITLE_EXTENSIONS = frozenset({"srt", "vtt", "ass", "txt", "json"})
 
 
 @dataclass(frozen=True, slots=True)

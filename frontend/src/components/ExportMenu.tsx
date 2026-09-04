@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { ApiError, api } from "../api/client";
-import { DownloadIcon } from "../app/icons";
+import type { SavedExport } from "../api/types";
+import { ChevronDownIcon, DownloadIcon } from "../app/icons";
+import { DropdownMenu } from "./DropdownMenu";
+import { MotionPresence } from "./MotionPresence";
 
 const formats = [
   { value: "srt", label: "SRT 字幕" },
@@ -19,60 +22,81 @@ export function ExportMenu({
   variant?: "original" | "translation";
   language?: string;
 }) {
-  const [open, setOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const download = async (format: (typeof formats)[number]["value"]) => {
+  const [savedDirectory, setSavedDirectory] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const download = async (
+    format: (typeof formats)[number]["value"],
+    close: () => void,
+  ) => {
     setError(null);
+    setSavedDirectory(null);
+    setSaving(true);
     try {
-      const query = new URLSearchParams({ variant, format });
-      if (language) query.set("language", language);
-      const blob = await api.download(
-        `/api/items/${itemId}/export?${query.toString()}`,
+      const result = await api.request<SavedExport>(
+        `/api/items/${itemId}/export-text-file`,
+        {
+          method: "POST",
+          body: { variant, format, language },
+        },
       );
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `vtnote-${itemId.slice(0, 8)}-${variant}.${
-        format === "markdown" ? "md" : format
-      }`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      setOpen(false);
+      setSavedDirectory(result.directory);
+      close();
     } catch (caught) {
       setError(
         caught instanceof ApiError ? caught.message : "导出失败，请稍后重试。",
       );
+    } finally {
+      setSaving(false);
     }
   };
 
   return (
     <div className="export-menu">
-      <button
-        type="button"
-        className="button"
-        aria-expanded={open}
-        aria-haspopup="menu"
-        onClick={() => setOpen((value) => !value)}
+      <DropdownMenu
+        ariaLabel="导出格式"
+        align="end"
+        size="compact"
+        rootClassName="export-menu-dropdown"
+        triggerClassName="button export-menu-trigger"
+        popoverClassName="export-popover"
+        disabled={saving}
+        trigger={
+          <>
+            <DownloadIcon />
+            导出
+            <ChevronDownIcon className="dropdown-menu-chevron export-menu-chevron" />
+          </>
+        }
       >
-        <DownloadIcon />
-        导出
-      </button>
-      {open && (
-        <div className="export-popover" role="menu">
-          {formats.map((format) => (
-            <button
-              key={format.value}
-              type="button"
-              role="menuitem"
-              onClick={() => void download(format.value)}
-            >
-              {format.label}
-            </button>
-          ))}
-        </div>
-      )}
-      {error && <p className="field-error">{error}</p>}
+        {(close) => (
+          <>
+            {formats.map((format) => (
+              <button
+                key={format.value}
+                type="button"
+                role="menuitem"
+                disabled={saving}
+                onClick={() => void download(format.value, close)}
+              >
+                {format.label}
+              </button>
+            ))}
+          </>
+        )}
+      </DropdownMenu>
+      <MotionPresence present={Boolean(savedDirectory)}>
+        <p
+          className="field-success"
+          role="status"
+          title={savedDirectory ?? undefined}
+        >
+          已保存至 {savedDirectory ?? ""}
+        </p>
+      </MotionPresence>
+      <MotionPresence present={Boolean(error)}>
+        <p className="field-error">{error ?? ""}</p>
+      </MotionPresence>
     </div>
   );
 }

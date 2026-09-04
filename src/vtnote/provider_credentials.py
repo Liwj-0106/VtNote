@@ -45,20 +45,37 @@ class TokenHubCredentialBundle(_CredentialBundle):
     api_key: SecretStr
 
 
+class ApiKeyCredentialBundle(_CredentialBundle):
+    schema_version: Literal[1] = 1
+    api_key: SecretStr
+
+
 CredentialBundle = (
-    TencentCredentialBundle | BailianCredentialBundle | TokenHubCredentialBundle
+    TencentCredentialBundle
+    | BailianCredentialBundle
+    | TokenHubCredentialBundle
+    | ApiKeyCredentialBundle
 )
 
 _SCHEMAS: dict[str, type[_CredentialBundle]] = {
     "tencent_recording_asr": TencentCredentialBundle,
     "aliyun_bailian": BailianCredentialBundle,
     "tencent_tokenhub": TokenHubCredentialBundle,
+    "openai_chat_completions": ApiKeyCredentialBundle,
+    "anthropic_messages": ApiKeyCredentialBundle,
+    "google_gemini": ApiKeyCredentialBundle,
+    "azure_openai": ApiKeyCredentialBundle,
 }
 _FIELDS = {
     "tencent_recording_asr": ("secret_id", "secret_key"),
     "aliyun_bailian": ("api_key",),
     "tencent_tokenhub": ("api_key",),
+    "openai_chat_completions": ("api_key",),
+    "anthropic_messages": ("api_key",),
+    "google_gemini": ("api_key",),
+    "azure_openai": ("api_key",),
 }
+STRUCTURED_CREDENTIAL_PROTOCOLS = frozenset(_SCHEMAS)
 
 
 def _schema(protocol: str) -> type[_CredentialBundle]:

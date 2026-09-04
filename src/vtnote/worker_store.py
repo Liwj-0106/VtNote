@@ -30,7 +30,9 @@ from vtnote.pipeline import (
     aggregate_item_status,
     aggregate_task_status,
     validate_execution_evidence,
+    validate_stage_progress,
 )
+from vtnote.stage_models import allowed_stage_models
 
 
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
@@ -175,53 +177,7 @@ class WorkerStore:
                 latest[row.stage] = row
         return latest
 
-    @staticmethod
-    def _allowed_stage_models(row: StageRunRecord) -> tuple[str, ...]:
-        snapshot = row.item.task.pipeline_snapshot_json
-        if not isinstance(snapshot, dict):
-            return ()
-        if row.stage in {"translate", "notes"}:
-            section_name = "translation" if row.stage == "translate" else "notes"
-            section = snapshot.get(section_name)
-            profile = section.get("profile") if isinstance(section, dict) else None
-            model = profile.get("model") if isinstance(profile, dict) else None
-            return (model,) if isinstance(model, str) else ()
-        local = snapshot.get("local_whisper")
-        local_model = (
-            local.get("model")
-            if isinstance(local, dict) and isinstance(local.get("model"), str)
-            else None
-        )
-        override = row.retry_override_json
-        if isinstance(override, dict):
-            strategy = override.get("strategy")
-            if strategy == "local":
-                return (local_model,) if isinstance(local_model, str) else ()
-            override_asr = override.get("asr")
-            override_profile = (
-                override_asr.get("profile")
-                if isinstance(override_asr, dict)
-                else None
-            )
-            if (
-                strategy == "cloud_confirmed"
-                and isinstance(override_profile, dict)
-                and isinstance(override_profile.get("model"), str)
-            ):
-                return (override_profile["model"],)
-        values: list[str] = []
-        asr = snapshot.get("asr")
-        mode = asr.get("mode") if isinstance(asr, dict) else None
-        profile = asr.get("profile") if isinstance(asr, dict) else None
-        if mode in {"local", "auto"} and isinstance(local_model, str):
-            values.append(local_model)
-        if (
-            mode in {"cloud", "auto"}
-            and isinstance(profile, dict)
-            and isinstance(profile.get("model"), str)
-        ):
-            values.append(profile["model"])
-        return tuple(dict.fromkeys(values))
+    _allowed_stage_models = staticmethod(allowed_stage_models)
 
     @classmethod
     def _recalculate_item_and_task(
@@ -472,6 +428,28 @@ class WorkerStore:
                 resource.lease_owner = token
                 resource.lease_expires_at = now + lease_duration
                 resource.heartbeat_at = now
+            session.commit()
+            return True
+
+    def update_progress(
+        self,
+        claim: StageClaim,
+        progress: Mapping[str, object],
+        *,
+        now: datetime,
+    ) -> bool:
+        """Persist bounded progress only while the caller still owns the stage."""
+
+        normalized = validate_stage_progress(progress)
+        now = _utc(now)
+        with Session(self.engine) as session:
+            self._begin_immediate(session)
+            row = session.get(StageRunRecord, claim.stage_run_id)
+            if not self._claim_matches(row, claim, now):
+                session.rollback()
+                return False
+            assert row is not None
+            row.progress_json = dict(normalized)
             session.commit()
             return True
 

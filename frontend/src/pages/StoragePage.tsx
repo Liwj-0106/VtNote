@@ -5,14 +5,22 @@ import { formatBytes, formatDate } from "../app/format";
 import { AppLink } from "../app/router";
 import { EmptyState } from "../components/EmptyState";
 import { InlineNotice } from "../components/InlineNotice";
+import { MotionPresence } from "../components/MotionPresence";
+import {
+  SettingsRowsSkeleton,
+  Skeleton,
+  SkeletonStatus,
+} from "../components/Skeleton";
 
 export function StoragePage() {
   const [summary, setSummary] = useState<StorageSummary | null>(null);
   const [trash, setTrash] = useState<TrashAsset[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  const load = async () => {
+  const load = async (showSkeleton = false) => {
+    if (showSkeleton) setLoading(true);
     try {
       const [nextSummary, nextTrash] = await Promise.all([
         api.request<StorageSummary>("/api/storage"),
@@ -25,10 +33,12 @@ export function StoragePage() {
       setError(
         caught instanceof ApiError ? caught.message : "无法读取存储状态。",
       );
+    } finally {
+      if (showSkeleton) setLoading(false);
     }
   };
   useEffect(() => {
-    void load();
+    void load(true);
   }, []);
 
   const restore = async (asset: TrashAsset) => {
@@ -61,9 +71,15 @@ export function StoragePage() {
           </p>
         </div>
       </header>
-      {error && <InlineNotice tone="danger">{error}</InlineNotice>}
+      <MotionPresence present={Boolean(error)}>
+        {error ? <InlineNotice tone="danger">{error}</InlineNotice> : null}
+      </MotionPresence>
 
-      {summary && (
+      {loading ? (
+        <SettingsRowsSkeleton label="正在读取存储状态" count={3} />
+      ) : null}
+      <MotionPresence present={!loading && Boolean(summary)}>
+        {summary ? (
         <div className="storage-summary">
           <section className="settings-row">
             <div>
@@ -93,7 +109,8 @@ export function StoragePage() {
             </span>
           </section>
         </div>
-      )}
+        ) : null}
+      </MotionPresence>
 
       <section className="settings-section section-rule">
         <div className="section-heading-row">
@@ -102,7 +119,9 @@ export function StoragePage() {
             <p>这里只能恢复 VtNote 自己创建并登记的临时媒体。</p>
           </div>
         </div>
-        {trash.length === 0 ? (
+        {loading ? (
+          <StorageTrashSkeleton />
+        ) : trash.length === 0 ? (
           <EmptyState
             title="回收区为空"
             description="处理完成或失败后的临时媒体会在这里短暂保留。"
@@ -136,6 +155,23 @@ export function StoragePage() {
         </InlineNotice>
       </section>
     </div>
+  );
+}
+
+function StorageTrashSkeleton() {
+  return (
+    <SkeletonStatus className="storage-trash-skeleton" label="正在读取回收区">
+      {Array.from({ length: 2 }, (_, index) => (
+        <div className="storage-trash-skeleton-row" key={index}>
+          <div className="storage-trash-skeleton-copy">
+            <Skeleton />
+            <Skeleton />
+            <Skeleton />
+          </div>
+          <Skeleton className="storage-trash-skeleton-action is-block" />
+        </div>
+      ))}
+    </SkeletonStatus>
   );
 }
 

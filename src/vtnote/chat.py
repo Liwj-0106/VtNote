@@ -23,7 +23,7 @@ BAILIAN_CHAT_PATH = "/chat/completions"
 MAX_CHAT_REQUEST_BYTES = 64 * 1024
 MAX_CHAT_RESPONSE_BYTES = 256 * 1024
 _WORKSPACE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_MODEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$")
+_MODEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,191})$")
 _SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -163,7 +163,7 @@ class ChatResponse:
 
 @dataclass(frozen=True, slots=True)
 class ChatCapabilities:
-    protocol: Literal["aliyun_bailian", "tencent_tokenhub"]
+    protocol: str
     endpoint: str
     response_format: Literal["json_object"]
     max_request_bytes: int
@@ -204,14 +204,13 @@ class ChatProfileSnapshot:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ChatProfileSnapshot":
-        if (
-            not isinstance(value, Mapping)
-            or value.get("protocol") not in {"aliyun_bailian", "tencent_tokenhub"}
+        if not isinstance(value, Mapping) or not isinstance(
+            value.get("protocol"), str
         ):
-            raise ValueError("invalid domestic chat profile snapshot")
+            raise ValueError("invalid chat profile snapshot")
         options = value.get("options")
         if not isinstance(options, Mapping):
-            raise ValueError("invalid domestic chat profile options")
+            raise ValueError("invalid chat profile options")
         return cls(
             model=value.get("model"),  # type: ignore[arg-type]
             context_length=value.get("context_length"),  # type: ignore[arg-type]

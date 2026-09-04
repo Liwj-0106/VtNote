@@ -28,12 +28,19 @@ from vtnote.logging_setup import configure_logging
 from vtnote.maintenance import MaintenanceLoop, build_maintenance_service
 from vtnote.media import CommandRunner, FfmpegBinaries, FfmpegMediaProcessor
 from vtnote.model_assets import ModelAssetService
+from vtnote.model_assets import (
+    load_sensevoice_manifest,
+    load_silero_vad_manifest,
+)
+from vtnote.native_runtime import configure_windows_native_runtime
 from vtnote.paths import StoragePaths
 from vtnote.platform_sources import (
     FfmpegMediaValidator,
     build_default_platform_registry,
 )
+from vtnote.project_resources import apply_repository_runtime_defaults, bundled_asset
 from vtnote.runtime_assets import RuntimeAssetService
+from vtnote.sensevoice_asr import SenseVoiceTranscriber
 from vtnote.secrets import KeyringSecretStore
 from vtnote.sensitive_text import WindowsDpapiSensitiveTextProtector
 from vtnote.source_stage import SourceStageHandler
@@ -44,7 +51,12 @@ from vtnote.transcribe_stage import (
     build_snapshot_cos_stager,
 )
 from vtnote.url_security import SocketResolver
-from vtnote.worker import Worker, build_model_installer_loop
+from vtnote.worker import (
+    ModelInstallerLoop,
+    RoundRobinModelInstaller,
+    Worker,
+    build_model_installer_loop,
+)
 from vtnote.worker_store import WorkerStore
 from vtnote.youtube_runtime import configure_managed_runtime_environment
 
@@ -108,10 +120,12 @@ def stop_children(
 
 
 def _spawn(command: Sequence[str]) -> subprocess.Popen[bytes]:
+    configure_windows_native_runtime()
     kwargs: dict[str, object] = {
         "shell": False,
         "stdin": subprocess.DEVNULL,
         "close_fds": True,
+        "env": os.environ.copy(),
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -182,16 +196,20 @@ def run_api(settings: Settings) -> int:
 
 
 def _manifest_path() -> Path:
-    return (
-        Path(__file__).resolve().parents[2]
-        / "assets"
-        / "models"
-        / "large-v3-turbo.manifest.json"
-    )
+    return bundled_asset("models", "large-v3-turbo.manifest.json")
+
+
+def _sensevoice_manifest_path() -> Path:
+    return bundled_asset("models", "sensevoice-small-int8.manifest.json")
+
+
+def _silero_vad_manifest_path() -> Path:
+    return bundled_asset("models", "silero-vad.manifest.json")
 
 
 def run_worker(settings: Settings) -> int:
     paths = StoragePaths.from_settings(settings)
+    model_paths = StoragePaths.managed_assets_from_settings(settings)
     paths.ensure_roots()
     configure_managed_runtime_environment(settings)
     configure_logging(paths.runtime("logs"), process_name="worker")
@@ -229,18 +247,38 @@ def run_worker(settings: Settings) -> int:
     )
     model_assets = ModelAssetService(
         engine=engine,
-        paths=paths,
+        paths=model_paths,
         manifest_path=_manifest_path(),
     )
     local_transcriber = FasterWhisperTranscriber(
         assets=model_assets,
-        expected_model_root=paths.durable("models", "faster-whisper"),
-        expected_cache_root=paths.runtime("models", "faster-whisper"),
+        expected_model_root=model_paths.durable("models", "faster-whisper"),
+        expected_cache_root=model_paths.runtime("models", "faster-whisper"),
+    )
+    sensevoice_assets = ModelAssetService(
+        engine=engine,
+        paths=model_paths,
+        manifest_path=_sensevoice_manifest_path(),
+        manifest_loader=load_sensevoice_manifest,
+    )
+    silero_vad_assets = ModelAssetService(
+        engine=engine,
+        paths=model_paths,
+        manifest_path=_silero_vad_manifest_path(),
+        manifest_loader=load_silero_vad_manifest,
+    )
+    sensevoice_transcriber = SenseVoiceTranscriber(
+        assets=sensevoice_assets,
+        vad_assets=silero_vad_assets,
     )
     transcribe_handler = TranscribeStageHandler(
         paths=paths,
         media=media,
         local_transcriber=local_transcriber,
+        local_transcribers={
+            "faster_whisper": local_transcriber,
+            "sensevoice_sherpa_onnx": sensevoice_transcriber,
+        },
         cloud_client=TencentRecordingClient(),
         credential_resolver=SnapshotTencentCredentialResolver(
             engine=engine,
@@ -271,14 +309,45 @@ def run_worker(settings: Settings) -> int:
     )
     installer = build_model_installer_loop(
         engine=engine,
-        paths=paths,
+        paths=model_paths,
         manifest_path=_manifest_path(),
         worker_id=f"model-{uuid4()}",
         resolver=resolver,
+        proxy_url=settings.platform_proxy_url,
+        stop_requested=stop_event.is_set,
+    )
+    sensevoice_installer = build_model_installer_loop(
+        engine=engine,
+        paths=model_paths,
+        manifest_path=_sensevoice_manifest_path(),
+        manifest_loader=load_sensevoice_manifest,
+        worker_id=f"model-sensevoice-{uuid4()}",
+        resolver=resolver,
+        proxy_url=settings.platform_proxy_url,
+        stop_requested=stop_event.is_set,
+    )
+    vad_installer = build_model_installer_loop(
+        engine=engine,
+        paths=model_paths,
+        manifest_path=_silero_vad_manifest_path(),
+        manifest_loader=load_silero_vad_manifest,
+        worker_id=f"model-vad-{uuid4()}",
+        resolver=resolver,
+        proxy_url=settings.platform_proxy_url,
+        stop_requested=stop_event.is_set,
+    )
+    installer_loop = ModelInstallerLoop(
+        installer=RoundRobinModelInstaller(
+            (
+                vad_installer.installer,
+                sensevoice_installer.installer,
+                installer.installer,
+            )
+        ),
         stop_requested=stop_event.is_set,
     )
     installer_thread = threading.Thread(
-        target=installer.run,
+        target=installer_loop.run,
         name="vtnote-model-installer",
         daemon=True,
     )
@@ -312,6 +381,7 @@ def run_worker(settings: Settings) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_windows_native_runtime()
     parser = argparse.ArgumentParser(prog="vtnote")
     parser.add_argument(
         "role",
@@ -320,6 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="supervisor",
     )
     args = parser.parse_args(argv)
+    apply_repository_runtime_defaults()
     settings = Settings()
     if args.role == "api":
         return run_api(settings)

@@ -1,153 +1,77 @@
-# VtNote Agent Guide
+# VtNote 协作约束
 
-本文件适用于整个 `VtNote` 仓库。目标是让后续开发代理基于当前代码和本机事实继续工作，避免重复猜测、覆盖用户改动或误触发付费服务。
+本文件适用于整个 VtNote 项目。只记录明确、可执行且可长期维护的规则。
 
-## 1. 开始工作前
+## 开始与边界
 
-1. 先运行 `git status --short`。当前工作树可能包含用户或其他代理尚未提交的改动；不要重置、覆盖或顺手格式化无关文件。
-2. 阅读 `README.md`、`docs/README.md` 和与任务直接相关的现行文档。若文档与代码冲突，以当前代码、测试和实机检查为准，并同步修正文档。
-3. 不确定外部服务参数、页面交互或返回格式时，使用官方文档或真实已登录页面核实；不要凭记忆猜字段。
-4. 修改前确定需求边界。诊断请求只调查和说明；只有用户要求开发或修复时才改代码。
+- 修改前读取根 `README.md`、相关现行文档、依赖清单，并运行 `git status --short`。
+- 工作树可能包含用户未提交修改；不得重置、覆盖、清理或顺手格式化无关内容。
+- 源码、配置、静态资源、测试、依赖清单、构建与打包入口必须保留在项目根目录内。
+- 安装、构建、测试和打包不得依赖项目外脚本、个人绝对路径、预先存在的模型、Cookie、数据库或本机缓存。
+- 当前源码工作区的持久数据、缓存、日志、模型和 YouTube/Deno 运行时分别写入已忽略的 `.vtnote/Data`、`.vtnote/Cache` 和 `.vtnote/ManagedAssets`；源码入口只接受 `.vtnote/` 内的隔离存储覆盖，不得再为本项目新建一级数据目录或依赖个人绝对路径。
+- 不读取、输出或提交 `.env`、Cookie、密钥、数据库、用户媒体、模型文件和运行日志。
 
-## 2. 本机开发环境
+## 环境与依赖
 
-- 仓库：`D:\Workspace\Project\VtNote`
-- Conda 环境：`vtnote`
-- Python：`3.11.15`
-- Python 可执行文件：`D:\ProgramData\Anaconda3\envs\vtnote\python.exe`
-- Node.js：`24.12.0`
-- npm：`11.6.2`
-- FFmpeg / FFprobe：`vtnote` Conda 环境内 `7.1.1`，不保证在系统全局 PATH 中。
-- `vtnote` 已以 editable 模式指向当前仓库。
+- Python 使用项目 `environment.yml` 声明的独立 Conda 环境；所有 Python、pytest、FFmpeg 和启动命令均在该环境中执行。
+- Node 依赖只使用 `frontend/package-lock.json`，安装命令为 `npm --prefix frontend ci`；不得生成第二份锁文件。
+- Python 依赖以 `pyproject.toml`、`environment.yml` 和 `requirements.lock` 为准；修改依赖时同步更新相关清单。
+- 测试默认离线，不得触发真实 ASR、AI、模型下载或平台大文件下载。付费或外部实测必须获得用户明确授权。
 
-所有 Python、pytest、FFmpeg 和正式启动命令都应在 `conda activate vtnote` 后执行。若自动化终端无法激活环境，使用：
+## 架构
 
-```powershell
-conda run -n vtnote python ...
-conda run -n vtnote ffmpeg ...
-```
+- `src/vtnote/launcher.py` 监督 API 与独立 Worker；耐久任务继续使用 SQLite 队列、租约和恢复点。
+- `src/vtnote/api.py`、`tasks.py`、`configuration.py` 只保留兼容门面与组合逻辑。新 HTTP 职责进入 `src/vtnote/http/`，跨入口合同进入 `src/vtnote/application/`，业务能力进入专用模块。
+- 保留 `vtnote.api`、`vtnote.tasks`、`vtnote.configuration` 的兼容导入路径。
+- API 与 Worker 共用的重试边界、阶段模型判定和结果产物规则分别维护在 `retry_policy.py`、`stage_models.py` 和 `result_artifacts.py`；不得在服务或 Worker 中复制实现。
+- 前端页面只做路由级加载和编排；带独立状态或交互的能力进入 `frontend/src/features/<capability>/`，无业务通用组件进入 `frontend/src/components/`。
+- `TaskHistoryPage.tsx` 只编排查询、工具栏和数据源；记录展示进入 `TaskLibraryWorkspace.tsx`，选择与键盘范围操作进入 `useTaskLibrarySelection.ts`。
+- 任务创建来源解析、提交参数、总结设置和模型可用性分别复用 `features/task-creation/model.ts`、`features/summary-settings/model.ts` 和 `features/profile-selection/model.ts`，页面与弹窗不得另写同类规则。
+- 原生 `<dialog>` 只由 `components/ModalDialog.tsx` 持有；表单、确认和业务弹窗通过共享容器组合，不得各自实现焦点恢复、Escape、遮罩点击和忙碌态关闭逻辑。
+- `styles/features/create-task.css`、`task-library.css`、`task-detail.css` 和 `settings.css` 只作为有序 `@import` 入口；新增规则进入对应同名目录的作用域分片，并保持导入顺序。
+- 架构边界由 `tests/test_architecture_boundaries.py` 约束；不得仅调高预算绕过拆分。
+- API 只绑定 `127.0.0.1`。来源适配器必须保留 HTTPS、域名、DNS、重定向和资源主机校验。
+- `transcript.json` 是字幕真相来源；其他字幕、对齐、说话人和导出格式均为可重建派生产物。
+- 用户原始文件永不删除。任务删除只允许终态任务，并保留批量原子性、恢复和云端清理保护。
 
-非必要临时文件写入 `D:\Workspace\Codex\cache\VtNote-*`，不要在仓库或 C 盘留下测试缓存。
+## 安全
 
-## 3. 数据目录
+- 密钥只进入系统凭据存储；自定义提示词使用当前用户的数据保护能力保存。
+- Cookie 只用于用户有权访问的内容，按平台域过滤并驻留进程内存；不得写入数据库、日志、任务快照、测试或仓库。
+- 日志和错误必须经过敏感信息清理；不得永久保存上游原始响应。
+- 云端状态未知时禁止盲目重复付费提交；阶段失败必须保留已完成成果。
 
-代码默认使用：
+## 前端
 
-```text
-%LOCALAPPDATA%\VtNote\Data
-%LOCALAPPDATA%\VtNote\Cache
-```
+- 保持“新总结、总结记录、合集管理、设置”四项信息架构；设置子页面继续由统一设置布局承载，不增加账号、会员、统计卡或说明性页面。
+- 视觉、排版、层级与动效以 `design-system/vtnote/MASTER.md` 和 `frontend/src/styles/tokens.css` 为基线；使用暖中性色、墨色正文和单一低饱和铜色强调，成功、警告、危险色只表达对应状态。
+- 不使用装饰性渐变、玻璃拟态、发光、悬浮抬升或弹跳动效；交互反馈保持短促、可中断，并遵守 `prefers-reduced-motion`。
+- 页面文案只保留标题、字段、状态和可执行动作需要的信息；不得添加英文眉题、重复副标题、操作提示或其他无助于当前决策的说明文字。
+- 图标按钮保留可访问名称；交互必须键盘可达并提供正确的 `aria-*` 状态。
+- 分段导航统一复用 `components/SegmentedTabs.tsx`；弹窗、菜单、Select、Toast 和页面切换复用共享浮层与 `MotionPresence`，不得在业务页面复制焦点管理、键盘导航、碰撞定位或进出场实现。
+- 内容库选择保持文件管理器语义；活动任务不进入删除选择集。
+- 总结记录和合集详情继续复用 `frontend/src/features/task-library/TaskLibraryRow.tsx`；页面级列宽与响应式差异必须限制在各自页面作用域，避免改变其他视图。
+- 全局提示统一复用 `frontend/src/features/task-queue/TaskQueueProvider.tsx` 中的 Toast 入口和共享组件；Toast 不显示关闭按钮，只允许自动消失或向右拖拽移除。
+- 原文、字幕等阅读视图只上报时间戳；在线视频定位统一由 `SourceVideoPanel` 处理，不得在多个页面分别操作播放器。
+- 修改前端后必须重新构建，确保 Python 服务读取到最新生产页面。
 
-本机默认目录中已有数据库和任务记录。不要为了测试清空、迁移或覆盖它们。
+## 验证与交付
 
-需要隔离测试时，显式设置一对同盘路径：
-
-```powershell
-$env:VTNOTE_DATA_ROOT = 'D:\Workspace\Codex\cache\VtNote-test-data'
-$env:VTNOTE_RUNTIME_CACHE_ROOT = 'D:\Workspace\Codex\cache\VtNote-test-runtime'
-```
-
-正式 D 盘模式约定为：
-
-```text
-D:\Workspace\Project\VtNote-data
-D:\Workspace\Codex\cache\VtNote-runtime
-```
-
-不要在未获用户许可时把现有 C 盘数据迁移到 D 盘。`Settings` 要求两个根目录为绝对路径、互不包含，并位于同一 Windows 盘符。
-
-## 4. 当前产品边界
-
-- 前端主入口支持 Bilibili 链接和本地音视频上传。
-- 后端也实现了受控 YouTube 适配器；只有固定 yt-dlp、EJS、Deno 和 D 盘运行时校验全部通过时才启用。
-- 字幕顺序：平台字幕优先；否则进入 ASR。
-- 云 ASR：腾讯云录音文件识别。
-- 本地 ASR：`large-v3-turbo`、CUDA、`int8_float16`。当前没有 CPU fallback，不得在文档或 UI 中声称已经支持。
-- AI 笔记：腾讯云 TokenHub，前端当前固定 `glm-5.1`。
-- 翻译代码仍存在，但新建任务界面目前固定关闭翻译；不要把它描述为已开放的用户功能。
-- 不支持登录态 Cookie、会员或付费视频、DRM、硬字幕 OCR。
-- 所有模型和 ASR 调用暂定只使用国内服务；不要擅自增加国外 API 或第三方中转。
-
-## 5. 架构约束
-
-- `src/vtnote/launcher.py` 同时监督 API 与独立 Worker；不要用 FastAPI `BackgroundTasks` 或进程内队列替代耐久任务机制。
-- API 只允许绑定 `127.0.0.1`；不要扩大到局域网地址。
-- SQLite 保存任务、阶段、租约和恢复状态；文件产物必须经 `StoragePaths` 构造路径。
-- `transcript.json` 是原文标准数据。SRT、TXT 等应从标准数据稳定生成，不要把导出文件作为新的真相来源。
-- 用户原始本地文件永不删除。临时媒体只能位于 VtNote 管理的运行缓存中，并遵守回收与恢复语义。
-- 写关键产物时保持原子发布和可恢复性；不要直接覆盖已完成的原文。
-- 来源适配器保持平台隔离，继续执行 URL 白名单、重定向复检和资源主机限制。
-
-## 6. 密钥与外部调用
-
-- 密钥只能通过 `KeyringSecretStore` 进入 Windows Credential Manager；数据库、API、日志、任务快照、测试和文档中不得出现明文或可逆掩码。
-- 日志与错误信息必须经过敏感文本保护；不要把上游原始响应整段永久保存。
-- 腾讯云 ASR 验证会真实识别内置短音频，TokenHub 验证会真实调用模型；两者都可能消耗额度。
-- 默认自动化测试不得触发真实付费请求、真实模型下载或大文件下载。任何这类操作都必须在用户明确授权后进行，并清楚说明目标服务和可能费用。
-- 不读取或转发浏览器 Cookie。公开视频失败时应给出可操作错误，不得绕过平台限制。
-
-## 7. 前端规则
-
-- 前端源码在 `frontend/src`；生产服务读取 `frontend/dist`。
-- 修改前端后至少运行测试和构建，确保正式 `vtnote` 启动能看到最新页面。
-- 保持当前极简信息架构：新建处理、内容库、设置。不要自行增加统计卡、会员、账号体系、可视化工作流或多余说明文字。
-- 点击“开始处理”后进入内容库，由内容库行内进度展示状态；不要重新引入独立的处理中间页。
-- 交互必须保留键盘可达性、可读状态文本和合理的 `aria-*` 语义。
-- UI 文案优先简洁中文；错误信息应能指导用户操作，避免直接显示内部异常名作为唯一说明。
-
-## 8. 后端规则
-
-- 使用 Python 3.11、Pydantic 2、SQLAlchemy 2 和 FastAPI 现有模式。
-- 新的任务状态或阶段状态必须同时更新 schema、数据库逻辑、API 类型、前端展示和测试。
-- 阶段失败应保持已完成产物；AI 笔记失败不能破坏字幕，也不能重新下载或重新转写。
-- 云请求错误要区分：鉴权/配置错误、限流/服务端错误、超时且结果未知。未知结果禁止盲目重复付费提交。
-- 本地 ASR 模型必须由受控模型资产服务安装和校验；运行时不得临时从互联网自动拉取未登记模型。
-
-## 9. 验证命令
-
-按改动影响面运行最小充分测试。
-
-文档修改：
-
-```powershell
-git diff --check -- README.md AGENTS.md docs
-```
-
-后端定向测试：
-
-```powershell
-conda run -n vtnote python -m pytest -q tests\test_target.py
-```
-
-后端完整测试：
+从项目根按影响面运行：
 
 ```powershell
 conda run -n vtnote python -m pytest -q
-```
-
-前端：
-
-```powershell
 npm --prefix frontend test
 npm --prefix frontend run lint
 npm --prefix frontend run build
+npm --prefix frontend run test:e2e:install
+npm --prefix frontend run test:e2e
+conda run -n vtnote python tools/package.py
+git diff --check
 ```
 
-启动检查：
-
-```powershell
-conda activate vtnote
-vtnote
-Invoke-RestMethod http://127.0.0.1:8765/api/health
-Invoke-RestMethod http://127.0.0.1:8765/api/readiness
-```
-
-不要为了文档或局部 UI 修改反复运行真实 ASR/AI 端到端测试。
-
-## 10. Git 与交接
-
-- 只提交本任务相关文件；不要把现有脏工作树中的其他改动一起纳入提交。
-- 不提交 `frontend/dist`、`node_modules`、数据库、用户数据、缓存、模型、日志、密钥或测试下载物。
-- 不使用 `git reset --hard`、`git checkout --` 等破坏性命令处理用户改动。
-- 交接时说明：修改文件、验证命令、未运行的真实外部测试、已知限制。
-- 用户要求推送时使用已安装的 GitHub 插件工作流；推送前再次核对 diff 和分支。当前本地分支是 `feature/vtnote-v1`，不要自行合并到 `main`。
+- 安装验证使用 `environment.yml` 和 `frontend/package-lock.json`，不得依赖已有 editable 安装判断成功。
+- 打包产物必须位于项目 `dist/`，wheel 必须包含生产前端、模型清单和内置验证音频。
+- 启动验证至少检查 `/api/health` 与 `/api/readiness`；测试服务和打包暂存只使用项目内 `.vtnote/Cache/` 隔离数据。
+- README 只保留用途、目录结构、运行、测试和部署/打包信息；详细产品与技术合同放在 `docs/`。
+- 交付说明必须包含修改范围、验证结果和未执行的真实外部服务测试。

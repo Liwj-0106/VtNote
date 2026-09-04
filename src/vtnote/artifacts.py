@@ -19,8 +19,10 @@ from vtnote.schemas import (
     Provenance,
     ProvenanceMethod,
     Transcript,
+    TranscriptAlignment,
     TranscriptSegment,
     Translation,
+    SpeakerMap,
     canonical_transcript_bytes,
     canonical_translation_bytes,
 )
@@ -117,6 +119,26 @@ def parse_source_subtitle(
         cues = parse_vtt(text)
     elif normalized == "ass":
         cues = parse_ass(text)
+    elif normalized == "txt":
+        # Plain text carries no timeline. Preserve all non-empty lines in one
+        # canonical cue and use the smallest practical deterministic duration
+        # that remains exportable to SRT/VTT/ASS.
+        normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        content = "\n".join(
+            line.strip() for line in normalized_text.splitlines() if line.strip()
+        )
+        cues = (
+            [
+                TranscriptSegment(
+                    id="seg_000001",
+                    start_ms=0,
+                    end_ms=1_000,
+                    text=content,
+                )
+            ]
+            if content
+            else []
+        )
     elif normalized == "json":
         try:
             payload = json.loads(text)
@@ -296,6 +318,53 @@ def ensure_transcription_recovery(
         paths,
         paths.transcription_recovery(item_id, stage_run_id),
         canonical_transcript_bytes(transcript),
+    )
+
+
+def ensure_transcript_alignment(
+    paths: StoragePaths,
+    item_id: str,
+    alignment: TranscriptAlignment,
+) -> Path:
+    payload = alignment.model_dump(mode="json", exclude_none=True)
+    data = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return _ensure_immutable(paths, paths.transcript_alignment(item_id), data)
+
+
+def ensure_speaker_map(
+    paths: StoragePaths,
+    item_id: str,
+    speakers: SpeakerMap,
+) -> Path:
+    payload = speakers.model_dump(mode="json", exclude_none=True)
+    data = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return _ensure_immutable(paths, paths.speaker_map(item_id), data)
+
+
+def write_transcription_chunk_recovery(
+    paths: StoragePaths,
+    item_id: str,
+    stage_run_id: str,
+    chunk_index: int,
+    payload: dict[str, object],
+) -> Path:
+    """Atomically checkpoint one deterministic ASR chunk for crash recovery."""
+
+    data = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return _atomic_write(
+        paths,
+        paths.transcription_chunk_recovery(item_id, stage_run_id, chunk_index),
+        data,
+        immutable=False,
     )
 
 

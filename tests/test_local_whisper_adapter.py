@@ -103,6 +103,43 @@ def context(
     )
 
 
+def v2_context(
+    tmp_path: Path,
+    *,
+    cpu_fallback: bool = False,
+    loader=None,
+    saver=None,
+    progress=None,
+) -> TranscriptionContext:
+    return TranscriptionContext(
+        local_whisper={
+            "schema_version": 2,
+            "model": "large-v3-turbo",
+            "device": "cuda",
+            "compute_type": "int8_float16",
+            "vad_filter": True,
+            "vad_parameters": {
+                "threshold": 0.5,
+                "min_speech_duration_ms": 250,
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+            "cpu_fallback_enabled": cpu_fallback,
+            "word_timestamps": True,
+            "punctuation_normalization": True,
+            "speaker_diarization_enabled": False,
+            "chunk_duration_ms": 60_000,
+            "chunk_overlap_ms": 5_000,
+            "model_root": str(tmp_path / "data" / "models" / "faster-whisper"),
+            "cache_root": str(tmp_path / "cache" / "models" / "faster-whisper"),
+        },
+        cancel_requested=lambda: False,
+        chunk_loader=loader,
+        chunk_saver=saver,
+        progress_reporter=progress,
+    )
+
+
 def make_transcriber(
     tmp_path: Path,
     model: FakeModel,
@@ -202,6 +239,83 @@ def test_cuda_unavailable_is_explicit_and_never_creates_cpu_model(
     assert caught.value.code == "local_asr_cuda_unavailable"
     assert assets.calls == 0
     assert factory_calls == []
+
+
+def test_v2_can_explicitly_fall_back_to_cpu(tmp_path: Path) -> None:
+    model = FakeModel([SimpleNamespace(start=0.0, end=1.0, text="hello")])
+    transcriber, _, factory_calls = make_transcriber(
+        tmp_path, model, cuda_devices=0
+    )
+
+    result = transcriber.transcribe(
+        audio(tmp_path),
+        v2_context(tmp_path, cpu_fallback=True),
+    )
+
+    assert result.runtime_device == "cpu"
+    assert factory_calls[0]["device"] == "cpu"
+    assert factory_calls[0]["compute_type"] == "int8"
+
+
+def test_v2_emits_word_alignment_and_normalizes_punctuation(tmp_path: Path) -> None:
+    words = [
+        SimpleNamespace(start=0.0, end=0.4, word="你好", probability=0.9),
+        SimpleNamespace(start=0.4, end=0.6, word="，", probability=0.8),
+    ]
+    model = FakeModel(
+        [SimpleNamespace(start=0.0, end=1.0, text="  你好 ，  ", words=words)]
+    )
+    transcriber, _, _ = make_transcriber(tmp_path, model)
+
+    result = transcriber.transcribe(audio(tmp_path), v2_context(tmp_path))
+
+    assert result.transcript.segments[0].text == "你好，"
+    assert result.alignment is not None
+    assert [word.text for word in result.alignment.words] == ["你好", "，"]
+    assert result.alignment.words[0].probability == 0.9
+
+
+def test_v2_recovers_completed_chunks_without_retranscribing(tmp_path: Path) -> None:
+    class ChunkModel(FakeModel):
+        def transcribe(self, audio_path: str, **kwargs: object):
+            self.calls.append((audio_path, dict(kwargs)))
+            clip = str(kwargs["clip_timestamps"])
+            start = float(clip.split(",", 1)[0])
+            segment = SimpleNamespace(
+                start=start + 3.0,
+                end=start + 4.0,
+                text=f"chunk-{len(self.calls)}",
+                words=[],
+            )
+            return iter([segment]), SimpleNamespace(
+                language="zh", language_probability=0.95
+            )
+
+    model = ChunkModel([])
+    transcriber, _, _ = make_transcriber(tmp_path, model)
+    checkpoints: dict[int, dict[str, object]] = {}
+    progress: list[tuple[int, int]] = []
+    selected_audio = audio(tmp_path, duration_ms=130_000)
+
+    first = transcriber.transcribe(
+        selected_audio,
+        v2_context(
+            tmp_path,
+            saver=lambda index, payload: checkpoints.__setitem__(index, payload),
+            progress=lambda current, total: progress.append((current, total)),
+        ),
+    )
+    model.calls.clear()
+    second = transcriber.transcribe(
+        selected_audio,
+        v2_context(tmp_path, loader=checkpoints.get),
+    )
+
+    assert len(checkpoints) == 3
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+    assert first.transcript == second.transcript
+    assert second.recovered_chunks == 3
+    assert model.calls == []
 
 
 def test_lazy_segment_generator_is_fully_iterated_and_normalized(

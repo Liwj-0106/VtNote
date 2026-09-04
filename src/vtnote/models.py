@@ -23,6 +23,38 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _default_local_whisper_options() -> dict[str, Any]:
+    from vtnote.config import Settings
+
+    settings = Settings()
+    asset_root = settings.managed_assets_root
+    data_root = asset_root / "Data" if asset_root is not None else settings.data_root
+    cache_root = (
+        asset_root / "Cache" if asset_root is not None else settings.runtime_cache_root
+    )
+    return {
+        "schema_version": 2,
+        "model": "large-v3-turbo",
+        "device": "cuda",
+        "compute_type": "int8_float16",
+        "vad_filter": True,
+        "vad_parameters": {
+            "threshold": 0.5,
+            "min_speech_duration_ms": 250,
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 200,
+        },
+        "cpu_fallback_enabled": False,
+        "word_timestamps": True,
+        "punctuation_normalization": True,
+        "speaker_diarization_enabled": False,
+        "chunk_duration_ms": 900_000,
+        "chunk_overlap_ms": 5_000,
+        "model_root": str(data_root / "models" / "faster-whisper"),
+        "cache_root": str(cache_root / "models" / "faster-whisper"),
+    }
+
+
 class UTCDateTime(TypeDecorator[datetime]):
     """Store UTC-naive in SQLite and always return aware UTC datetimes."""
 
@@ -424,6 +456,9 @@ class DefaultSettingsRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     asr_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
+    local_asr_engine: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="faster_whisper"
+    )
     cloud_asr_profile_id: Mapped[str | None] = mapped_column(
         ForeignKey("processor_profiles.id", ondelete="SET NULL")
     )
@@ -449,20 +484,132 @@ class DefaultSettingsRecord(Base):
     notes_auto_enable_allowed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+    export_directory: Mapped[str | None] = mapped_column(Text)
     local_whisper_options: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON),
         nullable=False,
-        default=lambda: {
-            "model": "large-v3-turbo",
-            "device": "cuda",
-            "compute_type": "int8_float16",
-            "vad_filter": True,
-            "model_root": r"D:\Workspace\Project\VtNote-data\models\faster-whisper",
-            "cache_root": r"D:\Workspace\Codex\cache\VtNote-runtime\models\faster-whisper",
-        },
+        default=_default_local_whisper_options,
     )
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class LibraryCollectionRecord(Base):
+    __tablename__ = "library_collections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(
+        String(128, collation="NOCASE"), nullable=False, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class LibraryCollectionTaskRecord(Base):
+    __tablename__ = "library_collection_tasks"
+
+    collection_id: Mapped[str] = mapped_column(
+        ForeignKey("library_collections.id", ondelete="CASCADE"), primary_key=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+
+
+class LibraryTagRecord(Base):
+    __tablename__ = "library_tags"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(
+        String(128, collation="NOCASE"), nullable=False, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class LibraryTaskTagRecord(Base):
+    __tablename__ = "library_task_tags"
+
+    tag_id: Mapped[str] = mapped_column(
+        ForeignKey("library_tags.id", ondelete="CASCADE"), primary_key=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+
+
+class LibraryExcerptRecord(Base):
+    __tablename__ = "library_excerpts"
+    __table_args__ = (
+        UniqueConstraint("item_id", "segment_id", name="uq_library_excerpt_segment"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    segment_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    transcript_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class LibrarySearchDocumentRecord(Base):
+    __tablename__ = "library_search_documents"
+    __table_args__ = (
+        Index("ix_library_search_task_kind", "task_id", "kind"),
+        Index("ix_library_search_item_kind", "item_id", "kind"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    segment_id: Mapped[str | None] = mapped_column(String(32))
+    start_ms: Mapped[int | None] = mapped_column(Integer)
+    end_ms: Mapped[int | None] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
+    )
+
+
+class LibrarySearchStateRecord(Base):
+    __tablename__ = "library_search_state"
+
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("items.id", ondelete="CASCADE"), primary_key=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utcnow, nullable=False
     )
 
 
